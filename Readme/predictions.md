@@ -11,7 +11,9 @@ The predictions module implements a complete workflow for:
 2. **Selecting optimal option contracts** for each prediction
 3. **Backtesting** both predictions and option trades
 
-All scripts work with shared CSV files: `predictions/{UNDERLYING}_predicted.csv` (e.g., `NIFTY_predicted.csv`, `BANKNIFTY_predicted.csv`), which accumulate data through each stage.
+All scripts work with CSV files in `predictions/output/` directory:
+- Prediction files: `{UNDERLYING}_{strategy}_predicted.csv` (e.g., `NIFTY_trendFollowing_predicted.csv`)
+- Combined files: `{UNDERLYING}_{predictor_strategy}_{selector_strategy}.csv` (e.g., `NIFTY_trendFollowing_nearestExpiryATM.csv`)
 
 ---
 
@@ -38,48 +40,30 @@ All scripts work with shared CSV files: `predictions/{UNDERLYING}_predicted.csv`
 
 **Usage**:
 ```bash
-# Generate predictions for NIFTY (default)
+# Generate predictions for NIFTY with default strategy (trendFollowing)
 python predictions/index_predictor.py -u NIFTY
 
 # Generate predictions for BANKNIFTY
 python predictions/index_predictor.py -u BANKNIFTY
 
-# Regenerate all predictions
-python predictions/index_predictor.py -u NIFTY --regenerate-all
+# Use different prediction strategies
+python predictions/index_predictor.py -u NIFTY -s trendFollowing
+python predictions/index_predictor.py -u NIFTY -s momentum
+python predictions/index_predictor.py -u NIFTY -s meanReversion
+
+# List all available prediction strategies
+python predictions/index_predictor.py --list-strategies
+
+# Automatically run option selection for all selector strategies after generating predictions
+python predictions/index_predictor.py -u NIFTY -s trendFollowing --auto-option-selection
 ```
+
+**Output**: Creates/overwrites `predictions/output/{UNDERLYING}_{strategy}_predicted.csv`
+- Example: `predictions/output/NIFTY_trendFollowing_predicted.csv`
+- Always completely overwrites the file with new predictions
 
 ---
 
-### index_backtest.py
-
-**Purpose**: Backtests the accuracy of index direction predictions.
-
-**How it works**:
-- For each prediction, checks the **next trading day's 09:15 open** vs **today's 15:15 close**
-- Calculates gap move percentage: `(next_open - today_close) / today_close`
-- Tags results:
-  - **CORRECT**: CALL prediction and gap > 0, or PUT prediction and gap < 0
-  - **INCORRECT**: CALL prediction and gap ≤ 0, or PUT prediction and gap ≥ 0
-  - **MISSED_CALL/MISSED_PUT**: NO_POSITION but significant move (≥1%) occurred
-  - **OK_NO_TRADE**: NO_POSITION and no significant move
-
-**Output**: Updates `{UNDERLYING}_predicted.csv` with backtest columns:
-- `today_close_1515`, `next_date`, `next_open_0915`
-- `gap_move_pct`, `result`
-
-**Usage**:
-```bash
-# Backtest NIFTY predictions (default)
-python predictions/index_backtest.py -u NIFTY
-
-# Backtest BANKNIFTY predictions
-python predictions/index_backtest.py -u BANKNIFTY
-```
-
-**Prerequisites**: 
-- `index_predictor.py` must be run first to create predictions
-
----
 
 ### option_selector.py
 
@@ -105,199 +89,59 @@ python predictions/index_backtest.py -u BANKNIFTY
 
 **Usage**:
 ```bash
-# Select options for NIFTY (default)
+# Select options for NIFTY with default strategies
 python predictions/option_selector.py -u NIFTY
 
-# Select options for BANKNIFTY
-python predictions/option_selector.py -u BANKNIFTY
+# Specify both predictor and selector strategies
+python predictions/option_selector.py -u NIFTY -ps trendFollowing -ss nearestExpiryATM
+python predictions/option_selector.py -u NIFTY -ps momentum -ss nearestExpiryHighOI
+python predictions/option_selector.py -u NIFTY -ps meanReversion -ss highestDeltaPriceRatio
 
-# Regenerate all option selections
-python predictions/option_selector.py -u NIFTY --regenerate-all
+# For BANKNIFTY with different strategy combinations
+python predictions/option_selector.py -u BANKNIFTY -ps trendFollowing -ss nearestExpiryATM
+
+# List all available selector strategies
+python predictions/option_selector.py --list-strategies
 ```
 
+**Output**: Creates/updates `predictions/output/{UNDERLYING}_{predictor_strategy}_{selector_strategy}.csv`
+- Example: `predictions/output/NIFTY_trendFollowing_nearestExpiryATM.csv`
+- Always recomputes option selections for all CALL/PUT predictions
+
 **Prerequisites**: 
-- `index_predictor.py` and `index_backtest.py` should be run first
+- `index_predictor.py` must be run first to create the prediction file
 - Database must have option snapshot data at 15:15 for the prediction dates
 
 ---
 
----
+### backtest.py (Combined Backtest)
 
-### option_backtest.py
-
-**Purpose**: Calculates P&L for selected option trades.
+**Purpose**: Automatically backtests all strategy combination files for a given underlying (NIFTY or BANKNIFTY).
 
 **How it works**:
-- For predictions with selected options:
-  - Entry: Option price at **09:15** on the day after prediction (next trading day)
-  - Exit: Option price at **15:15** on the same day (same-day exit strategy)
-  - Calculates:
-    - P&L per contract: `exit_price - entry_price`
-    - P&L per lot: `pnl_per_contract × lot_size`
-    - Return percentage: `pnl_per_contract / entry_price`
-
-**Output**: Updates `{UNDERLYING}_predicted.csv` with option backtest columns:
-- `option_entry_date`, `option_entry_price_0915`
-- `option_exit_date`, `option_closing_price_1515`
-- `option_lot_size`, `option_pnl_per_contract`, `option_pnl_per_lot`
-- `option_return_pct`, `option_result`, `option_backtest_status`
+- Automatically finds all CSV files matching `{UNDERLYING}_{predictionStrategy}_{selectionStrategy}.csv` in `predictions/output/`
+- **Only processes files with both prediction and selection strategies** (excludes files like `NIFTY_trendFollowing_predicted.csv`)
+- For each file found:
+  - Runs index backtest (computes gap moves, prediction accuracy)
+    - Inserts index backtest columns between 'prediction' and 'option_trade_date'
+  - Runs option backtest (computes P&L for selected option instruments)
+    - Inserts option backtest columns after 'selection_option_price_1515'
+  - Displays summary metrics for each file:
+    - **Index prediction accuracy**: % of CORRECT predictions / total predictions
+    - **Option selector accuracy**: % of PROFIT selections / total selections when index was CORRECT
+    - **Net profit**: Sum of all `option_pnl_per_lot` values
+- Processes all files in a single run
 
 **Usage**:
 ```bash
-# Backtest options for NIFTY (default)
-python predictions/option_backtest.py -u NIFTY
+# Backtest all NIFTY strategy combination files (both index and option backtest)
+python predictions/backtest.py -u NIFTY
 
-# Backtest options for BANKNIFTY
-python predictions/option_backtest.py -u BANKNIFTY
+# Backtest all BANKNIFTY strategy combination files
+python predictions/backtest.py -u BANKNIFTY
 ```
 
 **Prerequisites**:
-- `index_predictor.py`, `index_backtest.py`, and `option_selector.py` must be run first
-- Database must have option snapshot data at both 09:15 and 15:15 for entry/exit dates
-
----
-
-## Helper Modules
-
-### underlying_data.py
-
-**Purpose**: Database connection and NIFTY daily data fetching utilities.
-
-**Functions**:
-- `get_db_connection()`: Creates database connection using `.env` configuration
-- `fetch_index_daily()`: Fetches daily index data (09:15 open, 15:15 close) from `UnderlyingSnapshot` table
-
-**Used by**: `index_predictor.py`, `index_backtest.py`, `option_backtest.py`
-
----
-
-### options_data.py
-
-**Purpose**: Option data fetching utilities from database.
-
-**Functions**:
-- `fetch_index_options_eod()`: Fetches full options chain at 15:15 for a date range
-- `fetch_option_intraday_prices()`: Fetches 09:15 and 15:15 prices for specific option tokens
-
-**Used by**: `option_selector.py`, `option_backtest.py`
-
----
-
-## Execution Sequence
-
-**Step 1: Generate Predictions**
-```bash
-python predictions/index_predictor.py -u NIFTY
-# or
-python predictions/index_predictor.py -u BANKNIFTY
-```
-- Generates new predictions for dates with sufficient data
-- Creates/updates `{UNDERLYING}_predicted.csv` with prediction column
-
-**Step 2: Backtest Predictions**
-```bash
-python predictions/index_backtest.py -u NIFTY
-# or
-python predictions/index_backtest.py -u BANKNIFTY
-```
-- Backtests prediction accuracy by comparing predictions to actual gap moves
-- Updates CSV with prediction accuracy results (`result` column)
-- Can be run multiple times as new data becomes available
-
-**Step 3: Select Options**
-```bash
-python predictions/option_selector.py -u NIFTY
-# or
-python predictions/option_selector.py -u BANKNIFTY
-```
-- Selects best option contracts for CALL/PUT predictions
-- Updates CSV with option details
-- Only processes predictions that don't already have options assigned
-
-**Step 4: Backtest Options**
-```bash
-python predictions/option_backtest.py -u NIFTY
-# or
-python predictions/option_backtest.py -u BANKNIFTY
-```
-- Calculates P&L for selected option trades
-- Updates CSV with option performance metrics
-- Can be run multiple times as new price data becomes available
-
-## Data Flow
-
-```
-Database (UnderlyingSnapshot, OptionSnapshot)
-    ↓
-index_predictor.py
-    ↓
-{UNDERLYING}_predicted.csv (predictions)
-    ↓
-index_backtest.py
-    ↓
-{UNDERLYING}_predicted.csv (predictions + backtest results)
-    ↓
-option_selector.py
-    ↓
-{UNDERLYING}_predicted.csv (predictions + backtest + option selections)
-    ↓
-option_backtest.py
-    ↓
-{UNDERLYING}_predicted.csv (complete: predictions + backtest + options + P&L)
-```
-
----
-
-## CSV File Structure
-
-The `{UNDERLYING}_predicted.csv` file accumulates columns as scripts run:
-
-**After index_predictor.py**:
-- `date`, `prediction`
-
-**After index_backtest.py**:
-- `today_close_1515`, `next_date`, `next_open_0915`, `gap_move_pct`, `result`
-
-**After option_selector.py**:
-- `option_trade_date`, `option_instrument_token`, `option_tradingsymbol`
-- `option_strike`, `option_expiry`, `option_type`
-- `selection_option_price_1515`
-
-**After option_backtest.py**:
-- `option_entry_date`, `option_entry_price_0915`
-- `option_exit_date`, `option_closing_price_1515`
-- `option_lot_size`, `option_pnl_per_contract`, `option_pnl_per_lot`
-- `option_return_pct`, `option_result`, `option_backtest_status`
-
----
-
-## Key Parameters
-
-### index_predictor.py
-- `LOOKBACK_DAYS = 10`: Number of days used for trend analysis
-- `TREND_THRESH = 0.003`: Minimum 0.3% move to trigger CALL/PUT prediction
-
-### index_backtest.py
-- `SIGNIFICANT_MOVE_THRESH = 0.01`: 1% gap threshold for "missed" opportunities
-
-### option_selector.py
-- Selection criteria: Nearest expiry, ATM strike, highest volume/OI
-
----
-
-## Troubleshooting
-
-1. **"File not found" errors**: Run scripts in sequence - each depends on previous outputs
-2. **"No option data found"**: Ensure `daily_intraday_stock_option.py` has collected data for the required dates
-3. **Missing predictions**: Check that `UnderlyingSnapshot` table has sufficient historical data (at least 10 days)
-4. **Option selection fails**: Verify that options exist in database for the prediction dates and that 15:15 snapshots are available
-
----
-
-## Notes
-
-- All scripts are **idempotent**: Safe to run multiple times
-- Scripts only process rows that need updates (skip already processed data)
-- The CSV file serves as the central state file - preserve it between runs
-- Backtest scripts can be run repeatedly as new data becomes available
-
+- `index_predictor.py` must be run first to create prediction files
+- `option_selector.py` must be run to create strategy combination files
+- Only files with both prediction and selection strategies will be processed
