@@ -2,26 +2,24 @@
 import os
 import sys
 import argparse
-from typing import Callable, Dict, Optional
 import pandas as pd
 
 from underlying_data import get_db_connection
 from options_data import fetch_index_options_eod
+from selection_logic import SELECTION_STRATEGIES
 
 PRED_DIR = "predictions/output"
 PRED_FILE_TEMPLATE = "{underlying}_{predictor_strategy}_predicted.csv"
 STRATEGY_FILE_TEMPLATE = "{underlying}_{predictor_strategy}_{selector_strategy}.csv"
+
+# Prediction strategy names (to avoid circular import from index_predictor)
+PREDICTION_STRATEGY_NAMES = ["trendFollowing", "momentum", "meanReversion"]
 
 # Adjust these if your actual view names differ
 DEFAULT_OPTIONS_VIEWS = {
     "NIFTY": "dbo.vw_NiftySnapshotWithUnderlying",
     "BANKNIFTY": "dbo.vw_BankNiftySnapshotWithUnderlying",
 }
-
-# Type definition for selection functions
-# Input: chain_df (pd.DataFrame), prediction (str), trade_date (pd.Timestamp)
-# Output: dict with option details or None
-SelectionFunction = Callable[[pd.DataFrame, str, pd.Timestamp], Optional[Dict]]
 
 
 def _ensure_option_columns(preds: pd.DataFrame) -> pd.DataFrame:
@@ -56,209 +54,14 @@ def _clear_option_columns(preds: pd.DataFrame) -> pd.DataFrame:
     return preds
 
 
-# ============================================================================
-# SELECTION STRATEGIES
-# ============================================================================
-# Each strategy function follows the same signature:
-#   Input: chain_df (pd.DataFrame), prediction (str), trade_date (pd.Timestamp)
-#   Output: dict with option details or None
-
-def select_nearest_expiry_atm(chain_df: pd.DataFrame,
-                               prediction: str,
-                               trade_date: pd.Timestamp) -> Optional[Dict]:
-    """
-    Strategy 1: Nearest expiry, ATM strike, highest volume/OI.
-    Original strategy - selects option with:
-    - Nearest expiry date
-    - Closest to ATM (At The Money)
-    - Highest volume and open interest
-    """
-    if prediction not in ("CALL", "PUT") or chain_df.empty:
-        return None
-
-    df = chain_df.copy()
-    df = df[df["option_side"] == prediction]
-    if df.empty:
-        return None
-
-    trade_date_norm = pd.to_datetime(trade_date).normalize()
-
-    df = df[df["expiry"] > trade_date_norm]
-    if df.empty:
-        return None
-
-    df = df[df["option_price"] > 0]
-    if df.empty:
-        return None
-
-    df["days_to_expiry"] = (df["expiry"] - trade_date_norm).dt.days
-    min_days = df["days_to_expiry"].min()
-    df = df[df["days_to_expiry"] == min_days]
-
-    underlying_series = df["underlying_price"].dropna()
-    if underlying_series.empty:
-        return None
-    underlying_price = float(underlying_series.iloc[0])
-
-    df["moneyness"] = (df["strike"] - underlying_price).abs()
-    min_m = df["moneyness"].min()
-    df = df[df["moneyness"] == min_m]
-
-    if "option_volume" in df.columns and "open_interest" in df.columns:
-        df = df.sort_values(["option_volume", "open_interest"], ascending=[False, False])
-    elif "open_interest" in df.columns:
-        df = df.sort_values("open_interest", ascending=False)
-    else:
-        df = df.sort_values("strike")
-
-    row = df.iloc[0]
-
-    return {
-        "option_trade_date": trade_date_norm,
-        "option_instrument_token": int(row["instrument_token"]),
-        "option_tradingsymbol": row["tradingsymbol"],
-        "option_strike": float(row["strike"]),
-        "option_expiry": row["expiry"],
-        "option_type": prediction,
-        "selection_option_price_1515": float(row["option_price"]),
-    }
-
-
-def select_nearest_expiry_high_oi(chain_df: pd.DataFrame,
-                                   prediction: str,
-                                   trade_date: pd.Timestamp) -> Optional[Dict]:
-    """
-    Strategy 2: Nearest expiry, highest open interest (ignores moneyness).
-    Selects option with:
-    - Nearest expiry date
-    - Highest open interest (regardless of strike)
-    """
-    if prediction not in ("CALL", "PUT") or chain_df.empty:
-        return None
-
-    df = chain_df.copy()
-    df = df[df["option_side"] == prediction]
-    if df.empty:
-        return None
-
-    trade_date_norm = pd.to_datetime(trade_date).normalize()
-
-    df = df[df["expiry"] > trade_date_norm]
-    if df.empty:
-        return None
-
-    df = df[df["option_price"] > 0]
-    if df.empty:
-        return None
-
-    df["days_to_expiry"] = (df["expiry"] - trade_date_norm).dt.days
-    min_days = df["days_to_expiry"].min()
-    df = df[df["days_to_expiry"] == min_days]
-
-    if "open_interest" in df.columns:
-        df = df.sort_values("open_interest", ascending=False)
-    elif "option_volume" in df.columns:
-        df = df.sort_values("option_volume", ascending=False)
-    else:
-        df = df.sort_values("strike")
-
-    row = df.iloc[0]
-
-    return {
-        "option_trade_date": trade_date_norm,
-        "option_instrument_token": int(row["instrument_token"]),
-        "option_tradingsymbol": row["tradingsymbol"],
-        "option_strike": float(row["strike"]),
-        "option_expiry": row["expiry"],
-        "option_type": prediction,
-        "selection_option_price_1515": float(row["option_price"]),
-    }
-
-
-def select_highest_delta_price_ratio(chain_df: pd.DataFrame,
-                             prediction: str,
-                             trade_date: pd.Timestamp) -> Optional[Dict]:
-    """
-    Strategy: Highest delta/price ratio with long time to expiry.
-    Selects option with:
-    - Highest delta/option_price ratio
-    - Prefers options with longer time to expiry (as tiebreaker)
-    - Only considers options with valid delta and price > 0
-    """
-    if prediction not in ("CALL", "PUT") or chain_df.empty:
-        return None
-
-    df = chain_df.copy()
-    df = df[df["option_side"] == prediction]
-    if df.empty:
-        return None
-
-    trade_date_norm = pd.to_datetime(trade_date).normalize()
-
-    df = df[df["expiry"] > trade_date_norm]
-    if df.empty:
-        return None
-
-    # Filter for options with valid price and delta
-    df = df[df["option_price"] > 0]
-    if df.empty:
-        return None
-
-    # Check if delta column exists
-    if "delta" not in df.columns:
-        return None
-
-    # Filter for options with valid (non-null) delta
-    df = df[df["delta"].notna()]
-    if df.empty:
-        return None
-
-    # Convert delta to numeric (handle any string representations)
-    df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
-    df = df[df["delta"].notna()]
-    if df.empty:
-        return None
-
-    # Calculate days to expiry
-    df["days_to_expiry"] = (df["expiry"] - trade_date_norm).dt.days
-
-    # Calculate delta/price ratio
-    # For PUT options, delta is negative, so we use absolute value
-    df["delta_abs"] = df["delta"].abs()
-    df["delta_price_ratio"] = df["delta_abs"] / df["option_price"]
-
-    # Sort by: 1) Highest delta/price ratio, 2) Longest time to expiry (as tiebreaker)
-    df = df.sort_values(
-        ["delta_price_ratio", "days_to_expiry"],
-        ascending=[False, False]  # Highest ratio first, longest expiry first
-    )
-
-    row = df.iloc[0]
-
-    return {
-        "option_trade_date": trade_date_norm,
-        "option_instrument_token": int(row["instrument_token"]),
-        "option_tradingsymbol": row["tradingsymbol"],
-        "option_strike": float(row["strike"]),
-        "option_expiry": row["expiry"],
-        "option_type": prediction,
-        "selection_option_price_1515": float(row["option_price"]),
-    }
-
-
-# Registry of available selection strategies
-SELECTION_STRATEGIES: Dict[str, SelectionFunction] = {
-    "nearestExpiryATM": select_nearest_expiry_atm,
-    "nearestExpiryHighOI": select_nearest_expiry_high_oi,
-    "highestDeltaPriceRatio": select_highest_delta_price_ratio,
-}
 
 
 def main(underlying: str, 
          selector_strategy: str,
          predictor_strategy: str = "trendFollowing",
          regenerate_all: bool = True, 
-         options_view: str | None = None):
+         options_view: str | None = None,
+         delete_intermediate: bool = True):
     """
     Main function to select options using a specified strategy.
     
@@ -344,7 +147,7 @@ def main(underlying: str,
         os.makedirs(PRED_DIR, exist_ok=True)
         preds.to_csv(strategy_path, index=False)
         # Delete the intermediate prediction file after successful creation
-        if os.path.isfile(strategy_path) and os.path.isfile(base_path):
+        if delete_intermediate and os.path.isfile(strategy_path) and os.path.isfile(base_path):
             try:
                 os.remove(base_path)
                 print(f"[{underlying}] Deleted intermediate file: {base_filename}")
@@ -374,7 +177,7 @@ def main(underlying: str,
         os.makedirs(PRED_DIR, exist_ok=True)
         preds.to_csv(strategy_path, index=False)
         # Delete the intermediate prediction file after successful creation
-        if os.path.isfile(strategy_path) and os.path.isfile(base_path):
+        if delete_intermediate and os.path.isfile(strategy_path) and os.path.isfile(base_path):
             try:
                 os.remove(base_path)
                 print(f"[{underlying}] Deleted intermediate file: {base_filename}")
@@ -435,8 +238,8 @@ def main(underlying: str,
     print(preds.tail())
     
     # Delete the intermediate prediction file after successful creation of combined strategy file
-    # Only delete if the strategy file was successfully created and the base file exists
-    if os.path.isfile(strategy_path) and os.path.isfile(base_path):
+    # Only delete if delete_intermediate is True, the strategy file was successfully created and the base file exists
+    if delete_intermediate and os.path.isfile(strategy_path) and os.path.isfile(base_path):
         try:
             os.remove(base_path)
             print(f"[{underlying}] Deleted intermediate file: {base_filename}")
@@ -466,14 +269,13 @@ Example: NIFTY_trendFollowing_nearestExpiryATM.csv
     )
     parser.add_argument(
         "-ps", "--predictor-strategy",
-        default="trendFollowing",
-        help="Prediction strategy used (must match the predictor strategy used in index_predictor.py)"
+        default=None,
+        help="Prediction strategy used (if not provided, runs for all prediction strategies). Available: " + ", ".join(PREDICTION_STRATEGY_NAMES)
     )
     parser.add_argument(
         "-ss", "--selector-strategy",
-        default="nearestExpiryATM",
-        choices=list(SELECTION_STRATEGIES.keys()),
-        help="Selection strategy to use"
+        default=None,
+        help="Selection strategy to use (if not provided, runs for all selection strategies). Available: " + ", ".join(SELECTION_STRATEGIES.keys())
     )
     parser.add_argument(
         "--no-regenerate",
@@ -502,10 +304,68 @@ Example: NIFTY_trendFollowing_nearestExpiryATM.csv
             print(f"  {name:25s} - {doc}")
         sys.exit(0)
     
-    main(
-        underlying=args.underlying,
-        predictor_strategy=args.predictor_strategy,
-        selector_strategy=args.selector_strategy,
-        regenerate_all=args.regenerate_all,
-        options_view=args.options_view
-    )
+    # Determine which prediction strategies to run
+    if args.predictor_strategy is None:
+        predictor_strategies = PREDICTION_STRATEGY_NAMES
+    else:
+        if args.predictor_strategy not in PREDICTION_STRATEGY_NAMES:
+            available = ", ".join(PREDICTION_STRATEGY_NAMES)
+            raise ValueError(
+                f"Unknown prediction strategy '{args.predictor_strategy}'. Available strategies: {available}"
+            )
+        predictor_strategies = [args.predictor_strategy]
+    
+    # Determine which selection strategies to run
+    if args.selector_strategy is None:
+        selector_strategies = list(SELECTION_STRATEGIES.keys())
+    else:
+        if args.selector_strategy not in SELECTION_STRATEGIES:
+            available = ", ".join(SELECTION_STRATEGIES.keys())
+            raise ValueError(
+                f"Unknown selector strategy '{args.selector_strategy}'. Available strategies: {available}"
+            )
+        selector_strategies = [args.selector_strategy]
+    
+    # Run for all combinations
+    if len(predictor_strategies) > 1 or len(selector_strategies) > 1:
+        print(f"[{args.underlying}] Running for all strategy combinations...")
+        print(f"  Prediction strategies: {', '.join(predictor_strategies)}")
+        print(f"  Selection strategies: {', '.join(selector_strategies)}")
+        print(f"  Total combinations: {len(predictor_strategies) * len(selector_strategies)}")
+        print(f"{'='*60}\n")
+        
+        for pred_strategy in predictor_strategies:
+            for sel_strategy in selector_strategies:
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"Running: {pred_strategy} + {sel_strategy}")
+                    print(f"{'='*60}\n")
+                    # Don't delete intermediate files when running all combinations
+                    # Only delete after the last selector strategy for each predictor strategy
+                    is_last_selector = (sel_strategy == selector_strategies[-1])
+                    main(
+                        underlying=args.underlying,
+                        predictor_strategy=pred_strategy,
+                        selector_strategy=sel_strategy,
+                        regenerate_all=args.regenerate_all,
+                        options_view=args.options_view,
+                        delete_intermediate=is_last_selector
+                    )
+                except Exception as e:
+                    print(f"Error running combination '{pred_strategy}' + '{sel_strategy}': {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        print(f"\n{'='*60}")
+        print(f"Completed running all strategy combinations for {args.underlying}")
+        print(f"{'='*60}\n")
+    else:
+        # Single combination - delete intermediate file after creation
+        main(
+            underlying=args.underlying,
+            predictor_strategy=predictor_strategies[0],
+            selector_strategy=selector_strategies[0],
+            regenerate_all=args.regenerate_all,
+            options_view=args.options_view,
+            delete_intermediate=True
+        )

@@ -4,6 +4,8 @@ import sys
 import argparse
 import glob
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 
 from underlying_data import get_db_connection, fetch_index_daily
 from options_data import fetch_option_intraday_prices
@@ -177,7 +179,7 @@ def _ensure_option_backtest_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_and_display_summary(filename: str) -> None:
+def calculate_and_display_summary(filename: str) -> dict:
     """
     Calculate and display summary metrics for a backtested file.
     
@@ -255,8 +257,19 @@ def calculate_and_display_summary(filename: str) -> None:
             print(f"     Net Profit: N/A (no option P&L data)")
         print()
         
+        # Return summary data
+        return {
+            "filename": filename,
+            "strategy_combination": filename.replace('.csv', ''),
+            "index_prediction_accuracy": index_accuracy if index_accuracy is not None else 0.0,
+            "option_selector_accuracy": option_accuracy if option_accuracy is not None else 0.0,
+            "net_profit": net_profit if net_profit is not None else 0.0,
+            "data": preds  # Return the full dataframe for detailed comparison
+        }
+        
     except Exception as e:
         print(f"  ⚠️  Error calculating summary: {e}")
+        return None
 
 
 def find_prediction_files(underlying: str) -> list:
@@ -617,6 +630,213 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
         return False
 
 
+def create_comparison_excel(underlying: str, summary_data: list) -> None:
+    """
+    Create an Excel file with two sheets comparing all strategy combinations.
+    
+    Sheet 1: Summary of individual strategy backtesting
+    Sheet 2: Detailed comparison by date
+    """
+    if not summary_data:
+        return
+    
+    # Extract strategy names from filenames
+    # Format: {UNDERLYING}_{predictionStrategy}_{selectionStrategy}.csv
+    strategy_combinations = {}
+    for item in summary_data:
+        filename = item["filename"]
+        name_parts = filename.replace('.csv', '').split('_')
+        if len(name_parts) >= 3:
+            pred_strategy = name_parts[1]
+            sel_strategy = '_'.join(name_parts[2:])  # Handle multi-word strategy names
+            strategy_combinations[filename] = {
+                "prediction_strategy": pred_strategy,
+                "selection_strategy": sel_strategy
+            }
+    
+    # Create workbook
+    wb = Workbook()
+    
+    # Sheet 1: Summary
+    ws1 = wb.active
+    ws1.title = "Summary"
+    
+    # Headers
+    headers = ["Strategy Combination", "Index Prediction Accuracy (%)", "Option Selector Accuracy (%)", "Net Profit (₹)"]
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws1.cell(row=1, column=col_idx)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+    
+    # Data rows
+    for row_idx, item in enumerate(summary_data, 2):
+        ws1.cell(row=row_idx, column=1).value = item["strategy_combination"]
+        ws1.cell(row=row_idx, column=2).value = round(item["index_prediction_accuracy"], 2)
+        ws1.cell(row=row_idx, column=3).value = round(item["option_selector_accuracy"], 2)
+        ws1.cell(row=row_idx, column=4).value = round(item["net_profit"], 2)
+    
+    # Auto-adjust column widths
+    for col in ws1.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws1.column_dimensions[col_letter].width = adjusted_width
+    
+    # Sheet 2: Detailed Comparison
+    ws2 = wb.create_sheet("Detailed Comparison")
+    
+    # Collect all unique dates
+    all_dates = set()
+    for item in summary_data:
+        if item["data"] is not None and "date" in item["data"].columns:
+            all_dates.update(item["data"]["date"].dropna().tolist())
+    
+    if not all_dates:
+        wb.save(os.path.join(PRED_DIR, f"{underlying}_comparison.xlsx"))
+        return
+    
+    all_dates = sorted(list(all_dates))
+    
+    # Get unique prediction and selection strategies
+    pred_strategies = sorted(set([sc["prediction_strategy"] for sc in strategy_combinations.values()]))
+    sel_strategies = sorted(set([sc["selection_strategy"] for sc in strategy_combinations.values()]))
+    
+    # Build column headers for Sheet 2
+    col_headers = ["Date", "today_close_1515", "next_open_0915"]
+    
+    # Add prediction strategy columns
+    for pred_strat in pred_strategies:
+        col_headers.append(f"{pred_strat} - prediction")
+        col_headers.append(f"{pred_strat} - result")
+    
+    col_headers.append("option_trade_date")
+    
+    # Add selection strategy columns
+    for sel_strat in sel_strategies:
+        col_headers.append(f"{sel_strat} - option_tradingsymbol")
+        col_headers.append(f"{sel_strat} - option_expiry")
+        col_headers.append(f"{sel_strat} - option_pnl_per_lot")
+        col_headers.append(f"{sel_strat} - option_result")
+    
+    # Write headers
+    for col_idx, header in enumerate(col_headers, 1):
+        cell = ws2.cell(row=1, column=col_idx)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+    
+    # Create a mapping of filename to data
+    data_map = {item["filename"]: item["data"] for item in summary_data if item["data"] is not None}
+    
+    # Write data rows
+    for row_idx, date in enumerate(all_dates, 2):
+        ws2.cell(row=row_idx, column=1).value = date
+        
+        # Get common columns (today_close_1515, next_open_0915) from first available file
+        first_data = None
+        for data in data_map.values():
+            if data is not None and len(data) > 0:
+                first_data = data
+                break
+        
+        if first_data is not None:
+            date_mask = first_data["date"] == date
+            if date_mask.any():
+                row_data = first_data[date_mask].iloc[0]
+                if "today_close_1515" in row_data:
+                    ws2.cell(row=row_idx, column=2).value = row_data.get("today_close_1515")
+                if "next_open_0915" in row_data:
+                    ws2.cell(row=row_idx, column=3).value = row_data.get("next_open_0915")
+        
+        col_idx = 4  # Start after Date, today_close_1515, next_open_0915
+        
+        # Add prediction strategy data
+        for pred_strat in pred_strategies:
+            # Find file with this prediction strategy
+            matching_file = None
+            for filename, sc in strategy_combinations.items():
+                if sc["prediction_strategy"] == pred_strat and filename in data_map:
+                    matching_file = filename
+                    break
+            
+            if matching_file and matching_file in data_map:
+                data = data_map[matching_file]
+                date_mask = data["date"] == date
+                if date_mask.any():
+                    row_data = data[date_mask].iloc[0]
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("prediction")
+                    col_idx += 1
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("result")
+                    col_idx += 1
+                else:
+                    col_idx += 2  # Skip if no data
+            else:
+                col_idx += 2  # Skip if no matching file
+        
+        # Add option_trade_date (from first available file with option data)
+        for filename, data in data_map.items():
+            if data is not None:
+                date_mask = data["date"] == date
+                if date_mask.any():
+                    row_data = data[date_mask].iloc[0]
+                    if "option_trade_date" in row_data and pd.notna(row_data.get("option_trade_date")):
+                        ws2.cell(row=row_idx, column=col_idx).value = row_data.get("option_trade_date")
+                        break
+        col_idx += 1
+        
+        # Add selection strategy data
+        for sel_strat in sel_strategies:
+            # Find file with this selection strategy
+            matching_file = None
+            for filename, sc in strategy_combinations.items():
+                if sc["selection_strategy"] == sel_strat and filename in data_map:
+                    matching_file = filename
+                    break
+            
+            if matching_file and matching_file in data_map:
+                data = data_map[matching_file]
+                date_mask = data["date"] == date
+                if date_mask.any():
+                    row_data = data[date_mask].iloc[0]
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("option_tradingsymbol")
+                    col_idx += 1
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("option_expiry")
+                    col_idx += 1
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("option_pnl_per_lot")
+                    col_idx += 1
+                    ws2.cell(row=row_idx, column=col_idx).value = row_data.get("option_result")
+                    col_idx += 1
+                else:
+                    col_idx += 4  # Skip if no data
+            else:
+                col_idx += 4  # Skip if no matching file
+    
+    # Auto-adjust column widths for Sheet 2
+    for col in ws2.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws2.column_dimensions[col_letter].width = adjusted_width
+    
+    # Save workbook
+    excel_path = os.path.join(PRED_DIR, f"{underlying}_comparison.xlsx")
+    wb.save(excel_path)
+    print(f"  📊 Comparison Excel saved to: {excel_path}")
+
+
 def main(underlying: str, options_view: str | None = None, skip_index: bool = False, skip_option: bool = False):
     """
     Main function to backtest all prediction files for a given underlying.
@@ -643,6 +863,7 @@ def main(underlying: str, options_view: str | None = None, skip_index: bool = Fa
     
     success_count = 0
     fail_count = 0
+    summary_data = []  # Collect summary data for Excel
     
     for i, filename in enumerate(files, 1):
         print(f"[{i}/{len(files)}] Processing: {filename}")
@@ -667,14 +888,22 @@ def main(underlying: str, options_view: str | None = None, skip_index: bool = Fa
         
         if (skip_index or index_success) and (skip_option or option_success):
             success_count += 1
-            # Calculate and display summary for this file
-            calculate_and_display_summary(filename)
+            # Calculate and display summary for this file, collect data
+            summary = calculate_and_display_summary(filename)
+            if summary:
+                summary_data.append(summary)
         
         print()  # Empty line between files
     
     print(f"{'='*70}")
     print(f"Summary: {success_count} file(s) processed successfully, {fail_count} failed")
     print(f"{'='*70}\n")
+    
+    # Generate comparison Excel file if we have data
+    if summary_data:
+        print(f"Generating comparison Excel file...")
+        create_comparison_excel(underlying, summary_data)
+        print(f"✅ Comparison Excel file created successfully\n")
 
 
 if __name__ == "__main__":

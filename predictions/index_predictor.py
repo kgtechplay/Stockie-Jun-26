@@ -1,99 +1,20 @@
-# nifty_predictor.py (now supports NIFTY and BANKNIFTY)
+# index_predictor.py (now supports NIFTY and BANKNIFTY)
 import os
 import sys
 import argparse
-from typing import Callable, Dict
 import pandas as pd
 
 from underlying_data import get_db_connection, fetch_index_daily
-from option_selector import main as run_option_selection, SELECTION_STRATEGIES
+from option_selector import main as run_option_selection
+from selection_logic import SELECTION_STRATEGIES
+from prediction_logic import (
+    PREDICTION_STRATEGIES,
+    PredictionFunction,
+    LOOKBACK_DAYS
+)
 
-LOOKBACK_DAYS = 10
-TREND_THRESH = 0.003          # 0.3% move over last 10 days to call trend
 PRED_DIR = "predictions/output"
 PRED_FILE_TEMPLATE = "{underlying}_{strategy}_predicted.csv"   # e.g. NIFTY_trendFollowing_predicted.csv
-
-# Type definition for prediction functions
-# Input: window_closes (pd.Series), optional parameters
-# Output: str ("CALL", "PUT", or "NO_POSITION")
-PredictionFunction = Callable[[pd.Series], str]
-
-
-def predict_trend_following(window_closes: pd.Series,
-                            trend_thresh: float = TREND_THRESH) -> str:
-    """
-    Strategy 1: Trend Following
-    Use last LOOKBACK_DAYS closes to decide:
-      - "CALL" (expect up), "PUT" (expect down), or "NO_POSITION".
-    Original strategy - looks for trend direction and mean comparison.
-    """
-    first_close = float(window_closes.iloc[0])
-    last_close = float(window_closes.iloc[-1])
-    mean_close = float(window_closes.mean())
-
-    trend_pct = (last_close - first_close) / first_close if first_close != 0 else 0.0
-
-    if trend_pct > trend_thresh and last_close > mean_close:
-        return "CALL"
-    elif trend_pct < -trend_thresh and last_close < mean_close:
-        return "PUT"
-    else:
-        return "NO_POSITION"
-
-
-def predict_momentum(window_closes: pd.Series,
-                     momentum_thresh: float = 0.005) -> str:
-    """
-    Strategy 2: Momentum
-    Uses recent momentum (last 3 days vs previous 3 days) to predict direction.
-    More sensitive to short-term momentum changes.
-    """
-    if len(window_closes) < 6:
-        return "NO_POSITION"
-    
-    recent_avg = float(window_closes.iloc[-3:].mean())
-    previous_avg = float(window_closes.iloc[-6:-3].mean()) if len(window_closes) >= 6 else float(window_closes.iloc[0])
-    
-    momentum_pct = (recent_avg - previous_avg) / previous_avg if previous_avg != 0 else 0.0
-    
-    if momentum_pct > momentum_thresh:
-        return "CALL"
-    elif momentum_pct < -momentum_thresh:
-        return "PUT"
-    else:
-        return "NO_POSITION"
-
-
-def predict_mean_reversion(window_closes: pd.Series,
-                           deviation_thresh: float = 0.01) -> str:
-    """
-    Strategy 3: Mean Reversion
-    Predicts opposite direction when price deviates significantly from mean.
-    Expects price to revert to mean.
-    """
-    current_close = float(window_closes.iloc[-1])
-    mean_close = float(window_closes.mean())
-    std_close = float(window_closes.std())
-    
-    if std_close == 0:
-        return "NO_POSITION"
-    
-    z_score = (current_close - mean_close) / std_close
-    
-    if z_score > 1.0:  # Price is significantly above mean, expect reversion down
-        return "PUT"
-    elif z_score < -1.0:  # Price is significantly below mean, expect reversion up
-        return "CALL"
-    else:
-        return "NO_POSITION"
-
-
-# Registry of available prediction strategies
-PREDICTION_STRATEGIES: Dict[str, PredictionFunction] = {
-    "trendFollowing": predict_trend_following,
-    "momentum": predict_momentum,
-    "meanReversion": predict_mean_reversion,
-}
 
 
 def generate_index_predictions(df_daily: pd.DataFrame,
@@ -259,9 +180,8 @@ Example: NIFTY_trendFollowing_predicted.csv
     )
     parser.add_argument(
         "-s", "--strategy",
-        default="trendFollowing",
-        choices=list(PREDICTION_STRATEGIES.keys()),
-        help="Prediction strategy to use"
+        default=None,
+        help="Prediction strategy to use (if not provided, runs for all strategies). Available: " + ", ".join(PREDICTION_STRATEGIES.keys())
     )
     parser.add_argument(
         "--no-regenerate",
@@ -290,9 +210,41 @@ Example: NIFTY_trendFollowing_predicted.csv
             print(f"  {name:25s} - {doc}")
         sys.exit(0)
     
-    main(
-        underlying=args.underlying,
-        predictor_strategy=args.strategy,
-        regenerate_all=args.regenerate_all,
-        run_option_selection_auto=args.auto_option_selection
-    )
+    # If no strategy specified, run for all strategies
+    if args.strategy is None:
+        print(f"[{args.underlying}] No strategy specified. Running for all prediction strategies...")
+        print(f"{'='*60}\n")
+        
+        for strategy_name in PREDICTION_STRATEGIES.keys():
+            try:
+                print(f"\n{'='*60}")
+                print(f"Running prediction strategy: {strategy_name}")
+                print(f"{'='*60}\n")
+                main(
+                    underlying=args.underlying,
+                    predictor_strategy=strategy_name,
+                    regenerate_all=args.regenerate_all,
+                    run_option_selection_auto=args.auto_option_selection
+                )
+            except Exception as e:
+                print(f"Error running prediction strategy '{strategy_name}': {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n{'='*60}")
+        print(f"Completed running all prediction strategies for {args.underlying}")
+        print(f"{'='*60}\n")
+    else:
+        # Validate strategy if provided
+        if args.strategy not in PREDICTION_STRATEGIES:
+            available = ", ".join(PREDICTION_STRATEGIES.keys())
+            print(f"Error: Unknown prediction strategy '{args.strategy}'.")
+            print(f"Available strategies: {available}")
+            sys.exit(1)
+        
+        main(
+            underlying=args.underlying,
+            predictor_strategy=args.strategy,
+            regenerate_all=args.regenerate_all,
+            run_option_selection_auto=args.auto_option_selection
+        )
