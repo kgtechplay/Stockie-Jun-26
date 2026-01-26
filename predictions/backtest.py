@@ -7,16 +7,11 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
-from underlying_data import get_db_connection, fetch_index_daily
+from underlying_data import get_db_connection, fetch_index_daily, fetch_5m_candles_for_dates
 from options_data import fetch_option_intraday_prices
 
 PRED_DIR = "predictions/output"
 SIGNIFICANT_MOVE_THRESH = 0.01   # 1% gap => MISSED_CALL / MISSED_PUT for NO_POSITION
-
-DEFAULT_OPTIONS_VIEWS = {
-    "NIFTY": "dbo.vw_NiftySnapshotWithUnderlying",
-    "BANKNIFTY": "dbo.vw_BankNiftySnapshotWithUnderlying",
-}
 
 
 def _ensure_backtest_columns(preds: pd.DataFrame) -> pd.DataFrame:
@@ -28,7 +23,9 @@ def _ensure_backtest_columns(preds: pd.DataFrame) -> pd.DataFrame:
         "today_close_1515",
         "next_date",
         "next_open_0915",
-        "gap_move_pct",
+        "next_close_1515",
+        "next_day_move_pct",
+        "predicted_max_delta",
         "result",
     ]
     for c in cols:
@@ -44,7 +41,7 @@ def _reorder_columns_after_index_backtest(preds: pd.DataFrame) -> pd.DataFrame:
     Desired order:
     - date
     - prediction
-    - today_close_1515, next_date, next_open_0915, gap_move_pct, result (index backtest)
+    - today_close_1515, next_date, next_open_0915, next_close_1515, next_day_move_pct, predicted_max_delta, result (index backtest)
     - option_trade_date, option_instrument_token, ... (option selection columns)
     - option_entry_date, ... (option backtest columns)
     """
@@ -55,7 +52,7 @@ def _reorder_columns_after_index_backtest(preds: pd.DataFrame) -> pd.DataFrame:
     all_cols = list(preds.columns)
     
     # Define column groups
-    index_backtest_cols = ["today_close_1515", "next_date", "next_open_0915", "gap_move_pct", "result"]
+    index_backtest_cols = ["today_close_1515", "next_date", "next_open_0915", "next_close_1515", "next_day_move_pct", "predicted_max_delta", "result"]
     option_selection_cols = [
         "option_trade_date", "option_instrument_token", "option_tradingsymbol",
         "option_strike", "option_expiry", "option_type", "selection_option_price_1515"
@@ -103,7 +100,7 @@ def _reorder_columns_after_option_backtest(preds: pd.DataFrame) -> pd.DataFrame:
     Desired order:
     - date
     - prediction
-    - today_close_1515, next_date, next_open_0915, gap_move_pct, result (index backtest)
+    - today_close_1515, next_date, next_open_0915, next_close_1515, next_day_move_pct, predicted_max_delta, result (index backtest)
     - option_trade_date, option_instrument_token, option_tradingsymbol, option_strike, 
       option_expiry, option_type, selection_option_price_1515
     - option_entry_date, option_entry_price_0915, ... (option backtest columns)
@@ -116,7 +113,7 @@ def _reorder_columns_after_option_backtest(preds: pd.DataFrame) -> pd.DataFrame:
     all_cols = list(preds.columns)
     
     # Define column groups
-    index_backtest_cols = ["today_close_1515", "next_date", "next_open_0915", "gap_move_pct", "result"]
+    index_backtest_cols = ["today_close_1515", "next_date", "next_open_0915", "next_close_1515", "next_day_move_pct", "predicted_max_delta", "result"]
     option_selection_cols = [
         "option_trade_date", "option_instrument_token", "option_tradingsymbol",
         "option_strike", "option_expiry", "option_type", "selection_option_price_1515"
@@ -240,7 +237,7 @@ def calculate_and_display_summary(filename: str) -> dict:
             net_profit = None
         
         # Display summary
-        print(f"  📊 Summary for {filename}:")
+        print(f"  [SUMMARY] Summary for {filename}:")
         if index_accuracy is not None:
             print(f"     Index Prediction Accuracy: {index_accuracy:.2f}% ({correct_predictions}/{total_predictions} correct)")
         else:
@@ -252,7 +249,7 @@ def calculate_and_display_summary(filename: str) -> dict:
             print(f"     Option Selector Accuracy: N/A (no option backtest results)")
         
         if net_profit is not None:
-            print(f"     Net Profit: ₹{net_profit:,.2f}")
+            print(f"     Net Profit: INR {net_profit:,.2f}")
         else:
             print(f"     Net Profit: N/A (no option P&L data)")
         print()
@@ -268,7 +265,7 @@ def calculate_and_display_summary(filename: str) -> dict:
         }
         
     except Exception as e:
-        print(f"  ⚠️  Error calculating summary: {e}")
+        print(f"  [WARN] Error calculating summary: {e}")
         return None
 
 
@@ -325,7 +322,7 @@ def run_index_backtest(filename: str, underlying: str) -> bool:
     path = os.path.join(PRED_DIR, filename)
     
     if not os.path.isfile(path):
-        print(f"  ⚠️  File not found: {path}")
+        print(f"  [WARN] File not found: {path}")
         return False
     
     try:
@@ -344,12 +341,53 @@ def run_index_backtest(filename: str, underlying: str) -> bool:
         df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"]).dt.normalize()
         df_daily = df_daily.sort_values("trade_date").reset_index(drop=True)
 
+        # Map column names to what backtest expects
+        # fetch_index_daily returns: close_price, open_price -> backtest expects: close_1515, open_0915, open_915
+        if "close_price" in df_daily.columns:
+            df_daily["close_1515"] = df_daily["close_price"]
+        if "open_price" in df_daily.columns:
+            df_daily["open_0915"] = df_daily["open_price"]
+            df_daily["open_915"] = df_daily["open_price"]  # Also map to open_915 for compatibility
+
         # Build mapping: date -> next trading date
         df_daily["next_trade_date"] = df_daily["trade_date"].shift(-1)
         next_map = df_daily.set_index("trade_date")["next_trade_date"]
 
         # Fast lookup for daily data
         daily_by_date = df_daily.set_index("trade_date")
+
+        # First pass: collect all next_dates that we'll need for 5-minute candle queries
+        next_dates_to_fetch = set()
+        for idx, row in preds.iterrows():
+            date = row["date"]
+            if pd.isna(date) or date not in next_map.index:
+                continue
+            next_date = next_map[date]
+            if pd.notna(next_date) and next_date in daily_by_date.index:
+                next_dates_to_fetch.add(next_date)
+        
+        # Batch fetch 5-minute candle data for all unique next_dates
+        candles_5m_df = pd.DataFrame()
+        if next_dates_to_fetch:
+            conn = get_db_connection()
+            try:
+                candles_5m_df = fetch_5m_candles_for_dates(
+                    conn,
+                    underlying=underlying,
+                    dates=list(next_dates_to_fetch)
+                )
+            finally:
+                conn.close()
+        
+        # Create lookup dictionary: next_date -> (min_low, max_high)
+        candles_lookup = {}
+        if not candles_5m_df.empty:
+            for _, candle_row in candles_5m_df.iterrows():
+                trade_date = candle_row["trade_date"]
+                candles_lookup[trade_date] = {
+                    "min_low_price": float(candle_row["min_low_price"]) if pd.notna(candle_row["min_low_price"]) else None,
+                    "max_high_price": float(candle_row["max_high_price"]) if pd.notna(candle_row["max_high_price"]) else None,
+                }
 
         # ---- full recompute for ALL rows ----
         for idx, row in preds.iterrows():
@@ -359,7 +397,9 @@ def run_index_backtest(filename: str, underlying: str) -> bool:
             preds.at[idx, "today_close_1515"] = pd.NA
             preds.at[idx, "next_date"] = pd.NA
             preds.at[idx, "next_open_0915"] = pd.NA
-            preds.at[idx, "gap_move_pct"] = pd.NA
+            preds.at[idx, "next_close_1515"] = pd.NA
+            preds.at[idx, "next_day_move_pct"] = pd.NA
+            preds.at[idx, "predicted_max_delta"] = pd.NA
             preds.at[idx, "result"] = pd.NA
 
             if pd.isna(date):
@@ -391,19 +431,52 @@ def run_index_backtest(filename: str, underlying: str) -> bool:
             next_open = float(daily_by_date.loc[next_date, "open_915"])
             preds.at[idx, "next_open_0915"] = next_open
 
-            # Gap move
-            gap_move_pct = (next_open - today_close) / today_close if today_close != 0 else 0.0
-            preds.at[idx, "gap_move_pct"] = gap_move_pct
+            # Next day's 15:15 close
+            next_close = float(daily_by_date.loc[next_date, "close_1515"])
+            preds.at[idx, "next_close_1515"] = next_close
 
-            # Tag result based on prediction vs gap direction
+            # Calculate next day move percentage (renamed from gap_move_pct)
+            next_day_move_pct = (next_open - today_close) / today_close if today_close != 0 else 0.0
+            preds.at[idx, "next_day_move_pct"] = next_day_move_pct
+
+            # Calculate predicted_max_delta based on 5-minute candle data (do this first)
+            predicted_max_delta = pd.NA
             pred = row["prediction"]
+            
+            if next_date in candles_lookup:
+                candle_data = candles_lookup[next_date]
+                
+                if pred == "PUT" and candle_data["min_low_price"] is not None:
+                    # PUT: (today_close - lowest_next_day_price) / today_close
+                    lowest_price = candle_data["min_low_price"]
+                    if today_close > 0:
+                        predicted_max_delta = (today_close - lowest_price) / today_close
+                        preds.at[idx, "predicted_max_delta"] = predicted_max_delta
+                elif pred == "CALL" and candle_data["max_high_price"] is not None:
+                    # CALL: (highest_next_day_price - today_close) / today_close
+                    highest_price = candle_data["max_high_price"]
+                    if today_close > 0:
+                        predicted_max_delta = (highest_price - today_close) / today_close
+                        preds.at[idx, "predicted_max_delta"] = predicted_max_delta
+
+            # Determine result based on prediction logic
+            # For CALL/PUT: result = CORRECT if predicted_max_delta > 0
+            # For other predictions: use current logic
             if pred == "CALL":
-                result = "CORRECT" if gap_move_pct > 0 else "INCORRECT"
+                # CORRECT if predicted_max_delta > 0
+                if pd.notna(predicted_max_delta) and predicted_max_delta > 0:
+                    result = "CORRECT"
+                else:
+                    result = "INCORRECT"
             elif pred == "PUT":
-                result = "CORRECT" if gap_move_pct < 0 else "INCORRECT"
+                # CORRECT if predicted_max_delta > 0
+                if pd.notna(predicted_max_delta) and predicted_max_delta > 0:
+                    result = "CORRECT"
+                else:
+                    result = "INCORRECT"
             elif pred == "NO_POSITION":
-                if abs(gap_move_pct) >= SIGNIFICANT_MOVE_THRESH:
-                    result = "MISSED_CALL" if gap_move_pct > 0 else "MISSED_PUT"
+                if abs(next_day_move_pct) >= SIGNIFICANT_MOVE_THRESH:
+                    result = "MISSED_CALL" if next_day_move_pct > 0 else "MISSED_PUT"
                 else:
                     result = "OK_NO_TRADE"
             else:
@@ -420,11 +493,11 @@ def run_index_backtest(filename: str, underlying: str) -> bool:
         os.makedirs(PRED_DIR, exist_ok=True)
         preds.to_csv(path, index=False)
 
-        print(f"  ✅ Index backtest completed: {len(preds)} rows")
+        print(f"  [OK] Index backtest completed: {len(preds)} rows")
         return True
         
     except Exception as e:
-        print(f"  ❌ Error in index backtest: {e}")
+        print(f"  [ERROR] Error in index backtest: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -437,7 +510,7 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
     Args:
         filename: Name of the prediction file (e.g., "NIFTY_trendFollowing_nearestExpiryATM.csv")
         underlying: NIFTY or BANKNIFTY
-        options_view: Override options snapshot view name
+
         
     Returns:
         True if successful, False otherwise
@@ -445,14 +518,10 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
     path = os.path.join(PRED_DIR, filename)
     
     if not os.path.isfile(path):
-        print(f"  ⚠️  File not found: {path}")
+        print(f"  [WARN] File not found: {path}")
         return False
     
     try:
-        if options_view is None:
-            options_view = DEFAULT_OPTIONS_VIEWS.get(
-                underlying, "dbo.vw_NiftySnapshotWithUnderlying"
-            )
 
         preds = pd.read_csv(path, parse_dates=["date"])
         preds["date"] = preds["date"].dt.normalize()
@@ -478,7 +547,7 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
         )
         needing = preds[mask].copy()
         if needing.empty:
-            print(f"  ⚠️  No rows with CALL/PUT + option_instrument_token to backtest")
+            print(f"  [WARN] No rows with CALL/PUT + option_instrument_token to backtest")
             preds = preds.sort_values("date").reset_index(drop=True)
             preds = _reorder_columns_after_option_backtest(preds)
             os.makedirs(PRED_DIR, exist_ok=True)
@@ -520,7 +589,7 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
             tokens.add(token)
 
         if not entry_dates or not tokens:
-            print(f"  ⚠️  No valid entry dates or tokens to backtest")
+            print(f"  [WARN] No valid entry dates or tokens to backtest")
             preds = preds.sort_values("date").reset_index(drop=True)
             preds = _reorder_columns_after_option_backtest(preds)
             os.makedirs(PRED_DIR, exist_ok=True)
@@ -537,13 +606,12 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
                 instrument_tokens=tokens,
                 start_date=start_date,
                 end_date=end_date,
-                view_name=options_view,
             )
         finally:
             conn.close()
 
         if prices_df.empty:
-            print(f"  ⚠️  No option price data found for required tokens/date range")
+            print(f"  [WARN] No option price data found for required tokens/date range")
             preds = preds.sort_values("date").reset_index(drop=True)
             preds = _reorder_columns_after_option_backtest(preds)
             os.makedirs(PRED_DIR, exist_ok=True)
@@ -620,11 +688,11 @@ def run_option_backtest(filename: str, underlying: str, options_view: str | None
         os.makedirs(PRED_DIR, exist_ok=True)
         preds.to_csv(path, index=False)
 
-        print(f"  ✅ Option backtest completed: {len(preds[mask])} rows")
+        print(f"  [OK] Option backtest completed: {len(preds[mask])} rows")
         return True
         
     except Exception as e:
-        print(f"  ❌ Error in option backtest: {e}")
+        print(f"  [ERROR] Error in option backtest: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -662,7 +730,7 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
     ws1.title = "Summary"
     
     # Headers
-    headers = ["Strategy Combination", "Index Prediction Accuracy (%)", "Option Selector Accuracy (%)", "Net Profit (₹)"]
+    headers = ["Strategy Combination", "Index Prediction Accuracy (%)", "Option Selector Accuracy (%)", "Net Profit (INR)"]
     for col_idx, header in enumerate(headers, 1):
         cell = ws1.cell(row=1, column=col_idx)
         cell.value = header
@@ -709,7 +777,7 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
     sel_strategies = sorted(set([sc["selection_strategy"] for sc in strategy_combinations.values()]))
     
     # Build column headers for Sheet 2
-    col_headers = ["Date", "today_close_1515", "next_open_0915"]
+    col_headers = ["Date", "today_close_1515", "next_open_0915", "next_close_1515"]
     
     # Add prediction strategy columns
     for pred_strat in pred_strategies:
@@ -739,7 +807,7 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
     for row_idx, date in enumerate(all_dates, 2):
         ws2.cell(row=row_idx, column=1).value = date
         
-        # Get common columns (today_close_1515, next_open_0915) from first available file
+        # Get common columns (today_close_1515, next_open_0915, next_close_1515) from first available file
         first_data = None
         for data in data_map.values():
             if data is not None and len(data) > 0:
@@ -754,8 +822,10 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
                     ws2.cell(row=row_idx, column=2).value = row_data.get("today_close_1515")
                 if "next_open_0915" in row_data:
                     ws2.cell(row=row_idx, column=3).value = row_data.get("next_open_0915")
+                if "next_close_1515" in row_data:
+                    ws2.cell(row=row_idx, column=4).value = row_data.get("next_close_1515")
         
-        col_idx = 4  # Start after Date, today_close_1515, next_open_0915
+        col_idx = 5  # Start after Date, today_close_1515, next_open_0915, next_close_1515
         
         # Add prediction strategy data
         for pred_strat in pred_strategies:
@@ -834,16 +904,15 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
     # Save workbook
     excel_path = os.path.join(PRED_DIR, f"{underlying}_comparison.xlsx")
     wb.save(excel_path)
-    print(f"  📊 Comparison Excel saved to: {excel_path}")
+    print(f"  [OK] Comparison Excel saved to: {excel_path}")
 
 
-def main(underlying: str, options_view: str | None = None, skip_index: bool = False, skip_option: bool = False):
+def main(underlying: str, skip_index: bool = False, skip_option: bool = False):
     """
     Main function to backtest all prediction files for a given underlying.
     
     Args:
         underlying: NIFTY or BANKNIFTY
-        options_view: Override options snapshot view name
         skip_index: If True, skip index backtest
         skip_option: If True, skip option backtest
     """
@@ -853,7 +922,7 @@ def main(underlying: str, options_view: str | None = None, skip_index: bool = Fa
     files = find_prediction_files(underlying)
     
     if not files:
-        print(f"❌ No prediction files found for {underlying}")
+        print(f"[ERROR] No prediction files found for {underlying}")
         print(f"   Searched in: {os.path.join(PRED_DIR, f'{underlying}_*.csv')}")
         return
     
@@ -879,7 +948,7 @@ def main(underlying: str, options_view: str | None = None, skip_index: bool = Fa
         
         # Run option backtest
         if not skip_option:
-            option_success = run_option_backtest(filename, underlying, options_view)
+            option_success = run_option_backtest(filename, underlying)
             if not option_success:
                 fail_count += 1
                 continue
@@ -903,7 +972,7 @@ def main(underlying: str, options_view: str | None = None, skip_index: bool = Fa
     if summary_data:
         print(f"Generating comparison Excel file...")
         create_comparison_excel(underlying, summary_data)
-        print(f"✅ Comparison Excel file created successfully\n")
+        print(f"[OK] Comparison Excel file created successfully\n")
 
 
 if __name__ == "__main__":
@@ -935,11 +1004,6 @@ Examples:
         help="Underlying index (NIFTY or BANKNIFTY)"
     )
     parser.add_argument(
-        "--options-view",
-        default=None,
-        help="Override options snapshot view name (defaults depend on underlying)"
-    )
-    parser.add_argument(
         "--skip-index",
         action="store_true",
         help="Skip index backtest (only run option backtest)"
@@ -953,12 +1017,11 @@ Examples:
     args = parser.parse_args()
     
     if args.skip_index and args.skip_option:
-        print("❌ Error: Cannot skip both index and option backtest")
+        print("[ERROR] Cannot skip both index and option backtest")
         sys.exit(1)
     
     main(
         underlying=args.underlying,
-        options_view=args.options_view,
         skip_index=args.skip_index,
         skip_option=args.skip_option
     )

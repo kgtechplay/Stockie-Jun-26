@@ -200,7 +200,7 @@ def select_highest_delta_price_ratio(chain_df: pd.DataFrame,
 # Registry of available selection strategies
 SELECTION_STRATEGIES: Dict[str, SelectionFunction] = {
     "nearestExpiryATM": select_nearest_expiry_atm,
-    "nearestExpiryHighOI": select_nearest_expiry_high_oi,
-    "highestDeltaPriceRatio": select_highest_delta_price_ratio,
+    # "nearestExpiryHighOI": select_nearest_expiry_high_oi,
+    # "highestDeltaPriceRatio": select_highest_delta_price_ratio,
 }
 

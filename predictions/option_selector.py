@@ -155,8 +155,9 @@ def main(underlying: str,
                 print(f"[{underlying}] Warning: Could not delete {base_filename}: {e}")
         return
 
-    start_date = min(needed_dates).date()
-    end_date = max(needed_dates).date()
+    # Always fetch full-year 2025 to ensure option chains are available
+    start_date = pd.Timestamp("2025-01-01").date()
+    end_date = pd.Timestamp("2025-12-31").date()
 
     conn = get_db_connection()
     try:
@@ -164,7 +165,6 @@ def main(underlying: str,
             conn,
             start_date=start_date,
             end_date=end_date,
-            view_name=options_view,
             underlying_like=f"{underlying}%",
         )
     finally:

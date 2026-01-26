@@ -825,3 +825,108 @@ class AzureSqlClient:
         
         cur.close()
         return result
+
+    # ---------- KITE ACCESS TOKEN ----------
+
+    def save_kite_access_token(self, access_token: str) -> None:
+        """
+        Save or update the Kite access token in the database.
+        Creates the table if it doesn't exist, then upserts the token.
+        
+        Args:
+            access_token: The Kite Connect access token to save
+        """
+        cursor = self.conn.cursor()
+        
+        try:
+            # Create table if it doesn't exist
+            cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.KiteAccessToken') AND type in (N'U'))
+                BEGIN
+                    CREATE TABLE dbo.KiteAccessToken (
+                        id INT PRIMARY KEY IDENTITY(1,1),
+                        access_token NVARCHAR(MAX) NOT NULL,
+                        created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+                        updated_at DATETIME2 NOT NULL DEFAULT GETDATE()
+                    )
+                END
+            """)
+            
+            # Add updated_at column if it doesn't exist (for existing tables)
+            cursor.execute("""
+                IF NOT EXISTS (
+                    SELECT * FROM sys.columns 
+                    WHERE object_id = OBJECT_ID(N'dbo.KiteAccessToken') 
+                    AND name = 'updated_at'
+                )
+                BEGIN
+                    ALTER TABLE dbo.KiteAccessToken
+                    ADD updated_at DATETIME2 NOT NULL DEFAULT GETDATE()
+                END
+            """)
+            
+            # Check if a token already exists
+            cursor.execute("SELECT COUNT(*) FROM dbo.KiteAccessToken")
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                # Insert new token
+                cursor.execute("""
+                    INSERT INTO dbo.KiteAccessToken (access_token, created_at, updated_at)
+                    VALUES (?, GETDATE(), GETDATE())
+                """, (access_token,))
+            else:
+                # Update the most recently updated token (or first one if updated_at is NULL)
+                # This ensures we always overwrite the active token
+                cursor.execute("""
+                    UPDATE dbo.KiteAccessToken
+                    SET access_token = ?, updated_at = GETDATE()
+                    WHERE id = (
+                        SELECT TOP 1 id 
+                        FROM dbo.KiteAccessToken 
+                        ORDER BY updated_at DESC, id
+                    )
+                """, (access_token,))
+            
+            self.conn.commit()
+            
+        except Exception as e:
+            self.conn.rollback()
+            raise RuntimeError(f"Failed to save access token to database: {e}") from e
+        finally:
+            cursor.close()
+
+    def get_kite_access_token(self) -> str | None:
+        """
+        Retrieve the latest Kite access token from the database.
+        Tries both table name variations: kiteAccessToken and KiteAccessToken
+        
+        Returns:
+            The access token string, or None if not found
+        """
+        cursor = self.conn.cursor()
+        
+        # Try both table name variations (case-insensitive, but explicit is better)
+        table_names = ["dbo.kiteAccessToken", "dbo.KiteAccessToken", "kiteAccessToken", "KiteAccessToken"]
+        
+        for table_name in table_names:
+        try:
+                cursor.execute(f"""
+                SELECT TOP 1 access_token
+                    FROM {table_name}
+                ORDER BY updated_at DESC
+            """)
+            
+            row = cursor.fetchone()
+            if row:
+                    token = row[0]
+                    # Ensure token is a string and clean it
+                    if token:
+                        return str(token).strip()
+                # If we got here, table exists but no rows
+                break
+        except Exception as e:
+                # Table doesn't exist with this name, try next variation
+                continue
+        
+            return None
