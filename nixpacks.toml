@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ['unixODBC', 'unixODBCDev', 'curl', 'gnupg']
+
+[phases.install]
+cmds = [
+  'bash build.sh'
+]
+
+[start]
+cmd = "gunicorn api:app --bind 0.0.0.0:$PORT"
+
