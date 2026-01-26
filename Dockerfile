@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 # Install system dependencies for ODBC
 # Install Microsoft ODBC Driver 18 for SQL Server
+# Use Debian 12 repository (works for Debian 12/13) with proper GPG key setup
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
@@ -9,13 +10,8 @@ RUN apt-get update && \
     ca-certificates \
     apt-transport-https \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
-    && bash -c 'DEB_VERSION=$(cat /etc/debian_version | cut -d. -f1); \
-    if [ "$DEB_VERSION" = "12" ]; then \
-        curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list; \
-    else \
-        curl -fsSL https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list; \
-    fi' && \
-    apt-get update && \
+    && echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update && \
     ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     msodbcsql18 \
     unixodbc-dev \
