@@ -910,23 +910,23 @@ class AzureSqlClient:
         table_names = ["dbo.kiteAccessToken", "dbo.KiteAccessToken", "kiteAccessToken", "KiteAccessToken"]
         
         for table_name in table_names:
-        try:
+            try:
                 cursor.execute(f"""
                 SELECT TOP 1 access_token
                     FROM {table_name}
                 ORDER BY updated_at DESC
             """)
-            
-            row = cursor.fetchone()
-            if row:
+                
+                row = cursor.fetchone()
+                if row:
                     token = row[0]
                     # Ensure token is a string and clean it
                     if token:
                         return str(token).strip()
                 # If we got here, table exists but no rows
                 break
-        except Exception as e:
+            except Exception as e:
                 # Table doesn't exist with this name, try next variation
                 continue
         
-            return None
+        return None
