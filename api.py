@@ -364,6 +364,352 @@ def get_option_trend():
         }), 500
 
 
+# ----------------- Predictions: INDEX PREDICTION & BACKTEST -----------------
+
+@app.route('/api/predictions/strategies', methods=['GET'])
+def get_prediction_strategies():
+    """
+    Get list of all available prediction strategies.
+    
+    Response:
+    {
+        "success": true,
+        "strategies": ["trendUpRangeBreakout", "MaTrend_001", ...]
+    }
+    """
+    try:
+        # Import prediction strategies from prediction_logic
+        predictions_path = Path(__file__).parent / "predictions"
+        if str(predictions_path) not in sys.path:
+            sys.path.insert(0, str(predictions_path))
+        
+        # Dynamic import to avoid linter warnings
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "prediction_logic",
+            predictions_path / "prediction_logic.py"
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("Could not load prediction_logic module")
+        
+        prediction_logic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prediction_logic)
+        
+        strategies = list(prediction_logic.PREDICTION_STRATEGIES.keys())
+        return jsonify({
+            "success": True,
+            "strategies": strategies
+        }), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/predictions/run', methods=['POST'])
+def run_predictions():
+    """
+    Run index_predictor.py for selected instrument and strategies.
+    
+    Request body:
+    {
+        "instrument": "NIFTY" or "BANKNIFTY",
+        "strategies": ["trendUpRangeBreakout", "MaTrend_001", ...]
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Predictions generated successfully",
+        "files": ["NIFTY_trendUpRangeBreakout_predicted.csv", ...]
+    }
+    """
+    import subprocess
+    import logging
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "Request body is required"}), 400
+        
+        instrument = data.get("instrument", "").strip().upper()
+        strategies = data.get("strategies", [])
+        
+        if instrument not in ["NIFTY", "BANKNIFTY"]:
+            return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
+        
+        if not strategies or not isinstance(strategies, list):
+            return jsonify({"success": False, "error": "strategies must be a non-empty list"}), 400
+        
+        project_root = Path(__file__).parent
+        predictor_script = project_root / "predictions" / "index_predictor.py"
+        
+        if not predictor_script.exists():
+            return jsonify({"success": False, "error": "index_predictor.py not found"}), 500
+        
+        generated_files = []
+        errors = []
+        
+        for strategy in strategies:
+            try:
+                logger.info(f"Running prediction for {instrument} with strategy {strategy}")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(predictor_script),
+                        "-u", instrument,
+                        "-s", strategy,
+                        "--regenerate-all"
+                    ],
+                    cwd=str(project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minute timeout per strategy
+                )
+                
+                if result.returncode == 0:
+                    filename = f"{instrument}_{strategy}_predicted.csv"
+                    generated_files.append(filename)
+                    logger.info(f"Successfully generated {filename}")
+                else:
+                    error_msg = result.stderr or result.stdout
+                    errors.append(f"{strategy}: {error_msg[:200]}")
+                    logger.error(f"Error running {strategy}: {error_msg}")
+            except subprocess.TimeoutExpired:
+                errors.append(f"{strategy}: Timeout after 5 minutes")
+            except Exception as e:
+                errors.append(f"{strategy}: {str(e)}")
+                logger.error(f"Exception running {strategy}: {e}")
+        
+        if generated_files:
+            return jsonify({
+                "success": True,
+                "message": f"Generated {len(generated_files)} prediction file(s)",
+                "files": generated_files,
+                "errors": errors if errors else None
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "error": "No files generated",
+                "errors": errors
+            }), 500
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/predictions/backtest', methods=['POST'])
+def run_backtest():
+    """
+    Run backtest_index_prediction.py for selected instrument.
+    
+    Request body:
+    {
+        "instrument": "NIFTY" or "BANKNIFTY"
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Backtest completed successfully",
+        "comparison_file": "NIFTY_index_comparison.xlsx"
+    }
+    """
+    import subprocess
+    import logging
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "Request body is required"}), 400
+        
+        instrument = data.get("instrument", "").strip().upper()
+        
+        if instrument not in ["NIFTY", "BANKNIFTY"]:
+            return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
+        
+        project_root = Path(__file__).parent
+        backtest_script = project_root / "predictions" / "backtest_index_prediction.py"
+        
+        if not backtest_script.exists():
+            return jsonify({"success": False, "error": "backtest_index_prediction.py not found"}), 500
+        
+        logger.info(f"Running backtest for {instrument}")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(backtest_script),
+                "-u", instrument
+            ],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minute timeout
+        )
+        
+        if result.returncode == 0:
+            comparison_file = f"{instrument}_index_comparison.xlsx"
+            return jsonify({
+                "success": True,
+                "message": "Backtest completed successfully",
+                "comparison_file": comparison_file
+            }), 200
+        else:
+            error_msg = result.stderr or result.stdout
+            logger.error(f"Backtest error: {error_msg}")
+            return jsonify({
+                "success": False,
+                "error": f"Backtest failed: {error_msg[:500]}"
+            }), 500
+            
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "success": False,
+            "error": "Backtest timeout after 10 minutes"
+        }), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/predictions/files', methods=['GET'])
+def list_prediction_files():
+    """
+    List all generated files in the predictions/output folder.
+    
+    Query params:
+    - instrument (optional): Filter by NIFTY or BANKNIFTY
+    
+    Response:
+    {
+        "success": true,
+        "files": [
+            {
+                "name": "NIFTY_trendUpRangeBreakout_predicted.csv",
+                "type": "prediction",
+                "url": "/api/predictions/files/download?file=NIFTY_trendUpRangeBreakout_predicted.csv"
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        project_root = Path(__file__).parent
+        output_dir = project_root / "predictions" / "output"
+        
+        if not output_dir.exists():
+            return jsonify({
+                "success": True,
+                "files": []
+            }), 200
+        
+        instrument_filter = request.args.get("instrument", "").strip().upper()
+        
+        files = []
+        for file_path in output_dir.iterdir():
+            if file_path.is_file():
+                filename = file_path.name
+                
+                # Filter by instrument if specified
+                if instrument_filter and instrument_filter not in filename.upper():
+                    continue
+                
+                # Determine file type
+                file_type = "unknown"
+                if "_predicted.csv" in filename:
+                    file_type = "prediction"
+                elif "_index_comparison.xlsx" in filename:
+                    file_type = "comparison"
+                elif filename.endswith(".csv"):
+                    file_type = "csv"
+                elif filename.endswith(".xlsx"):
+                    file_type = "excel"
+                
+                files.append({
+                    "name": filename,
+                    "type": file_type,
+                    "size": file_path.stat().st_size,
+                    "url": f"/api/predictions/files/download?file={filename}"
+                })
+        
+        # Sort by name
+        files.sort(key=lambda x: x["name"])
+        
+        return jsonify({
+            "success": True,
+            "files": files
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/predictions/files/download', methods=['GET'])
+def download_prediction_file():
+    """
+    Download a generated prediction file.
+    
+    Query params:
+    - file: Filename to download (e.g., "NIFTY_trendUpRangeBreakout_predicted.csv")
+    
+    Returns the file for download.
+    """
+    from flask import send_file
+    
+    try:
+        filename = request.args.get("file", "").strip()
+        if not filename:
+            return jsonify({"success": False, "error": "file parameter is required"}), 400
+        
+        # Security: prevent directory traversal
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return jsonify({"success": False, "error": "Invalid filename"}), 400
+        
+        project_root = Path(__file__).parent
+        file_path = project_root / "predictions" / "output" / filename
+        
+        if not file_path.exists() or not file_path.is_file():
+            return jsonify({"success": False, "error": "File not found"}), 404
+        
+        return send_file(
+            str(file_path),
+            as_attachment=True,
+            download_name=filename
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     # Increase timeout for long-running requests
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0

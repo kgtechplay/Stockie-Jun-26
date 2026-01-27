@@ -3,6 +3,32 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:fl_chart/fl_chart.dart';
 import 'trend_view_screen.dart';
+import 'prediction_test_screen.dart';
+import 'dart:html' as html;
+
+String getApiBaseUrl() {
+  // Check if API_BASE_URL is set via environment variable (for build-time)
+  const envUrl = String.fromEnvironment('API_BASE_URL', defaultValue: '');
+  if (envUrl.isNotEmpty) {
+    return envUrl;
+  }
+  
+  // For web: try to detect from current location
+  try {
+    final location = html.window.location;
+    // If running on same origin, use relative URL
+    if (location.hostname == 'localhost' || location.hostname == '127.0.0.1') {
+      // Local development - assume API on port 5000
+      return 'http://${location.hostname}:5000/api';
+    } else {
+      // Production - use same origin
+      return '/api';
+    }
+  } catch (e) {
+    // Fallback for non-web platforms or if window is not available
+    return '/api';
+  }
+}
 
 void main() {
   runApp(const MyApp());
@@ -33,7 +59,7 @@ class StockSearchScreen extends StatefulWidget {
 
 class _StockSearchScreenState extends State<StockSearchScreen> {
   final TextEditingController _stockNameController = TextEditingController();
-  final String _apiBaseUrl = 'http://localhost:5000/api';
+  late final String _apiBaseUrl = getApiBaseUrl();
   List<Map<String, dynamic>> _matches = [];
   bool _isLoading = false;
   bool _isRefreshing = false;
@@ -191,6 +217,22 @@ class _StockSearchScreenState extends State<StockSearchScreen> {
       appBar: AppBar(
         title: const Text('Options Trading'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.analytics),
+            tooltip: 'Prediction Testing',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => PredictionTestScreen(
+                    apiBaseUrl: _apiBaseUrl,
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
