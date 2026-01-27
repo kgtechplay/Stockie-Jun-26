@@ -4,7 +4,7 @@ Flask REST API backend for the Options Trading application.
 """
 import sys
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # Add project root to Python path
@@ -710,7 +710,62 @@ def download_prediction_file():
         }), 500
 
 
-if __name__ == '__main__':
-    # Increase timeout for long-running requests
-    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+# ----------------- Serve Flutter Web App -----------------
+
+from werkzeug.exceptions import NotFound
+
+def _flutter_build_dir() -> Path:
+    """
+    Where Flutter web build is expected inside the container.
+    Your Docker build should ensure this path exists.
+    """
+    return project_root / "flutter_app" / "build" / "web"
+
+
+@app.route("/", defaults={"path": ""}, methods=["GET"])
+@app.route("/<path:path>", methods=["GET"])
+def serve_flutter(path: str):
+    """
+    Serve Flutter web app static files from flutter_app/build/web.
+
+    Rules:
+    - Never handle /api/* here (let Flask API routes do that)
+    - Serve real files if they exist (assets, flutter.js, etc.)
+    - Otherwise serve index.html (SPA routing)
+    """
+    # 1) Don't hijack API routes
+    if path.startswith("api/") or path == "api":
+        raise NotFound()
+
+    build_dir = _flutter_build_dir()
+    index_file = build_dir / "index.html"
+
+    # 2) If Flutter build isn't present, show helpful message
+    if not index_file.exists():
+        return jsonify({
+            "error": "Flutter web build not found in container",
+            "expected_path": str(build_dir),
+            "fix": "Build Flutter web during Docker build (recommended) or run 'flutter build web' and commit build/web (not recommended).",
+            "api_health": "/api/health"
+        }), 404
+
+    # 3) Serve static files if they exist (e.g., assets/, main.dart.js, flutter.js)
+    if path:
+        requested = build_dir / path
+        if requested.exists() and requested.is_file():
+            return send_from_directory(str(build_dir), path)
+
+        # If path is a directory (rare), try index.html inside it
+        if requested.exists() and requested.is_dir():
+            dir_index = requested / "index.html"
+            if dir_index.exists():
+                return send_from_directory(str(requested), "index.html")
+
+    # 4) SPA fallback
+    return send_from_directory(str(build_dir), "index.html")
+
+
+if __name__ == "__main__":
+    # Local dev only (Railway uses gunicorn)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True, threaded=True)

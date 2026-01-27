@@ -1,25 +1,39 @@
+# =========================
 # Python
+# =========================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.venv/
+env/
 build/
 dist/
 *.egg-info/
 
-# Environment
+# =========================
+# Environment / Secrets
+# =========================
 .env
 .secrets/
-scripts_daily/
 
+# =========================
+# Runtime / generated data
+# =========================
+predictions/output/
+
+# =========================
 # IDE
+# =========================
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Flutter
+# =========================
+# Flutter / Dart
+# =========================
 flutter_app/.dart_tool/
 flutter_app/.flutter-plugins
 flutter_app/.flutter-plugins-dependencies
@@ -27,10 +41,16 @@ flutter_app/.packages
 flutter_app/.pub-cache/
 flutter_app/.pub/
 flutter_app/build/
-flutter_app/.ios/
-flutter_app/.android/
 
+# ❌ DO NOT ignore these (must be committed)
+!flutter_app/lib/
+!flutter_app/web/
+!flutter_app/pubspec.yaml
+!flutter_app/pubspec.lock
+!flutter_app/.metadata
+
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
-
