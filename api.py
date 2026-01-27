@@ -2,6 +2,7 @@
 """
 Flask REST API backend for the Options Trading application.
 """
+import os
 import sys
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -453,6 +454,20 @@ def run_predictions():
         if not predictor_script.exists():
             return jsonify({"success": False, "error": "index_predictor.py not found"}), 500
         
+        # Clear existing output files for this instrument before generating new ones
+        # This ensures backtest only compares files from the current run
+        output_dir = project_root / "predictions" / "output"
+        if output_dir.exists():
+            import glob
+            pattern = str(output_dir / f"{instrument}_*")
+            existing_files = glob.glob(pattern)
+            for file_path in existing_files:
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Cleared existing file: {os.path.basename(file_path)}")
+                except Exception as e:
+                    logger.warning(f"Could not remove {file_path}: {e}")
+        
         generated_files = []
         errors = []
         
@@ -464,8 +479,7 @@ def run_predictions():
                         sys.executable,
                         str(predictor_script),
                         "-u", instrument,
-                        "-s", strategy,
-                        "--regenerate-all"
+                        "-s", strategy
                     ],
                     cwd=str(project_root),
                     capture_output=True,
@@ -548,6 +562,17 @@ def run_backtest():
         
         if not backtest_script.exists():
             return jsonify({"success": False, "error": "backtest_index_prediction.py not found"}), 500
+        
+        # Clear existing comparison file for this instrument before running backtest
+        # This ensures we always have the latest comparison results
+        output_dir = project_root / "predictions" / "output"
+        comparison_file = output_dir / f"{instrument}_index_comparison.xlsx"
+        if comparison_file.exists():
+            try:
+                os.remove(comparison_file)
+                logger.info(f"Cleared existing comparison file: {comparison_file.name}")
+            except Exception as e:
+                logger.warning(f"Could not remove comparison file: {e}")
         
         logger.info(f"Running backtest for {instrument}")
         result = subprocess.run(

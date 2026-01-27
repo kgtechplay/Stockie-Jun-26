@@ -156,8 +156,25 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        final files = List<Map<String, dynamic>>.from(data['files'] ?? []);
+        
+        // Sort files: comparison files first, then others alphabetically
+        files.sort((a, b) {
+          final aName = a['name'] as String;
+          final bName = b['name'] as String;
+          
+          final aIsComparison = aName.contains('_index_comparison.xlsx');
+          final bIsComparison = bName.contains('_index_comparison.xlsx');
+          
+          if (aIsComparison && !bIsComparison) return -1;
+          if (!aIsComparison && bIsComparison) return 1;
+          
+          // Both are comparison or both are not - sort alphabetically
+          return aName.compareTo(bName);
+        });
+        
         setState(() {
-          _generatedFiles = List<Map<String, dynamic>>.from(data['files'] ?? []);
+          _generatedFiles = files;
         });
       }
     } catch (e) {
@@ -168,9 +185,20 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
 
   void _downloadFile(String url, String filename) {
     try {
-      final fullUrl = url.startsWith('http') 
-          ? url 
-          : '${widget.apiBaseUrl}${url.startsWith('/') ? url : '/$url'}';
+      String fullUrl;
+      if (url.startsWith('http')) {
+        // Already a full URL
+        fullUrl = url;
+      } else {
+        // Handle relative URLs - check if URL already starts with /api
+        // and apiBaseUrl already ends with /api to avoid double /api/api/
+        String cleanUrl = url.startsWith('/') ? url : '/$url';
+        if (cleanUrl.startsWith('/api') && widget.apiBaseUrl.endsWith('/api')) {
+          // Remove /api prefix from URL since apiBaseUrl already includes it
+          cleanUrl = cleanUrl.substring(4); // Remove '/api'
+        }
+        fullUrl = '${widget.apiBaseUrl}$cleanUrl';
+      }
       
       // For web, open URL in new tab which will trigger download
       // The API endpoint returns the file with Content-Disposition header
@@ -203,11 +231,12 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
         title: const Text('Prediction Testing'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
             // Instrument Selection
             DropdownButtonFormField<String>(
               value: _selectedInstrument,
@@ -237,9 +266,45 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
             const SizedBox(height: 24),
             
             // Strategy Selection
-            const Text(
-              'Choose Prediction Strategy (Multi-select)',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Choose Prediction Strategy (Multi-select)',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                if (!_isLoadingStrategies && _availableStrategies.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        if (_selectedStrategies.length == _availableStrategies.length) {
+                          // Deselect all
+                          _selectedStrategies.clear();
+                        } else {
+                          // Select all
+                          _selectedStrategies = List<String>.from(_availableStrategies);
+                        }
+                      });
+                    },
+                    icon: Icon(
+                      _selectedStrategies.length == _availableStrategies.length
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank,
+                    ),
+                    label: Text(
+                      _selectedStrategies.length == _availableStrategies.length
+                          ? 'Deselect All'
+                          : 'Select All',
+                    ),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.blue,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(height: 8),
             if (_isLoadingStrategies)
@@ -372,64 +437,43 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 8),
-              Expanded(
-                child: ListView.builder(
-                  itemCount: _generatedFiles.length,
-                  itemBuilder: (context, index) {
-                    final file = _generatedFiles[index];
-                    final filename = file['name'] as String;
-                    final fileType = file['type'] as String;
-                    final fileUrl = file['url'] as String;
-                    final fileSize = file['size'] as int? ?? 0;
-                    
-                    // Format file size
-                    String sizeStr = '${(fileSize / 1024).toStringAsFixed(1)} KB';
-                    if (fileSize > 1024 * 1024) {
-                      sizeStr = '${(fileSize / (1024 * 1024)).toStringAsFixed(1)} MB';
-                    }
-                    
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      child: ListTile(
-                        leading: Icon(
-                          fileType == 'excel' || fileType == 'comparison'
-                              ? Icons.table_chart
-                              : Icons.description,
-                          color: Colors.blue,
-                        ),
-                        title: Text(
-                          filename,
-                          style: const TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        subtitle: Text('$fileType • $sizeStr'),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.download),
-                              onPressed: () => _downloadFile(fileUrl, filename),
-                              tooltip: 'Download',
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.open_in_new),
-                              onPressed: () {
-                                // Open file URL directly (will trigger download for web)
-                                final fullUrl = fileUrl.startsWith('http')
-                                    ? fileUrl
-                                    : '${widget.apiBaseUrl}${fileUrl.startsWith('/') ? fileUrl : '/$fileUrl'}';
-                                _downloadFile(fileUrl, filename);
-                              },
-                              tooltip: 'Download',
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
+              ..._generatedFiles.map((file) {
+                final filename = file['name'] as String;
+                final fileType = file['type'] as String;
+                final fileUrl = file['url'] as String;
+                final fileSize = file['size'] as int? ?? 0;
+                
+                // Format file size
+                String sizeStr = '${(fileSize / 1024).toStringAsFixed(1)} KB';
+                if (fileSize > 1024 * 1024) {
+                  sizeStr = '${(fileSize / (1024 * 1024)).toStringAsFixed(1)} MB';
+                }
+                
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  child: ListTile(
+                    leading: Icon(
+                      fileType == 'excel' || fileType == 'comparison'
+                          ? Icons.table_chart
+                          : Icons.description,
+                      color: Colors.blue,
+                    ),
+                    title: Text(
+                      filename,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text('$fileType • $sizeStr'),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.download),
+                      onPressed: () => _downloadFile(fileUrl, filename),
+                      tooltip: 'Download',
+                    ),
+                  ),
+                );
+              }).toList(),
             ],
-          ],
+            ],
+          ),
         ),
       ),
     );
