@@ -1,3 +1,4 @@
+
 # underlying_data.py (EXTENDED: joins UnderlyingSnapshot OHLC + MarketActivityDaily volume/OI proxies)
 #
 # Goal:
@@ -14,6 +15,7 @@ from pathlib import Path
 import pyodbc
 import pandas as pd
 from dotenv import load_dotenv
+import os
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
