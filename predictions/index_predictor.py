@@ -196,6 +196,8 @@ def main(
 
 
 if __name__ == "__main__":
+    print("KASHYAP AZURE_SQL_CONN_STR exists:", bool(os.getenv("AZURE_SQL_CONN_STR")))
+
     parser = argparse.ArgumentParser(
         description="Generate index predictions (NIFTY/BANKNIFTY) using different strategies.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
