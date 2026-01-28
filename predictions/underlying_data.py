@@ -27,6 +27,7 @@ from src.config import get_settings
 
 
 def get_db_connection() -> pyodbc.Connection:
+    print("KASHYAP AZURE_SQL_CONN_STR exists:", bool(os.getenv("AZURE_SQL_CONN_STR")))
     settings = get_settings()
     conn_str = settings.azure_sql_conn_str
     if not conn_str:
