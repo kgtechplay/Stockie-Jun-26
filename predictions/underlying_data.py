@@ -29,15 +29,21 @@ from src.config import get_settings
 
 
 def get_db_connection() -> pyodbc.Connection:
-    print("KASHYAP AZURE_SQL_CONN_STR exists:", bool(os.getenv("AZURE_SQL_CONN_STR")))
-    settings = get_settings()
-    conn_str = settings.azure_sql_conn_str
-    if not conn_str:
-        raise ValueError(
-            "AZURE_SQL_CONN_STR is not set in environment or .env file. "
-            "Please set it in your .env file."
-        )
+    raw = os.environ.get("AZURE_SQL_CONN_STR")
+    logging.warning("KASHYAP ENV VALUE PRESENT: %s", bool(raw))
+
+    if not raw:
+        raise ValueError("AZURE_SQL_CONN_STR missing from Railway env vars")
+
     return pyodbc.connect(conn_str)
+    # settings = get_settings()
+    # conn_str = settings.azure_sql_conn_str
+    # if not conn_str:
+    #     raise ValueError(
+    #         "AZURE_SQL_CONN_STR is not set in environment or .env file. "
+    #         "Please set it in your .env file."
+    #     )
+    # return pyodbc.connect(conn_str)
 
 
 def fetch_index_daily(
