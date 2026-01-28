@@ -16,6 +16,7 @@ import pyodbc
 import pandas as pd
 from dotenv import load_dotenv
 import os
+import logging
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
