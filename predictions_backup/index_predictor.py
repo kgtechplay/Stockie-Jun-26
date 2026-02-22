@@ -3,7 +3,7 @@
 # Key updates:
 # - generate_index_predictions now passes a *window DataFrame* (not just closes)
 #   so future strategies can use OHLC, volume/OI proxies, etc.
-# - prediction_logic.py is backward-compatible and still works with closes-only logic.
+# - index_prediction_logic.py is backward-compatible and still works with closes-only logic.
 # - fetch_index_daily is expected to return at least:
 #     trade_date, close_price
 #   and can include open/high/low + fut_* proxy columns (enriched)
@@ -14,12 +14,20 @@
 import os
 import sys
 import argparse
+from pathlib import Path
 import pandas as pd
 
-from underlying_data import get_db_connection, fetch_index_daily
+project_root = Path(__file__).parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.prediction.providers.underlying_data_provider import (
+    fetch_index_daily,
+    get_db_connection,
+)
 from option_selector import main as run_option_selection
-from selection_logic import SELECTION_STRATEGIES
-from prediction_logic import (
+from option_selection_logic import SELECTION_STRATEGIES
+from index_prediction_logic import (
     PREDICTION_STRATEGIES,
     PredictionFunction,
     DEFAULT_LOOKBACK_DAYS as LOOKBACK_DAYS
@@ -32,7 +40,10 @@ PRED_FILE_TEMPLATE = "{underlying}_{strategy}_predicted.csv"   # e.g. NIFTY_tren
 def generate_index_predictions(
     df_daily: pd.DataFrame,
     prediction_func: PredictionFunction,
-    lookback_days: int = LOOKBACK_DAYS
+    lookback_days: int = LOOKBACK_DAYS,
+    instrument: str = "NIFTY",
+    strategy_name: str | None = None,
+    use_agentic_aggregator: bool = False,
 ) -> pd.DataFrame:
     """
     From daily index data with columns:
@@ -64,14 +75,35 @@ def generate_index_predictions(
 
         # NEW: pass full window dataframe (includes closes and any other feature columns)
         window_df = df.loc[window_start:window_end].copy()
-
-        pred = prediction_func(window_df)
         date = df.loc[i, "trade_date"]
+        if use_agentic_aggregator:
+            from src.prediction.aggregator.index_aggregator import run_index_prediction
 
-        records.append({
-            "date": date,
-            "prediction": pred,
-        })
+            output = run_index_prediction(
+                instrument=instrument.upper(),
+                window=window_df,
+                as_of=pd.to_datetime(date).to_pydatetime().replace(
+                    hour=15, minute=15, second=0, microsecond=0
+                ),
+                strategies=[strategy_name] if strategy_name else None,
+            )
+            records.append(
+                {
+                    "date": date,
+                    "prediction": output.final_decision,
+                    "regime": output.regime,
+                    "confidence": output.confidence,
+                    "reasons": " | ".join(output.reasons[:5]),
+                }
+            )
+        else:
+            pred = prediction_func(window_df)
+            records.append(
+                {
+                    "date": date,
+                    "prediction": pred,
+                }
+            )
 
     preds = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
     return preds
@@ -132,6 +164,7 @@ def main(
     prediction_func = PREDICTION_STRATEGIES[predictor_strategy]
     filename = PRED_FILE_TEMPLATE.format(underlying=underlying, strategy=predictor_strategy)
     path = os.path.join(PRED_DIR, filename)
+    use_agentic_aggregator = os.getenv("USE_AGENTIC_AGGREGATOR", "0") == "1"
 
     conn = get_db_connection()
     try:
@@ -152,8 +185,16 @@ def main(
     print(f"[{underlying}] [{predictor_strategy}] fetched {len(df_daily)} days of data")
     print(f"Date range: {df_daily['trade_date'].min()} to {df_daily['trade_date'].max()}")
 
-    new_preds = generate_index_predictions(df_daily, prediction_func)
+    new_preds = generate_index_predictions(
+        df_daily=df_daily,
+        prediction_func=prediction_func,
+        instrument=underlying,
+        strategy_name=predictor_strategy,
+        use_agentic_aggregator=use_agentic_aggregator,
+    )
     print(f"[{underlying}] [{predictor_strategy}] generated {len(new_preds)} predictions")
+    if use_agentic_aggregator:
+        print(f"[{underlying}] [{predictor_strategy}] agentic aggregator mode enabled")
 
     combined = append_predictions_to_csv(
         new_preds,

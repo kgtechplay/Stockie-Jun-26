@@ -4,9 +4,9 @@ import sys
 import argparse
 import pandas as pd
 
-from underlying_data import get_db_connection
-from options_data import fetch_index_options_eod
-from selection_logic import SELECTION_STRATEGIES
+from src.prediction.providers.options_data_provider import fetch_index_options_eod
+from src.prediction.providers.underlying_data_provider import get_db_connection
+from option_selection_logic import SELECTION_STRATEGIES
 
 PRED_DIR = "predictions/output"
 PRED_FILE_TEMPLATE = "{underlying}_{predictor_strategy}_predicted.csv"

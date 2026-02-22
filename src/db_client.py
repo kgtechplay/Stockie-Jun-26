@@ -30,6 +30,34 @@ class AzureSqlClient:
                 error_msg = str(e)
                 suggestions = []
                 
+                if "IM002" in error_msg or "Data source name not found" in error_msg:
+                    suggestions.append(
+                        "1. Ensure the correct ODBC driver is installed (ODBC Driver 18 or 17 for SQL Server)"
+                    )
+                    suggestions.append(
+                        "2. Ensure your connection string starts with: Driver={ODBC Driver 18 for SQL Server};"
+                    )
+
+                if "Invalid connection string attribute" in error_msg:
+                    suggestions.append(
+                        "1. Your connection string has a malformed key/value pair. Use ';' to separate attributes."
+                    )
+                    suggestions.append(
+                        "2. Ensure you have: Driver=...;Server=...;Database=...;Uid=...;Pwd=...;Encrypt=yes;TrustServerCertificate=no"
+                    )
+                    suggestions.append(
+                        "3. Avoid wrapping the password in braces unless it contains semicolons."
+                    )
+
+                if "Login failed for user" in error_msg or "18456" in error_msg or "28000" in error_msg:
+                    suggestions.append("1. Verify username and password are correct")
+                    suggestions.append(
+                        "2. For Azure SQL, the username is often 'user@server' (e.g. kaycee@options-sql-server)"
+                    )
+                    suggestions.append(
+                        "3. Ensure your client IP is allowed in Azure SQL Server firewall rules"
+                    )
+
                 if "does not exist" in error_msg or "access denied" in error_msg:
                     suggestions.append(
                         "1. Verify the server name is correct (e.g., yourserver.database.windows.net)"

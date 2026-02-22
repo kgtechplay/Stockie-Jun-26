@@ -1,75 +1,34 @@
-# Daily Snapshot Scheduler Setup
+# Scheduler Setup
 
-The scheduler automatically runs `daily_intraday_stock_option.py` at:
-- **9:20 AM IST**
-- **3:20 PM IST (15:20 IST)**
+This repository currently does not include an active daily scheduler script in `scripts/`.
 
-## Automatic Startup Options
+Legacy scheduler helpers exist in `scripts_Daily/` but are marked `[DoNotUse]`.
 
-### Option 1: Windows Task Scheduler (Recommended)
+## Recommended current approach
 
-This method runs the scheduler automatically at system startup, even if you're not logged in.
+Use Windows Task Scheduler (or any job runner) to call the live API endpoint twice per trading day.
 
-1. **Run the setup script** (as Administrator for best results):
-   ```bash
-   python scripts/setup_scheduler.py
-   ```
+### Endpoint to schedule
 
-2. The script will create a Windows Task Scheduler task that:
-   - Runs at system startup
-   - Keeps the scheduler running continuously
-   - Executes the snapshot script at the scheduled times
+- `POST /api/options/process`
+- Body: `{ "tradingsymbol": "NIFTY" }` and `{ "tradingsymbol": "BANKNIFTY" }`
 
-3. **To remove the scheduled task**:
-   ```bash
-   python scripts/setup_scheduler.py --remove
-   ```
+### Example PowerShell command
 
-**Note**: You may need to run the setup script as Administrator:
-- Right-click on the script → "Run as administrator"
-
-### Option 2: Windows Startup Folder (Simple)
-
-This method runs the scheduler when you log in to Windows.
-
-1. **Press `Win + R`** to open Run dialog
-2. Type: `shell:startup` and press Enter
-3. **Copy** `scripts/start_scheduler.bat` to the Startup folder
-4. The scheduler will start automatically when you log in
-
-### Option 3: Manual Start
-
-If you prefer to start it manually:
-
-```bash
-python scripts/schedule_daily_snapshots.py
+```powershell
+$base = "http://localhost:5000/api/options/process"
+Invoke-RestMethod -Method Post -Uri $base -ContentType "application/json" -Body '{"tradingsymbol":"NIFTY"}'
+Invoke-RestMethod -Method Post -Uri $base -ContentType "application/json" -Body '{"tradingsymbol":"BANKNIFTY"}'
 ```
 
-Press `Ctrl+C` to stop it.
+Schedule the above near your desired market snapshot times.
 
-## Verify It's Running
+## If you still need legacy scheduler scripts
 
-After setup, you can verify the scheduler is running by:
+Legacy files:
+- `scripts_Daily/schedule_daily_snapshots[DoNotUse].py`
+- `scripts_Daily/setup_scheduler[DoNotUse].py`
+- `scripts_Daily/start_scheduler[DoNotUse].bat`
+- `scripts_Daily/daily_intraday_stock_option[DoNotUse].py`
 
-1. **Check Windows Task Scheduler**:
-   - Press `Win + R`, type `taskschd.msc`, press Enter
-   - Look for task: `OT-v1_DailySnapshotScheduler`
-
-2. **Check if Python process is running**:
-   - Open Task Manager (`Ctrl + Shift + Esc`)
-   - Look for `python.exe` running `schedule_daily_snapshots.py`
-
-## Troubleshooting
-
-- **Scheduler not starting**: Check Windows Task Scheduler for errors
-- **Script not executing**: Verify Python path and dependencies are installed
-- **Timezone issues**: The scheduler automatically converts IST to your local timezone
-- **Permission errors**: Run setup script as Administrator
-
-## Dependencies
-
-Make sure these are installed:
-```bash
-pip install schedule pytz
-```
-
+These are retained for reference only and are not part of the active documented flow.

@@ -94,6 +94,7 @@ class _PredictionTestScreenState extends State<PredictionTestScreen> {
         body: jsonEncode({
           'instrument': _selectedInstrument,
           'strategies': _selectedStrategies,
+          'use_agentic': true,
         }),
       );
 

@@ -1,5 +1,5 @@
 """
-prediction_logic.py
+strategies.py
 
 Central place for index-direction prediction strategies (e.g., NIFTY, BANKNIFTY).
 

@@ -39,7 +39,7 @@ COPY . .
 RUN mkdir -p /app/flutter_app/build
 COPY --from=flutter_build /src/flutter_app/build/web /app/flutter_app/build/web
 
-RUN mkdir -p predictions/output && chmod 755 predictions/output
+RUN mkdir -p output && chmod 755 output
 
 # Bind to Railway PORT
 CMD ["sh", "-c", "gunicorn api:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 120"]

@@ -1,4 +1,4 @@
-# selection_logic.py
+# option_selection_strategies.py
 """
 Option selection strategy functions and registry for selecting optimal option contracts.
 

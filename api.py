@@ -19,6 +19,8 @@ from src.db_client import AzureSqlClient
 from src.options_service import process_underlying_once
 from src.option_fetcher import _normalize_underlying
 from src.trend_service import fetch_option_trend_data
+from src.prediction.prediction_service import PredictionService
+from src.prediction.technical.strategies import PREDICTION_STRATEGIES
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Flutter app
@@ -379,24 +381,7 @@ def get_prediction_strategies():
     }
     """
     try:
-        # Import prediction strategies from prediction_logic
-        predictions_path = Path(__file__).parent / "predictions"
-        if str(predictions_path) not in sys.path:
-            sys.path.insert(0, str(predictions_path))
-        
-        # Dynamic import to avoid linter warnings
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "prediction_logic",
-            predictions_path / "prediction_logic.py"
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError("Could not load prediction_logic module")
-        
-        prediction_logic = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(prediction_logic)
-        
-        strategies = list(prediction_logic.PREDICTION_STRATEGIES.keys())
+        strategies = list(PREDICTION_STRATEGIES.keys())
         return jsonify({
             "success": True,
             "strategies": strategies
@@ -413,12 +398,13 @@ def get_prediction_strategies():
 @app.route('/api/predictions/run', methods=['POST'])
 def run_predictions():
     """
-    Run index_predictor.py for selected instrument and strategies.
+    Run prediction generation for selected instrument and strategies.
     
     Request body:
     {
         "instrument": "NIFTY" or "BANKNIFTY",
-        "strategies": ["trendUpRangeBreakout", "MaTrend_001", ...]
+        "strategies": ["trendUpRangeBreakout", "MaTrend_001", ...],
+        "use_agentic": true  # optional, defaults to USE_AGENTIC_AGGREGATOR env
     }
     
     Response:
@@ -428,7 +414,6 @@ def run_predictions():
         "files": ["NIFTY_trendUpRangeBreakout_predicted.csv", ...]
     }
     """
-    import subprocess
     import logging
     
     logging.basicConfig(level=logging.INFO)
@@ -449,14 +434,19 @@ def run_predictions():
             return jsonify({"success": False, "error": "strategies must be a non-empty list"}), 400
         
         project_root = Path(__file__).parent
-        predictor_script = project_root / "predictions" / "index_predictor.py"
-        
-        if not predictor_script.exists():
-            return jsonify({"success": False, "error": "index_predictor.py not found"}), 500
+        service = PredictionService.from_project_root(project_root)
+        use_agentic_raw = data.get("use_agentic")
+        if use_agentic_raw is None:
+            use_agentic = os.getenv("USE_AGENTIC_AGGREGATOR", "0") == "1"
+        else:
+            if isinstance(use_agentic_raw, bool):
+                use_agentic = use_agentic_raw
+            else:
+                use_agentic = str(use_agentic_raw).strip().lower() in {"1", "true", "yes", "y"}
         
         # Clear existing output files for this instrument before generating new ones
         # This ensures backtest only compares files from the current run
-        output_dir = project_root / "predictions" / "output"
+        output_dir = project_root / "output"
         if output_dir.exists():
             import glob
             pattern = str(output_dir / f"{instrument}_*")
@@ -473,30 +463,24 @@ def run_predictions():
         
         for strategy in strategies:
             try:
-                logger.info(f"Running prediction for {instrument} with strategy {strategy}")
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(predictor_script),
-                        "-u", instrument,
-                        "-s", strategy
-                    ],
-                    cwd=str(project_root),
-                    capture_output=True,
-                    text=True,
-                    timeout=300  # 5 minute timeout per strategy
+                logger.info(
+                    "Running prediction for %s with strategy %s (agentic=%s)",
+                    instrument,
+                    strategy,
+                    use_agentic,
                 )
-                
-                if result.returncode == 0:
-                    filename = f"{instrument}_{strategy}_predicted.csv"
-                    generated_files.append(filename)
-                    logger.info(f"Successfully generated {filename}")
-                else:
-                    error_msg = result.stderr or result.stdout
-                    errors.append(f"{strategy}: {error_msg[:200]}")
-                    logger.error(f"Error running {strategy}: {error_msg}")
-            except subprocess.TimeoutExpired:
-                errors.append(f"{strategy}: Timeout after 5 minutes")
+                preds_df = service.generate_predictions_for_strategy(
+                    instrument=instrument,
+                    strategy=strategy,
+                    use_agentic=use_agentic,
+                )
+                filename = service.save_predictions(
+                    instrument=instrument,
+                    strategy=strategy,
+                    predictions_df=preds_df,
+                )
+                generated_files.append(filename)
+                logger.info("Successfully generated %s", filename)
             except Exception as e:
                 errors.append(f"{strategy}: {str(e)}")
                 logger.error(f"Exception running {strategy}: {e}")
@@ -527,7 +511,7 @@ def run_predictions():
 @app.route('/api/predictions/backtest', methods=['POST'])
 def run_backtest():
     """
-    Run backtest_index_prediction.py for selected instrument.
+    Run index backtest for selected instrument.
     
     Request body:
     {
@@ -558,14 +542,14 @@ def run_backtest():
             return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
         
         project_root = Path(__file__).parent
-        backtest_script = project_root / "predictions" / "backtest_index_prediction.py"
+        backtest_script = project_root / "src" / "backtest" / "index_backtest.py"
         
         if not backtest_script.exists():
-            return jsonify({"success": False, "error": "backtest_index_prediction.py not found"}), 500
+            return jsonify({"success": False, "error": "src/backtest/index_backtest.py not found"}), 500
         
         # Clear existing comparison file for this instrument before running backtest
         # This ensures we always have the latest comparison results
-        output_dir = project_root / "predictions" / "output"
+        output_dir = project_root / "output"
         comparison_file = output_dir / f"{instrument}_index_comparison.xlsx"
         if comparison_file.exists():
             try:
@@ -578,7 +562,8 @@ def run_backtest():
         result = subprocess.run(
             [
                 sys.executable,
-                str(backtest_script),
+                "-m",
+                "src.backtest.index_backtest",
                 "-u", instrument
             ],
             cwd=str(project_root),
@@ -619,7 +604,7 @@ def run_backtest():
 @app.route('/api/predictions/files', methods=['GET'])
 def list_prediction_files():
     """
-    List all generated files in the predictions/output folder.
+    List all generated files in the output folder.
     
     Query params:
     - instrument (optional): Filter by NIFTY or BANKNIFTY
@@ -639,7 +624,7 @@ def list_prediction_files():
     """
     try:
         project_root = Path(__file__).parent
-        output_dir = project_root / "predictions" / "output"
+        output_dir = project_root / "output"
         
         if not output_dir.exists():
             return jsonify({
@@ -715,7 +700,7 @@ def download_prediction_file():
             return jsonify({"success": False, "error": "Invalid filename"}), 400
         
         project_root = Path(__file__).parent
-        file_path = project_root / "predictions" / "output" / filename
+        file_path = project_root / "output" / filename
         
         if not file_path.exists() or not file_path.is_file():
             return jsonify({"success": False, "error": "File not found"}), 404

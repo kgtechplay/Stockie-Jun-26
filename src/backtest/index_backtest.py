@@ -29,9 +29,18 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
-from underlying_data import get_db_connection, fetch_index_daily, fetch_5m_candles_for_dates
+# Ensure repo root is on sys.path so `import src.*` works even when executing this file directly.
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-PRED_DIR = "predictions/output"
+from src.prediction.providers.underlying_data_provider import (
+    fetch_5m_candles_for_dates,
+    fetch_index_daily,
+    get_db_connection,
+)
+
+PRED_DIR = "output"
 PRED_FILE_PATTERN = "{underlying}_{strategy}_predicted.csv"
 SIGNIFICANT_MOVE_THRESH = 0.01  # 1% gap => MISSED_CALL / MISSED_PUT for NO_POSITION
 

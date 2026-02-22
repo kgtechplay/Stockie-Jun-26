@@ -45,7 +45,57 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.blue,
         useMaterial3: true,
       ),
-      home: const StockSearchScreen(),
+      home: MainWorkflowShell(apiBaseUrl: getApiBaseUrl()),
+    );
+  }
+}
+
+class MainWorkflowShell extends StatefulWidget {
+  final String apiBaseUrl;
+
+  const MainWorkflowShell({
+    super.key,
+    required this.apiBaseUrl,
+  });
+
+  @override
+  State<MainWorkflowShell> createState() => _MainWorkflowShellState();
+}
+
+class _MainWorkflowShellState extends State<MainWorkflowShell> {
+  int _selectedIndex = 0;
+  late final List<Widget> _pages = [
+    PredictionTestScreen(apiBaseUrl: widget.apiBaseUrl),
+    const StockSearchScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: _pages,
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _selectedIndex,
+        onDestinationSelected: (index) {
+          setState(() {
+            _selectedIndex = index;
+          });
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.analytics_outlined),
+            selectedIcon: Icon(Icons.analytics),
+            label: 'Predictions',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.storage_outlined),
+            selectedIcon: Icon(Icons.storage),
+            label: 'Data',
+          ),
+        ],
+      ),
     );
   }
 }
@@ -217,22 +267,6 @@ class _StockSearchScreenState extends State<StockSearchScreen> {
       appBar: AppBar(
         title: const Text('Options Trading'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.analytics),
-            tooltip: 'Prediction Testing',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => PredictionTestScreen(
-                    apiBaseUrl: _apiBaseUrl,
-                  ),
-                ),
-              );
-            },
-          ),
-        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),

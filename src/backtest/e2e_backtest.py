@@ -7,10 +7,21 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
-from underlying_data import get_db_connection, fetch_index_daily, fetch_5m_candles_for_dates
-from options_data import fetch_option_intraday_prices
+from pathlib import Path
 
-PRED_DIR = "predictions/output"
+# Ensure repo root is on sys.path so `import src.*` works even when executing this file directly.
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from src.prediction.providers.options_data_provider import fetch_option_intraday_prices
+from src.prediction.providers.underlying_data_provider import (
+    fetch_5m_candles_for_dates,
+    fetch_index_daily,
+    get_db_connection,
+)
+
+PRED_DIR = "output"
 SIGNIFICANT_MOVE_THRESH = 0.01   # 1% gap => MISSED_CALL / MISSED_PUT for NO_POSITION
 
 

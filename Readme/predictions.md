@@ -1,96 +1,102 @@
 # Predictions Module Documentation
 
-## Quick Start - Usage Examples
+This module supports a full prediction pipeline:
 
+1. Generate index direction predictions (`CALL`, `PUT`, `NO_POSITION`)
+2. Optionally map predictions to option contracts
+3. Backtest both index signal quality and option trade outcomes
+
+All generated artifacts are written to `output/`.
+
+## Runtime architecture
+
+Core logic lives under `src/`:
+
+- `src/prediction/prediction_service.py`
+- `src/prediction/aggregator/index_aggregator.py`
+- `src/prediction/aggregator/option_aggregator.py`
+- `src/prediction/technical/strategies.py`
+- `src/prediction/technical/option_selection_strategies.py`
+- `src/prediction/providers/underlying_data_provider.py`
+- `src/prediction/providers/options_data_provider.py`
+- `src/backtest/index_backtest.py`
+- `src/backtest/e2e_backtest.py`
+
+## API usage (recommended)
+
+### Run predictions
 ```bash
-# Run all prediction strategies for NIFTY
-python predictions/index_predictor.py -u NIFTY
-
-# Run all strategy combinations for NIFTY
-python predictions/option_selector.py -u NIFTY
-
-# Run all selection strategies for a specific prediction strategy
-python predictions/option_selector.py -u NIFTY -ps trendFollowing
-
-# Run all prediction strategies with a specific selection strategy
-python predictions/option_selector.py -u NIFTY -ss nearestExpiryATM
-
-# Run a specific combination (original behavior)
-python predictions/option_selector.py -u NIFTY -ps trendFollowing -ss nearestExpiryATM
-
-# Run backtest
-python predictions/backtest.py -u NIFTY      # Backtest all NIFTY combinations
+curl -X POST http://localhost:5000/api/predictions/run \
+  -H "Content-Type: application/json" \
+  -d '{"instrument":"NIFTY","strategies":["MaTrend_001"],"use_agentic":true}'
 ```
 
----
-
-## Overview
-
-The predictions module implements a complete workflow for:
-1. **Generating index direction predictions** (CALL/PUT/NO_POSITION) for NIFTY/BANKNIFTY
-2. **Selecting optimal option contracts** for each prediction
-3. **Backtesting** both predictions and option trades
-
-All output files are saved in `predictions/output/`:
-- Prediction files: `{UNDERLYING}_{strategy}_predicted.csv`
-- Combined files: `{UNDERLYING}_{predictor_strategy}_{selector_strategy}.csv`
-
----
-
-## Scripts
-
-### index_predictor.py
-
-Generates daily index direction predictions using multiple strategies.
-
-**Strategies**: `trendFollowing`, `momentum`, `meanReversion`
-
-**Output**: `predictions/output/{UNDERLYING}_{strategy}_predicted.csv`
-
-**Usage**:
+### Run index backtest
 ```bash
-python predictions/index_predictor.py -u NIFTY                    # Run all strategies
-python predictions/index_predictor.py -u NIFTY -s trendFollowing  # Run specific strategy
-python predictions/index_predictor.py --list-strategies          # List all strategies
+curl -X POST http://localhost:5000/api/predictions/backtest \
+  -H "Content-Type: application/json" \
+  -d '{"instrument":"NIFTY"}'
 ```
 
----
-
-### option_selector.py
-
-Selects optimal option contracts for each CALL/PUT prediction.
-
-**Prediction Strategies**: `trendFollowing`, `momentum`, `meanReversion`  
-**Selection Strategies**: `nearestExpiryATM`, `nearestExpiryHighOI`, `highestDeltaPriceRatio`
-
-**Output**: `predictions/output/{UNDERLYING}_{predictor_strategy}_{selector_strategy}.csv`
-
-**Usage**:
+### List generated files
 ```bash
-python predictions/option_selector.py -u NIFTY                                    # Run all combinations
-python predictions/option_selector.py -u NIFTY -ps trendFollowing                   # All selectors for one predictor
-python predictions/option_selector.py -u NIFTY -ss nearestExpiryATM                 # All predictors for one selector
-python predictions/option_selector.py -u NIFTY -ps trendFollowing -ss nearestExpiryATM  # Specific combination
-python predictions/option_selector.py --list-strategies                             # List all strategies
+curl "http://localhost:5000/api/predictions/files?instrument=NIFTY"
 ```
 
-**Prerequisites**: Run `index_predictor.py` first to create prediction files.
+## Strategy names (source of truth)
 
----
+Prediction strategy names are defined in:
+- `src/prediction/technical/strategies.py` (`PREDICTION_STRATEGIES`)
 
-### backtest.py
+Selection strategies are defined in:
+- `src/prediction/technical/option_selection_strategies.py` (`SELECTION_STRATEGIES`)
 
-Automatically backtests all strategy combination files for a given underlying.
+Current prediction names include:
+- `trendUpRangeBreakout`
+- `MaTrend_001`
+- `MaTrend_0005`
+- `trendUpMaTrend_001`
+- `trendUpMaTrend_0005`
+- `trendDownRangeBreakout`
+- `trendDownMaTrend_001`
+- `trendDownMaTrend_0005`
+- `RsiMeanReversion_7030`
+- `RsiMeanReversion_6535`
+- `rangeRsiMeanReversion_7030`
+- `rangeRsiMeanReversion_6535`
+- `BollingerMeanReversion`
+- `rangeBollingerMeanReversion`
+- `choppy`
+- `unknown`
 
-**Usage**:
-```bash
-python predictions/backtest.py -u NIFTY      # Backtest all NIFTY combinations
-python predictions/backtest.py -u BANKNIFTY   # Backtest all BANKNIFTY combinations
-```
+## Data dependencies
 
-**Output**: Updates CSV files with backtest results and displays summary metrics:
-- Index prediction accuracy
-- Option selector accuracy (when index was correct)
-- Net profit
+Core tables used by prediction/backtest modules include:
+- `dbo.UnderlyingSnapshot`
+- `dbo.UnderlyingCandle5m`
+- `dbo.OptionInstrument`
+- `dbo.OptionSnapshot`
+- `dbo.OptionSnapshotCalc`
+- Optional proxy data from `dbo.MarketActivityDaily`
 
-**Prerequisites**: Run `index_predictor.py` and `option_selector.py` first.
+## Prediction schema checklist
+
+### Required for prediction generation
+- `dbo.UnderlyingSnapshot`
+  - `underlying`, `trade_date`, `open_price`, `high_price`, `low_price`, `close_price`
+
+### Required for index backtest
+- `dbo.UnderlyingSnapshot`
+  - `trade_date`, `open_price`, `close_price`
+- `dbo.UnderlyingCandle5m`
+  - `underlying`, `trade_date`, `low_price`, `high_price`
+
+### Required for option selection and e2e backtest
+- `dbo.OptionInstrument`
+  - `id`, `instrument_token`, `underlying`, `tradingsymbol`, `expiry`, `strike`, `lot_size`
+- `dbo.OptionSnapshot`
+  - `id`, `option_instrument_id`, `snapshot_time`, `last_price`, `volume`, `open_interest`
+- `dbo.OptionSnapshotCalc`
+  - `option_snapshot_id`, `implied_volatility`, `delta`, `gamma`
+- `dbo.MarketActivityDaily` (optional enrichment)
+  - `underlying`, `trade_date`, `fin_instrm_tp`, `tckr_symb`, `open_interest`, `traded_volume`, `traded_value`
