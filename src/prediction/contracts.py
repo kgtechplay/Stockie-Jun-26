@@ -69,3 +69,4 @@ class PredictionOutput:
 
     def __post_init__(self) -> None:
         self.confidence = clamp01(self.confidence)
+

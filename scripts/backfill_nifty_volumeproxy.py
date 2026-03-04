@@ -276,7 +276,16 @@ def upsert_market_activity_daily(
 # -----------------------
 # Main
 # -----------------------
-def main():
+def run_backfill_volumeproxy(
+    start_date: date,
+    end_date: date,
+    underlyings: list[str] | None = None,
+) -> Dict[str, Any]:
+    target_underlyings = [u.upper() for u in (underlyings or UNDERLYINGS)]
+    invalid = [u for u in target_underlyings if u not in ("NIFTY", "BANKNIFTY")]
+    if invalid:
+        raise ValueError(f"Unsupported underlying(s): {invalid}. Allowed: NIFTY, BANKNIFTY")
+
     if not AZURE_SQL_CONN_STR:
         raise RuntimeError(
             "AZURE_SQL_CONN_STR is empty. Set it as an environment variable or hardcode it in the script."
@@ -288,7 +297,7 @@ def main():
     inserted = 0
     skipped = 0
 
-    for d in daterange(BACKFILL_START, BACKFILL_END):
+    for d in daterange(start_date, end_date):
         # skip weekends (holidays are handled automatically by missing files)
         if d.weekday() >= 5:
             continue
@@ -305,7 +314,7 @@ def main():
             skipped += 1
             continue
 
-        for sym in UNDERLYINGS:
+        for sym in target_underlyings:
             payload = select_near_month_futidx_udiff(df, sym, d)
             if payload is None:
                 continue
@@ -319,7 +328,23 @@ def main():
 
     conn.close()
     print(f"Done. Upserts={inserted}, skipped_days={skipped}")
+    return {
+        "underlyings": target_underlyings,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "upserts": inserted,
+        "skipped_days": skipped,
+    }
+
+
+def main():
+    run_backfill_volumeproxy(
+        start_date=BACKFILL_START,
+        end_date=BACKFILL_END,
+        underlyings=UNDERLYINGS,
+    )
 
 
 if __name__ == "__main__":
     main()
+

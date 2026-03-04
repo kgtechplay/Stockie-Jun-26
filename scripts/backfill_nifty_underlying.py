@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.config import get_settings
-from src.db_client import AzureSqlClient
-from src.kite_client import KiteClient
+from src.core.config import get_settings
+from src.data.db_client import AzureSqlClient
+from src.integrations.kite_client import KiteClient
 
 load_dotenv()
 
@@ -63,7 +63,7 @@ def upsert_underlying_snapshots(
             int | None,
         ]
     ],
-) -> None:
+) -> Dict[str, int]:
     """
     Upsert rows into dbo.UnderlyingSnapshot.
 
@@ -71,7 +71,7 @@ def upsert_underlying_snapshots(
     """
     if not rows:
         print("No underlying snapshot rows to upsert.")
-        return
+        return {"prepared": 0, "updated": 0, "inserted": 0, "skipped_duplicates": 0}
 
     cursor = db.conn.cursor()
     cursor.fast_executemany = True
@@ -139,6 +139,10 @@ def upsert_underlying_snapshots(
             to_insert.append(row)
 
     # Perform updates
+    updated_count = 0
+    inserted_count = 0
+    skipped_count = 0
+
     if to_update:
         cursor.executemany(
             """
@@ -150,12 +154,10 @@ def upsert_underlying_snapshots(
             [(row[2], row[3], row[4], row[5], row[6], row[7], row[0], row[1]) for row in to_update],
         )
         print(f"Updated {len(to_update)} existing rows")
+        updated_count = len(to_update)
 
     # Perform inserts (handle unique constraint violations)
     if to_insert:
-        inserted_count = 0
-        skipped_count = 0
-        
         # Insert one by one to catch and skip duplicates
         for row in to_insert:
             try:
@@ -193,6 +195,12 @@ def upsert_underlying_snapshots(
 
     db.conn.commit()
     cursor.close()
+    return {
+        "prepared": len(rows),
+        "updated": updated_count,
+        "inserted": inserted_count,
+        "skipped_duplicates": skipped_count,
+    }
 
 
 def upsert_underlying_candles_5m(
@@ -209,7 +217,7 @@ def upsert_underlying_candles_5m(
             int | None,
         ]
     ],
-) -> None:
+) -> Dict[str, int]:
     """
     Upsert rows into dbo.UnderlyingCandle5m.
 
@@ -217,7 +225,7 @@ def upsert_underlying_candles_5m(
     """
     if not rows:
         print("No 5-minute candle rows to upsert.")
-        return
+        return {"prepared": 0, "updated": 0, "inserted": 0, "skipped_duplicates": 0}
 
     cursor = db.conn.cursor()
     cursor.fast_executemany = True
@@ -284,6 +292,10 @@ def upsert_underlying_candles_5m(
             to_insert.append(row)
 
     # Perform updates
+    updated_count = 0
+    inserted_count = 0
+    skipped_count = 0
+
     if to_update:
         cursor.executemany(
             """
@@ -295,12 +307,10 @@ def upsert_underlying_candles_5m(
             [(row[1], row[3], row[4], row[5], row[6], row[7], row[0], row[2]) for row in to_update],
         )
         print(f"Updated {len(to_update)} existing 5-minute candle rows")
+        updated_count = len(to_update)
 
     # Perform inserts (handle unique constraint violations)
     if to_insert:
-        inserted_count = 0
-        skipped_count = 0
-        
         # Insert one by one to catch and skip duplicates
         for row in to_insert:
             try:
@@ -338,9 +348,24 @@ def upsert_underlying_candles_5m(
 
     db.conn.commit()
     cursor.close()
+    return {
+        "prepared": len(rows),
+        "updated": updated_count,
+        "inserted": inserted_count,
+        "skipped_duplicates": skipped_count,
+    }
 
 
-def main() -> None:
+def run_backfill_underlying(
+    start_date: date,
+    end_date: date,
+    underlyings: List[str] | None = None,
+) -> Dict[str, object]:
+    target_underlyings = [u.upper() for u in (underlyings or ["NIFTY", "BANKNIFTY"])]
+    invalid = [u for u in target_underlyings if u not in ("NIFTY", "BANKNIFTY")]
+    if invalid:
+        raise ValueError(f"Unsupported underlying(s): {invalid}. Allowed: NIFTY, BANKNIFTY")
+
     settings = get_settings()
 
     db = AzureSqlClient(settings)
@@ -349,11 +374,14 @@ def main() -> None:
     kite_client = KiteClient(settings)
     kite_client.authenticate()
 
-    start_date = date(2025, 1, 1)
-    end_date = date(2025, 12, 31)
-    print(f"Backfilling underlying NIFTY/BANKNIFTY daily candles for {start_date} to {end_date}")
+    print(
+        f"Backfilling underlying {','.join(target_underlyings)} daily candles for "
+        f"{start_date} to {end_date}"
+    )
 
     index_tokens = get_index_tokens(kite_client)
+    index_tokens = {k: v for k, v in index_tokens.items() if k in target_underlyings}
+
 
     # Historical API window for daily candles
     # Start from start_date at market open, end at end of end_date
@@ -492,8 +520,9 @@ def main() -> None:
 
     # Insert daily candles (handle duplicates gracefully)
     print(f"\nPrepared {len(daily_rows)} UnderlyingSnapshot rows")
+    snapshot_summary = {"prepared": 0, "updated": 0, "inserted": 0, "skipped_duplicates": 0}
     try:
-        upsert_underlying_snapshots(db, daily_rows)
+        snapshot_summary = upsert_underlying_snapshots(db, daily_rows)
         print("UnderlyingSnapshot upsert complete.")
     except Exception as e:
         error_msg = str(e).lower()
@@ -505,8 +534,9 @@ def main() -> None:
 
     # Insert 5-minute candles (handle duplicates gracefully)
     print(f"\nPrepared {len(candle_5m_rows)} UnderlyingCandle5m rows")
+    candle_summary = {"prepared": 0, "updated": 0, "inserted": 0, "skipped_duplicates": 0}
     try:
-        upsert_underlying_candles_5m(db, candle_5m_rows)
+        candle_summary = upsert_underlying_candles_5m(db, candle_5m_rows)
         print("UnderlyingCandle5m upsert complete.")
     except Exception as e:
         error_msg = str(e).lower()
@@ -518,7 +548,22 @@ def main() -> None:
 
     db.close()
     print("Underlying backfill script done.")
+    return {
+        "underlyings": target_underlyings,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "daily": snapshot_summary,
+        "candles_5m": candle_summary,
+    }
+
+
+def main() -> None:
+    start_date = date(2025, 1, 1)
+    end_date = date(2025, 12, 31)
+    run_backfill_underlying(start_date=start_date, end_date=end_date)
 
 
 if __name__ == "__main__":
     main()
+
+

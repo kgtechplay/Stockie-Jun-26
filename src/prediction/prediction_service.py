@@ -9,15 +9,17 @@ import pandas as pd
 from src.prediction.aggregator.index_aggregator import run_index_prediction
 from src.prediction.aggregator.option_aggregator import apply_option_selection
 from src.prediction.contracts import PredictionOutput
-from src.prediction.providers.options_data_provider import fetch_index_options_eod
-from src.prediction.providers.underlying_data_provider import (
+from src.prediction.options_data_provider import fetch_index_options_eod
+from src.prediction.underlying_data_provider import (
     fetch_index_daily,
     get_db_connection,
 )
-from src.prediction.technical.option_selection_strategies import SELECTION_STRATEGIES
-from src.prediction.technical.strategies import (
+from src.prediction.strategies.option_registry import (
+    load_option_selection_strategies,
+)
+from src.prediction.strategies.index_registry import (
     DEFAULT_LOOKBACK_DAYS,
-    PREDICTION_STRATEGIES,
+    load_index_prediction_strategies,
 )
 
 
@@ -82,8 +84,9 @@ class PredictionService:
         end_date: str | None = None,
     ) -> pd.DataFrame:
         instrument = instrument.upper()
-        if strategy not in PREDICTION_STRATEGIES:
-            available = ", ".join(PREDICTION_STRATEGIES.keys())
+        strategy_registry = load_index_prediction_strategies()
+        if strategy not in strategy_registry:
+            available = ", ".join(strategy_registry.keys())
             raise ValueError(f"Unknown prediction strategy '{strategy}'. Available strategies: {available}")
 
         conn = get_db_connection()
@@ -110,7 +113,7 @@ class PredictionService:
             raise ValueError(f"Not enough rows to generate predictions for {instrument}.")
 
         records: list[dict[str, object]] = []
-        ta_fn = PREDICTION_STRATEGIES[strategy]
+        ta_fn = strategy_registry[strategy]
 
         for i in range(lookback_days - 1, len(df_daily)):
             window_df = df_daily.loc[i - lookback_days + 1 : i].copy()
@@ -140,6 +143,55 @@ class PredictionService:
 
         return pd.DataFrame(records).sort_values("date").reset_index(drop=True)
 
+    def generate_predictions_all_strategies(
+        self,
+        instrument: str,
+        use_agentic: bool,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        instrument = instrument.upper()
+        strategy_registry = load_index_prediction_strategies()
+        strategy_names = sorted(strategy_registry.keys())
+        out: dict[str, pd.DataFrame] = {}
+
+        for strategy in strategy_names:
+            out[strategy] = self.generate_predictions_for_strategy(
+                instrument=instrument,
+                strategy=strategy,
+                use_agentic=use_agentic,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        if not out:
+            return out
+
+        combined = None
+        for strategy_name in strategy_names:
+            df = out[strategy_name].copy()
+            df = df[["date", "prediction"]].rename(columns={"prediction": strategy_name})
+            combined = df if combined is None else combined.merge(df, on="date", how="outer")
+
+        if combined is None or combined.empty:
+            return out
+
+        def vote(row: pd.Series) -> str:
+            vals = [row[name] for name in strategy_names if row.get(name) in ("CALL", "PUT")]
+            if not vals:
+                return "NO_POSITION"
+            calls = vals.count("CALL")
+            puts = vals.count("PUT")
+            if calls > puts:
+                return "CALL"
+            if puts > calls:
+                return "PUT"
+            return "NO_POSITION"
+
+        combined["prediction"] = combined.apply(vote, axis=1)
+        out["combined"] = combined[["date", "prediction"]].sort_values("date").reset_index(drop=True)
+        return out
+
     def save_predictions(
         self,
         instrument: str,
@@ -165,8 +217,9 @@ class PredictionService:
         _ = regenerate_all  # Current behavior recomputes all CALL/PUT rows each run.
         underlying = underlying.upper()
 
-        if selector_strategy not in SELECTION_STRATEGIES:
-            available = ", ".join(SELECTION_STRATEGIES.keys())
+        selection_registry = load_option_selection_strategies()
+        if selector_strategy not in selection_registry:
+            available = ", ".join(selection_registry.keys())
             raise ValueError(
                 f"Unknown selector strategy '{selector_strategy}'. Available strategies: {available}"
             )
@@ -202,7 +255,7 @@ class PredictionService:
         finally:
             conn.close()
 
-        selection_func = SELECTION_STRATEGIES[selector_strategy]
+        selection_func = selection_registry[selector_strategy]
         selected_df = apply_option_selection(
             preds=preds,
             options_df=options_df,
@@ -214,3 +267,4 @@ class PredictionService:
             base_path.unlink()
 
         return strategy_filename
+

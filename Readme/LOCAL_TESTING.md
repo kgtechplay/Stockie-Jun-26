@@ -32,7 +32,7 @@ flutter doctor
 
 ```bash
 pip install -r requirements.txt
-python run_local.py
+python scripts/run_local.py
 ```
 
 Expected base URLs:
@@ -43,7 +43,7 @@ If port 5000 is already in use on your machine, you can override it:
 
 ```bash
 $env:PORT=5050  # PowerShell
-python run_local.py
+python scripts/run_local.py
 ```
 
 If you override the backend port, run Flutter with an explicit API base URL:
@@ -120,6 +120,20 @@ curl -X POST http://localhost:5000/api/predictions/run \
 curl -X POST http://localhost:5000/api/predictions/backtest \
   -H "Content-Type: application/json" \
   -d '{"instrument":"NIFTY"}'
+```
+
+### Run e2e backtest (index + option selector metrics)
+```bash
+curl -X POST http://localhost:5000/api/predictions/backtest/e2e \
+  -H "Content-Type: application/json" \
+  -d '{"instrument":"NIFTY"}'
+```
+
+### Run unified backfill for NIFTY
+```bash
+curl -X POST http://localhost:5000/api/backfill/nifty \
+  -H "Content-Type: application/json" \
+  -d '{"start_date":"2025-01-01","end_date":"2025-01-31"}'
 ```
 
 ### List generated files

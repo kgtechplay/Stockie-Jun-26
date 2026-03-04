@@ -12,15 +12,15 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.config import get_settings
-from src.db_client import AzureSqlClient
-from src.kite_client import KiteClient
-from src.option_fetcher import (
+from src.core.config import get_settings
+from src.data.db_client import AzureSqlClient
+from src.integrations.kite_client import KiteClient
+from src.fetchers.option_fetcher import (
     _years_to_expiry,
     _implied_volatility,
     _bs_greeks,
 )
-from src.models import OptionInstrument, OptionData
+from src.domain.models import OptionInstrument, OptionData
 
 RISK_FREE_RATE = 0.07
 # Rate limiting: Kite Connect allows ~3 requests/second, so use 0.4s delay to be safe
@@ -105,7 +105,16 @@ def fetch_index_5min_snapshots(
     return result
 
 
-def main() -> None:
+def run_backfill_options(
+    start_date: date,
+    end_date: date,
+    underlyings: List[str] | None = None,
+) -> Dict[str, object]:
+    target_underlyings = [u.upper() for u in (underlyings or ["NIFTY", "BANKNIFTY"])]
+    invalid = [u for u in target_underlyings if u not in ("NIFTY", "BANKNIFTY")]
+    if invalid:
+        raise ValueError(f"Unsupported underlying(s): {invalid}. Allowed: NIFTY, BANKNIFTY")
+
     settings = get_settings()
 
     db = AzureSqlClient(settings)
@@ -115,14 +124,13 @@ def main() -> None:
     kite_client.authenticate()
 
     today = date.today()  # Backfill run date
-    start_date = date(2025, 12, 26)
-    end_date = date(2025, 12, 30)
-    print(f"Backfilling NIFTY/BANKNIFTY options for {start_date} to {end_date}")
+    print(f"Backfilling {','.join(target_underlyings)} options for {start_date} to {end_date}")
 
-    # 1) Read option instruments for NIFTY/BANKNIFTY from DB
+    # 1) Read option instruments for selected underlyings from DB
     cursor = db.conn.cursor()
+    placeholders = ",".join("?" for _ in target_underlyings)
     cursor.execute(
-        """
+        f"""
         SELECT DISTINCT
             id,
             instrument_token,
@@ -137,8 +145,9 @@ def main() -> None:
             tick_size,
             segment
         FROM dbo.OptionInstrument
-        WHERE underlying IN ('NIFTY', 'BANKNIFTY')
-        """
+        WHERE underlying IN ({placeholders})
+        """,
+        target_underlyings,
     )
     rows = cursor.fetchall()
     cursor.close()
@@ -178,17 +187,24 @@ def main() -> None:
             )
         )
 
-    print(f"Loaded {len(option_instruments)} unique NIFTY/BANKNIFTY options from DB")
+    print(f"Loaded {len(option_instruments)} unique options from DB")
 
     if not option_instruments:
-        print("No NIFTY/BANKNIFTY options found in OptionInstrument. Exiting.")
+        print("No selected-underlying options found in OptionInstrument. Exiting.")
         db.close()
-        return
+        return {
+            "underlyings": target_underlyings,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "option_instruments_loaded": 0,
+            "option_snapshots_inserted": 0,
+        }
 
     # 2) Fetch index 5-min snapshots (09:15 & 15:15) for NIFTY & BANKNIFTY
     snap_times = [dtime(9, 15), dtime(15, 15)]
 
     index_tokens = get_index_tokens(kite_client)
+    index_tokens = {k: v for k, v in index_tokens.items() if k in target_underlyings}
     index_5min = fetch_index_5min_snapshots(
         kite_client=kite_client,
         index_tokens=index_tokens,
@@ -367,7 +383,22 @@ def main() -> None:
 
     db.close()
     print("Backfill run complete.")
+    return {
+        "underlyings": target_underlyings,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "option_instruments_loaded": len(option_instruments),
+        "option_snapshots_inserted": len(snapshots),
+    }
+
+
+def main() -> None:
+    start_date = date(2025, 12, 26)
+    end_date = date(2025, 12, 30)
+    run_backfill_options(start_date=start_date, end_date=end_date)
 
 
 if __name__ == "__main__":
     main()
+
+

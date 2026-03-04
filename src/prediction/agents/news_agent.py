@@ -130,3 +130,4 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(fallback)
+

@@ -10,8 +10,8 @@ from kiteconnect import KiteConnect
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.config import get_settings
-from src.db_client import AzureSqlClient
+from src.core.config import get_settings
+from src.data.db_client import AzureSqlClient
 
 # Load env vars
 load_dotenv()
@@ -97,3 +97,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

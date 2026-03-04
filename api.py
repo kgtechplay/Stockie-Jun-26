@@ -5,6 +5,7 @@ Flask REST API backend for the Options Trading application.
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -14,13 +15,16 @@ project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.config import get_settings
-from src.db_client import AzureSqlClient
-from src.options_service import process_underlying_once
-from src.option_fetcher import _normalize_underlying
-from src.trend_service import fetch_option_trend_data
+from src.core.config import get_settings
+from src.data.db_client import AzureSqlClient
+from src.services.options_service import process_underlying_once
+from src.fetchers.option_fetcher import _normalize_underlying
+from src.services.trend_service import fetch_option_trend_data
 from src.prediction.prediction_service import PredictionService
-from src.prediction.technical.strategies import PREDICTION_STRATEGIES
+from src.prediction.strategies.index_registry import load_index_prediction_strategies
+from src.backfill.index_backfill_service import IndexBackfillService, BackfillRequest
+from src.backtest.index.index_backtest import run_index_backtest_and_collect
+from src.backtest.e2e_backtest import run_e2e_backtest_and_collect
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Flutter app
@@ -49,6 +53,87 @@ def health_check():
             "status": "error",
             "message": str(e)
         }), 500
+
+
+def _parse_backfill_dates(data: dict) -> tuple[datetime.date, datetime.date]:
+    start_raw = (data or {}).get("start_date")
+    end_raw = (data or {}).get("end_date")
+    if not start_raw or not end_raw:
+        raise ValueError("start_date and end_date are required in YYYY-MM-DD format")
+
+    try:
+        start_date = datetime.strptime(str(start_raw), "%Y-%m-%d").date()
+        end_date = datetime.strptime(str(end_raw), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Invalid date format. Use YYYY-MM-DD for start_date and end_date") from exc
+
+    if start_date > end_date:
+        raise ValueError("start_date must be less than or equal to end_date")
+    return start_date, end_date
+
+
+def _run_backfill_endpoint(underlying: str):
+    try:
+        data = request.get_json() or {}
+        start_date, end_date = _parse_backfill_dates(data)
+        service = IndexBackfillService()
+        result = service.run_full_backfill(
+            BackfillRequest(
+                underlying=underlying,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+        return jsonify({"success": True, "result": result}), 200
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route('/api/backfill/nifty', methods=['POST'])
+def run_nifty_backfill():
+    return _run_backfill_endpoint("NIFTY")
+
+
+@app.route('/api/backfill/banknifty', methods=['POST'])
+def run_banknifty_backfill():
+    return _run_backfill_endpoint("BANKNIFTY")
+
+
+@app.route('/api/backfill/range/underlying', methods=['GET'])
+def get_underlying_backfill_range():
+    try:
+        underlying = (request.args.get("underlying") or "").strip().upper()
+        service = IndexBackfillService()
+        result = service.get_underlying_data_range(underlying)
+        return jsonify({"success": True, "result": result}), 200
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route('/api/backfill/range/options', methods=['GET'])
+def get_options_backfill_range():
+    try:
+        underlying = (request.args.get("underlying") or "").strip().upper()
+        service = IndexBackfillService()
+        result = service.get_options_data_range(underlying)
+        return jsonify({"success": True, "result": result}), 200
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route('/api/stocks/count', methods=['GET'])
@@ -381,7 +466,7 @@ def get_prediction_strategies():
     }
     """
     try:
-        strategies = list(PREDICTION_STRATEGIES.keys())
+        strategies = sorted(load_index_prediction_strategies().keys())
         return jsonify({
             "success": True,
             "strategies": strategies
@@ -430,8 +515,10 @@ def run_predictions():
         if instrument not in ["NIFTY", "BANKNIFTY"]:
             return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
         
-        if not strategies or not isinstance(strategies, list):
-            return jsonify({"success": False, "error": "strategies must be a non-empty list"}), 400
+        if strategies is None:
+            strategies = []
+        if not isinstance(strategies, list):
+            return jsonify({"success": False, "error": "strategies must be a list"}), 400
         
         project_root = Path(__file__).parent
         service = PredictionService.from_project_root(project_root)
@@ -460,30 +547,48 @@ def run_predictions():
         
         generated_files = []
         errors = []
-        
-        for strategy in strategies:
-            try:
-                logger.info(
-                    "Running prediction for %s with strategy %s (agentic=%s)",
-                    instrument,
-                    strategy,
-                    use_agentic,
-                )
-                preds_df = service.generate_predictions_for_strategy(
-                    instrument=instrument,
-                    strategy=strategy,
-                    use_agentic=use_agentic,
-                )
-                filename = service.save_predictions(
-                    instrument=instrument,
-                    strategy=strategy,
-                    predictions_df=preds_df,
-                )
-                generated_files.append(filename)
-                logger.info("Successfully generated %s", filename)
-            except Exception as e:
-                errors.append(f"{strategy}: {str(e)}")
-                logger.error(f"Exception running {strategy}: {e}")
+        run_all = (not strategies) or any(str(s).strip().upper() == "ALL" for s in strategies)
+
+        if run_all:
+            all_outputs = service.generate_predictions_all_strategies(
+                instrument=instrument,
+                use_agentic=use_agentic,
+            )
+            for strategy_name, preds_df in all_outputs.items():
+                try:
+                    filename = service.save_predictions(
+                        instrument=instrument,
+                        strategy=strategy_name,
+                        predictions_df=preds_df,
+                    )
+                    generated_files.append(filename)
+                except Exception as e:
+                    errors.append(f"{strategy_name}: {str(e)}")
+                    logger.error("Exception saving %s: %s", strategy_name, e)
+        else:
+            for strategy in strategies:
+                try:
+                    logger.info(
+                        "Running prediction for %s with strategy %s (agentic=%s)",
+                        instrument,
+                        strategy,
+                        use_agentic,
+                    )
+                    preds_df = service.generate_predictions_for_strategy(
+                        instrument=instrument,
+                        strategy=strategy,
+                        use_agentic=use_agentic,
+                    )
+                    filename = service.save_predictions(
+                        instrument=instrument,
+                        strategy=strategy,
+                        predictions_df=preds_df,
+                    )
+                    generated_files.append(filename)
+                    logger.info("Successfully generated %s", filename)
+                except Exception as e:
+                    errors.append(f"{strategy}: {str(e)}")
+                    logger.error(f"Exception running {strategy}: {e}")
         
         if generated_files:
             return jsonify({
@@ -525,7 +630,6 @@ def run_backtest():
         "comparison_file": "NIFTY_index_comparison.xlsx"
     }
     """
-    import subprocess
     import logging
     
     logging.basicConfig(level=logging.INFO)
@@ -541,57 +645,14 @@ def run_backtest():
         if instrument not in ["NIFTY", "BANKNIFTY"]:
             return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
         
-        project_root = Path(__file__).parent
-        backtest_script = project_root / "src" / "backtest" / "index_backtest.py"
-        
-        if not backtest_script.exists():
-            return jsonify({"success": False, "error": "src/backtest/index_backtest.py not found"}), 500
-        
-        # Clear existing comparison file for this instrument before running backtest
-        # This ensures we always have the latest comparison results
-        output_dir = project_root / "output"
-        comparison_file = output_dir / f"{instrument}_index_comparison.xlsx"
-        if comparison_file.exists():
-            try:
-                os.remove(comparison_file)
-                logger.info(f"Cleared existing comparison file: {comparison_file.name}")
-            except Exception as e:
-                logger.warning(f"Could not remove comparison file: {e}")
-        
         logger.info(f"Running backtest for {instrument}")
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "src.backtest.index_backtest",
-                "-u", instrument
-            ],
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minute timeout
-        )
-        
-        if result.returncode == 0:
-            comparison_file = f"{instrument}_index_comparison.xlsx"
-            return jsonify({
-                "success": True,
-                "message": "Backtest completed successfully",
-                "comparison_file": comparison_file
-            }), 200
-        else:
-            error_msg = result.stderr or result.stdout
-            logger.error(f"Backtest error: {error_msg}")
-            return jsonify({
-                "success": False,
-                "error": f"Backtest failed: {error_msg[:500]}"
-            }), 500
-            
-    except subprocess.TimeoutExpired:
+        result = run_index_backtest_and_collect(instrument)
         return jsonify({
-            "success": False,
-            "error": "Backtest timeout after 10 minutes"
-        }), 500
+            "success": True,
+            "message": "Backtest completed successfully",
+            "comparison_file": result.get("comparison_file"),
+            "summary": result.get("summaries", []),
+        }), 200
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -599,6 +660,54 @@ def run_backtest():
             "success": False,
             "error": str(e)
         }), 500
+
+
+@app.route('/api/predictions/backtest/e2e', methods=['POST'])
+def run_backtest_e2e():
+    """
+    Run end-to-end backtest (index + option selector logic).
+
+    Request body:
+    {
+        "instrument": "NIFTY" or "BANKNIFTY",
+        "skip_index": false,   # optional
+        "skip_option": false   # optional
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        instrument = (data.get("instrument") or "").strip().upper()
+        if instrument not in ["NIFTY", "BANKNIFTY"]:
+            return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
+
+        skip_index = bool(data.get("skip_index", False))
+        skip_option = bool(data.get("skip_option", False))
+        if skip_index and skip_option:
+            return jsonify({"success": False, "error": "Cannot skip both index and option backtest"}), 400
+
+        result = run_e2e_backtest_and_collect(
+            underlying=instrument,
+            skip_index=skip_index,
+            skip_option=skip_option,
+        )
+        return jsonify(
+            {
+                "success": True,
+                "message": "E2E backtest completed successfully",
+                "comparison_file": result.get("comparison_file"),
+                "summary": result.get("summaries", []),
+            }
+        ), 200
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify(
+            {
+                "success": False,
+                "error": str(e),
+            }
+        ), 500
 
 
 @app.route('/api/predictions/files', methods=['GET'])
@@ -779,3 +888,5 @@ if __name__ == "__main__":
     # Local dev only (Railway uses gunicorn)
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True)
+
+

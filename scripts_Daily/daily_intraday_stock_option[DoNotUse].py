@@ -11,18 +11,18 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.config import get_settings
-from src.db_client import AzureSqlClient
-from src.kite_client import KiteClient
-from src.stock_fetcher import extract_stock_instruments
-from src.option_fetcher import (
+from src.core.config import get_settings
+from src.data.db_client import AzureSqlClient
+from src.integrations.kite_client import KiteClient
+from src.fetchers.stock_fetcher import extract_stock_instruments
+from src.fetchers.option_fetcher import (
     filter_options_for_underlyings,
     _normalize_underlying,
     _years_to_expiry,           # CHANGED: use same helpers as backfill
     _implied_volatility,
     _bs_greeks,
 )
-from src.models import StockInstrument, OptionInstrument, OptionData
+from src.domain.models import StockInstrument, OptionInstrument, OptionData
 
 RISK_FREE_RATE = 0.07  # annualized for IV/Greeks
 load_dotenv()

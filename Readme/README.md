@@ -15,31 +15,32 @@ OT-v1 is a full-stack system for options analytics on Indian indices (NIFTY and 
 ```text
 OT_v1/
   api.py                         # Flask app entry point + API routes + Flutter static hosting
-  run_local.py                   # Local Flask runner
+  scripts/run_local.py           # Local Flask runner
   requirements.txt               # Python dependencies
   src/
-    config.py                    # Environment-driven settings
-    db_client.py                 # Azure SQL access layer
-    kite_client.py               # Kite API wrapper
-    models.py                    # Dataclasses for stocks/options/snapshots
-    stock_fetcher.py             # Instrument filtering for stocks/indices
-    stock_search.py              # Interactive symbol lookup helper
-    option_fetcher.py            # Option filtering + IV/Greeks calculations
-    options_service.py           # End-to-end option refresh pipeline
-    trend_service.py             # Historical option trend retrieval
+    core/config.py               # Environment-driven settings
+    core/logging_config.py
+    domain/models.py             # Dataclasses for stocks/options/snapshots
+    integrations/kite_client.py  # Kite API wrapper
+    fetchers/stock_fetcher.py    # Instrument filtering for stocks/indices
+    fetchers/option_fetcher.py   # Option filtering + IV/Greeks calculations
+    services/stock_search.py     # Interactive symbol lookup helper
+    services/options_service.py  # End-to-end option refresh pipeline
+    services/trend_service.py    # Historical option trend retrieval
+    cli/main.py                  # CLI entry point
+    data/db_client.py            # Azure SQL access layer
 
   src/prediction/
     prediction_service.py        # Prediction orchestration service
     contracts.py                 # Shared prediction/news/event dataclasses
-    technical/strategies.py      # TA strategy registry
-    technical/option_selection_strategies.py
+    strategies/                  # one-file-per-strategy + registries
     aggregator/index_aggregator.py
     aggregator/option_aggregator.py
-    providers/underlying_data_provider.py
-    providers/options_data_provider.py
+    underlying_data_provider.py
+    options_data_provider.py
 
   src/backtest/
-    index_backtest.py
+    index/index_backtest.py
     e2e_backtest.py
 
   output/                        # Generated prediction/backtest files
@@ -63,10 +64,8 @@ OT_v1/
   Readme/
     README.md                    # Primary project documentation
     LOCAL_TESTING.md             # Local API + Flutter testing steps
-    predictions.md               # Prediction + option-selection pipeline docs
     agents.md                    # Agent module implementation reference
     scripts.md                   # Data/token/backfill scripts
-    SCHEDULER_SETUP.md           # Scheduler guidance
 ```
 
 ## Prerequisites
@@ -116,7 +115,7 @@ python scripts/get_kite_access_token.py
 
 3. Start backend:
 ```bash
-python run_local.py
+python scripts/run_local.py
 ```
 
 4. Start Flutter web app (new terminal):
@@ -150,8 +149,16 @@ flutter run -d chrome
   - body: `{ "instrument": "NIFTY", "strategies": ["MaTrend_001"] }`
 - `POST /api/predictions/backtest`
   - body: `{ "instrument": "NIFTY" }`
+- `POST /api/predictions/backtest/e2e`
+  - body: `{ "instrument": "NIFTY" }`
 - `GET /api/predictions/files?instrument=NIFTY`
 - `GET /api/predictions/files/download?file=<filename>`
+
+### Backfill
+- `POST /api/backfill/nifty`
+- `POST /api/backfill/banknifty`
+- `GET /api/backfill/range/underlying?underlying=NIFTY|BANKNIFTY`
+- `GET /api/backfill/range/options?underlying=NIFTY|BANKNIFTY`
 
 ## Database schema checklist
 
@@ -181,7 +188,7 @@ Use this as a readiness checklist before running each feature area.
 - `dbo.MarketActivityDaily` (optional but supported via join)
   - used fields: `underlying`, `trade_date`, `fin_instrm_tp`, `tckr_symb`, `expiry_date`, `close_price`, `settle_price`, `underlying_price`, `open_interest`, `change_in_oi`, `traded_volume`, `traded_value`
 
-### Index backtest (`src/backtest/index_backtest.py`)
+### Index backtest (`src/backtest/index/index_backtest.py`)
 - `dbo.UnderlyingSnapshot`
 - `dbo.UnderlyingCandle5m`
   - required fields: `underlying`, `trade_date`, `low_price`, `high_price`
@@ -218,10 +225,8 @@ Generated files are written to `output/`.
 ## Documentation map
 
 - `Readme/scripts.md`: data and token scripts
-- `Readme/predictions.md`: full prediction + option-selection pipeline
 - `Readme/agents.md`: prediction agents (events/news/impact scoring) implementation reference
 - `Readme/LOCAL_TESTING.md`: local backend/frontend validation
-- `Readme/SCHEDULER_SETUP.md`: current scheduler guidance
 
 ## Notes
 

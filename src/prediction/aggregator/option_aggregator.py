@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from src.prediction.strategies.option_registry import load_option_selection_strategies
+
 OPTION_COLUMNS = [
     "option_trade_date",
     "option_instrument_token",
@@ -49,6 +51,22 @@ def apply_option_selection(
     return out.sort_values("date").reset_index(drop=True)
 
 
+def apply_all_option_selection_strategies(
+    preds: pd.DataFrame,
+    options_df: pd.DataFrame,
+    strategies: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    registry = load_option_selection_strategies()
+    selected = strategies or sorted(registry.keys())
+    outputs: dict[str, pd.DataFrame] = {}
+    for name in selected:
+        fn = registry.get(name)
+        if fn is None:
+            continue
+        outputs[name] = apply_option_selection(preds=preds, options_df=options_df, selection_func=fn)
+    return outputs
+
+
 def _ensure_option_columns(preds: pd.DataFrame) -> pd.DataFrame:
     for col in OPTION_COLUMNS:
         if col not in preds.columns:
@@ -61,3 +79,4 @@ def _clear_option_columns(preds: pd.DataFrame) -> pd.DataFrame:
         if col in preds.columns:
             preds[col] = pd.NA
     return preds
+

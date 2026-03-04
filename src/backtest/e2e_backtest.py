@@ -14,8 +14,8 @@ _repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from src.prediction.providers.options_data_provider import fetch_option_intraday_prices
-from src.prediction.providers.underlying_data_provider import (
+from src.prediction.options_data_provider import fetch_option_intraday_prices
+from src.prediction.underlying_data_provider import (
     fetch_5m_candles_for_dates,
     fetch_index_daily,
     get_db_connection,
@@ -918,7 +918,11 @@ def create_comparison_excel(underlying: str, summary_data: list) -> None:
     print(f"  [OK] Comparison Excel saved to: {excel_path}")
 
 
-def main(underlying: str, skip_index: bool = False, skip_option: bool = False):
+def run_e2e_backtest_and_collect(
+    underlying: str,
+    skip_index: bool = False,
+    skip_option: bool = False,
+) -> dict:
     """
     Main function to backtest all prediction files for a given underlying.
     
@@ -935,7 +939,13 @@ def main(underlying: str, skip_index: bool = False, skip_option: bool = False):
     if not files:
         print(f"[ERROR] No prediction files found for {underlying}")
         print(f"   Searched in: {os.path.join(PRED_DIR, f'{underlying}_*.csv')}")
-        return
+        return {
+            "underlying": underlying,
+            "summaries": [],
+            "comparison_file": None,
+            "success_count": 0,
+            "fail_count": 0,
+        }
     
     print(f"\n{'='*70}")
     print(f"Backtesting {len(files)} file(s) for {underlying}")
@@ -979,11 +989,41 @@ def main(underlying: str, skip_index: bool = False, skip_option: bool = False):
     print(f"Summary: {success_count} file(s) processed successfully, {fail_count} failed")
     print(f"{'='*70}\n")
     
+    comparison_file = None
     # Generate comparison Excel file if we have data
     if summary_data:
         print(f"Generating comparison Excel file...")
         create_comparison_excel(underlying, summary_data)
         print(f"[OK] Comparison Excel file created successfully\n")
+        comparison_file = f"{underlying}_comparison.xlsx"
+
+    summaries = []
+    for item in summary_data:
+        summaries.append(
+            {
+                "filename": item["filename"],
+                "strategy_combination": item["strategy_combination"],
+                "index_prediction_accuracy": item["index_prediction_accuracy"],
+                "option_selector_accuracy": item["option_selector_accuracy"],
+                "net_profit": item["net_profit"],
+            }
+        )
+
+    return {
+        "underlying": underlying,
+        "summaries": summaries,
+        "comparison_file": comparison_file,
+        "success_count": success_count,
+        "fail_count": fail_count,
+    }
+
+
+def main(underlying: str, skip_index: bool = False, skip_option: bool = False):
+    run_e2e_backtest_and_collect(
+        underlying=underlying,
+        skip_index=skip_index,
+        skip_option=skip_option,
+    )
 
 
 if __name__ == "__main__":
@@ -1036,4 +1076,5 @@ Examples:
         skip_index=args.skip_index,
         skip_option=args.skip_option
     )
+
 

@@ -89,6 +89,6 @@ Required env:
 ## Relationship to API
 
 For day-to-day refreshes in the live app, the primary path is:
-- `POST /api/options/process` (backend pipeline in `src/options_service.py`)
+- `POST /api/options/process` (backend pipeline in `src/services/options_service.py`)
 
 Backfill scripts are primarily for historical loading and dataset recovery.
