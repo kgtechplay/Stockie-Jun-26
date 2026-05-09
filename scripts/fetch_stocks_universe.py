@@ -1,34 +1,35 @@
 # scripts/fetch_stocks_universe.py
 """
 Fetch all NSE equity stocks and indices from Kite, mark F&O eligibility from NFO,
-and optionally enrich sector/industry via Yahoo Finance.
+and enrich sector/industry from NSE's official index constituent CSVs.
 
 Output: stocks_universe.csv at the project root.
 Schema matches dbo.WatchedInstrument:
   tradingsymbol, exchange, name, instrument_token, segment, tick_size, lot_size,
   instrument_type, sector, industry, is_fo_enabled, is_active
 
-instrument_type values:
-  STOCK        - NSE equity (EQ / BE series)
-  INDEX        - NSE index (NIFTY 50, NIFTY BANK, NIFTY IT, etc.)
-
-is_fo_enabled is derived by checking whether the symbol appears as an underlying
-in the live NFO instruments dump (no separate API call needed).
+Sector enrichment strategy:
+  1. Primary  — NSE constituent lists (Nifty 500 + Nifty Midcap 150 + Nifty
+                Smallcap 250). Fast, no auth, covers all FO-eligible stocks.
+  2. Optional — Yahoo Finance via --yfinance flag. Uses serial requests with a
+                short sleep to avoid Yahoo's crumb expiry (Invalid Crumb 401).
+                Adds coverage for stocks outside the Nifty index families.
 
 Usage:
     python scripts/fetch_stocks_universe.py
     python scripts/fetch_stocks_universe.py --fo-only
-    python scripts/fetch_stocks_universe.py --no-yfinance
+    python scripts/fetch_stocks_universe.py --yfinance          # secondary enrichment
+    python scripts/fetch_stocks_universe.py --no-nse            # skip NSE lists
     python scripts/fetch_stocks_universe.py --output path/to/file.csv
-    python scripts/fetch_stocks_universe.py --workers 12
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,10 +42,9 @@ load_dotenv()
 from src.common.config import get_settings
 from src.data_manager.kite_client import KiteClient
 
-# Only these Kite instrument_type values are proper NSE equities.
-# Excluded intentionally: BL (block deal window), SM (SME), ST (suspended T2T),
-# TB (T+1 settlement), N/SG (state govt securities), GB (sovereign gold bonds),
-# and anything else that is not a tradeable equity or index.
+# Only proper NSE equity series.
+# Excluded: BL (block deal), SM (SME), ST (suspended T2T), TB (T+1),
+#           SG (state govt bonds), GB (sovereign gold bonds), etc.
 _STOCK_TYPES = {"EQ", "BE"}
 _INDEX_TYPES  = {"INDEX"}
 
@@ -54,27 +54,32 @@ CSV_FIELDS = [
     "sector", "industry", "is_fo_enabled", "is_active",
 ]
 
+# NSE publishes index constituent CSVs with symbol + industry columns.
+# Listed largest-to-smallest so the first match (most prominent index) wins.
+_NSE_CONSTITUENT_URLS = [
+    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+    "https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    "https://archives.nseindia.com/content/indices/ind_niftymicrocap250list.csv",
+]
+
+
+# ──────────────────────────────────────────────────────────────
+# Classification
+# ──────────────────────────────────────────────────────────────
 
 def _our_type(kite_row: dict) -> str | None:
-    """Map a Kite instruments row to our instrument_type, or None to skip."""
     seg   = (kite_row.get("segment") or "").strip().upper()
     ktype = (kite_row.get("instrument_type") or "").strip().upper()
-
-    # Index check must come first — some index rows have segment NSE-INDEX
-    # but their ktype may look like an equity code on older Kite dumps.
+    # Index check first — some index rows have ktype that looks like equity
     if seg == "NSE-INDEX" or ktype in _INDEX_TYPES:
         return "INDEX"
     if ktype in _STOCK_TYPES:
         return "STOCK"
-    return None  # bonds, gold bonds, SME, suspended, state-govt securities → skip
+    return None
 
 
 def _build_fo_set(nfo_instruments: list[dict]) -> set[str]:
-    """
-    Return the set of underlying tradingsymbols that have active NFO contracts.
-    Kite's `name` field in the NFO dump is the underlying symbol (e.g. "RELIANCE",
-    "NIFTY", "BANKNIFTY").
-    """
     fo: set[str] = set()
     for row in nfo_instruments:
         name = (row.get("name") or "").strip().upper()
@@ -83,68 +88,127 @@ def _build_fo_set(nfo_instruments: list[dict]) -> set[str]:
     return fo
 
 
-def _yfinance_sector(tradingsymbol: str) -> tuple[str, str | None, str | None]:
-    """Fetch sector and industry for one NSE symbol via yfinance. Never raises."""
+# ──────────────────────────────────────────────────────────────
+# Sector enrichment: NSE constituent lists (primary)
+# ──────────────────────────────────────────────────────────────
+
+def _fetch_nse_sector_map() -> dict[str, str]:
+    """
+    Download NSE index constituent CSVs and return symbol → sector map.
+
+    NSE's 'Industry' column is the sector classification (e.g. 'FINANCIAL SERVICES',
+    'INFORMATION TECHNOLOGY', 'AUTOMOBILE AND AUTO COMPONENTS').
+    Returns empty dict if all downloads fail.
+    """
+    import requests
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    sector_map: dict[str, str] = {}
+
+    for url in _NSE_CONSTITUENT_URLS:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            added = 0
+            for row in reader:
+                sym      = (row.get("Symbol") or "").strip().upper()
+                industry = (row.get("Industry") or "").strip()
+                if sym and industry and sym not in sector_map:
+                    sector_map[sym] = industry
+                    added += 1
+            name = url.rsplit("/", 1)[-1]
+            print(f"  {name}: {added:,} new symbols")
+        except Exception as exc:
+            name = url.rsplit("/", 1)[-1]
+            print(f"  [WARN] {name} failed: {exc}")
+
+    return sector_map
+
+
+def _apply_nse_sectors(rows: list[dict], sector_map: dict[str, str]) -> int:
+    """Apply NSE sector map to rows in-place. Returns number of rows updated."""
+    updated = 0
+    for row in rows:
+        sector = sector_map.get(row["tradingsymbol"].upper())
+        if sector:
+            row["sector"] = sector
+            row["industry"] = sector   # NSE doesn't provide a separate sub-industry
+            updated += 1
+    return updated
+
+
+# ──────────────────────────────────────────────────────────────
+# Sector enrichment: Yahoo Finance (optional secondary)
+# ──────────────────────────────────────────────────────────────
+
+def _enrich_yfinance(rows: list[dict], delay: float = 0.4) -> int:
+    """
+    Serial yfinance lookups for stocks that still have no sector after NSE enrichment.
+
+    Serial (1 worker) + a small sleep between calls avoids Yahoo Finance's
+    'Invalid Crumb' 401 that occurs when many parallel sessions share/exhaust
+    the session token.
+
+    Returns number of rows enriched.
+    """
     try:
         import logging
         import yfinance as yf
-        # yfinance logs HTTP errors at WARNING level — silence them to keep output clean.
-        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-        info = yf.Ticker(f"{tradingsymbol}.NS").info
-        return tradingsymbol, info.get("sector"), info.get("industry")
-    except Exception:
-        return tradingsymbol, None, None
-
-
-def _enrich_sectors(
-    rows: list[dict],
-    workers: int,
-) -> None:
-    """Mutates rows in-place, adding sector/industry from Yahoo Finance."""
-    try:
-        import logging
-        import yfinance  # noqa: F401
-        # Silence HTTP 404 noise from yfinance and its urllib3 dependency.
         logging.getLogger("yfinance").setLevel(logging.CRITICAL)
         logging.getLogger("urllib3").setLevel(logging.CRITICAL)
         logging.getLogger("peewee").setLevel(logging.CRITICAL)
     except ImportError:
-        print(
-            "[WARN] yfinance is not installed — sector/industry will be blank.\n"
-            "       Install with: pip install yfinance"
-        )
-        return
+        print("[WARN] yfinance not installed — skipping. Install with: pip install yfinance")
+        return 0
 
-    stock_syms = [r["tradingsymbol"] for r in rows if r["instrument_type"] == "STOCK"]
-    total = len(stock_syms)
-    print(f"Enriching {total:,} stocks via Yahoo Finance ({workers} workers) — this takes a few minutes...")
+    missing = [r for r in rows if r["instrument_type"] == "STOCK" and not r["sector"]]
+    total = len(missing)
+    if total == 0:
+        print("  No stocks left without sector data — skipping yfinance.")
+        return 0
 
-    sector_map: dict[str, tuple[str | None, str | None]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_yfinance_sector, sym): sym for sym in stock_syms}
-        done = 0
-        hit = 0
-        for fut in as_completed(futures):
-            sym, sector, industry = fut.result()
-            sector_map[sym] = (sector, industry)
-            done += 1
+    print(f"  Yahoo Finance fallback for {total:,} remaining stocks (serial, ~{delay}s/req)...")
+    updated = 0
+    for i, row in enumerate(missing, 1):
+        try:
+            info = yf.Ticker(f"{row['tradingsymbol']}.NS").info
+            sector   = info.get("sector")
+            industry = info.get("industry")
             if sector:
-                hit += 1
-            if done % 200 == 0 or done == total:
-                print(f"  {done:,}/{total:,} fetched  |  {hit:,} with sector data")
+                row["sector"]   = sector
+                row["industry"] = industry or sector
+                updated += 1
+        except Exception:
+            pass
 
-    for row in rows:
-        pair = sector_map.get(row["tradingsymbol"])
-        if pair:
-            row["sector"], row["industry"] = pair
+        if i % 50 == 0 or i == total:
+            print(f"  {i:,}/{total:,} checked  |  {updated:,} enriched")
 
+        if i < total:
+            time.sleep(delay)
+
+    return updated
+
+
+# ──────────────────────────────────────────────────────────────
+# Main fetch
+# ──────────────────────────────────────────────────────────────
 
 def run_fetch(
     fo_only: bool = False,
-    use_yfinance: bool = True,
+    use_nse: bool = True,
+    use_yfinance: bool = False,
     output_path: Path | None = None,
-    workers: int = 8,
 ) -> Path:
     settings = get_settings()
     kite = KiteClient(settings)
@@ -156,10 +220,8 @@ def run_fetch(
 
     print("Fetching NFO instruments from Kite (for F&O flag)...")
     nfo_instruments = kite.fetch_instruments_nfo()
-    print(f"  {len(nfo_instruments):,} total NFO instruments")
-
     fo_set = _build_fo_set(nfo_instruments)
-    print(f"  {len(fo_set):,} unique F&O underlyings identified")
+    print(f"  {len(nfo_instruments):,} NFO instruments  |  {len(fo_set):,} unique F&O underlyings")
 
     rows: list[dict] = []
     skipped = 0
@@ -175,7 +237,6 @@ def run_fetch(
             continue
 
         is_fo = sym.upper() in fo_set or (inst.get("name") or "").strip().upper() in fo_set
-
         if fo_only and our_type == "STOCK" and not is_fo:
             continue
 
@@ -197,10 +258,24 @@ def run_fetch(
     n_stocks  = sum(1 for r in rows if r["instrument_type"] == "STOCK")
     n_indices = sum(1 for r in rows if r["instrument_type"] == "INDEX")
     n_fo      = sum(1 for r in rows if r["is_fo_enabled"])
-    print(f"\nClassified: {n_stocks:,} stocks  |  {n_indices:,} indices  |  {n_fo:,} FO-enabled  |  {skipped:,} skipped (bonds/ETFs etc.)")
+    print(
+        f"\nClassified: {n_stocks:,} stocks  |  {n_indices:,} indices  "
+        f"|  {n_fo:,} FO-enabled  |  {skipped:,} skipped"
+    )
 
+    # ── Primary enrichment: NSE constituent lists ──
+    if use_nse:
+        print("\nDownloading NSE constituent lists for sector data...")
+        sector_map = _fetch_nse_sector_map()
+        nse_hit = _apply_nse_sectors(rows, sector_map)
+        fo_covered = sum(1 for r in rows if r["is_fo_enabled"] and r["sector"])
+        print(f"  NSE sectors applied: {nse_hit:,} stocks  |  {fo_covered}/{n_fo} FO stocks covered")
+
+    # ── Secondary enrichment: Yahoo Finance (opt-in) ──
     if use_yfinance:
-        _enrich_sectors(rows, workers)
+        print("\nYahoo Finance enrichment (serial, rate-limited)...")
+        yf_hit = _enrich_yfinance(rows)
+        print(f"  Yahoo Finance added sectors for {yf_hit:,} additional stocks")
 
     out = output_path or (project_root / "stocks_universe.csv")
     with out.open("w", newline="", encoding="utf-8") as f:
@@ -208,9 +283,14 @@ def run_fetch(
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"\nWrote {len(rows):,} rows → {out}")
+    total_with_sector = sum(1 for r in rows if r["sector"])
+    print(f"\nWrote {len(rows):,} rows → {out}  |  {total_with_sector:,} with sector data")
     return out
 
+
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -222,28 +302,30 @@ def main() -> None:
         help="Only include F&O-enabled stocks (indices always included)",
     )
     parser.add_argument(
-        "--no-yfinance",
+        "--no-nse",
         action="store_true",
-        help="Skip Yahoo Finance sector/industry enrichment (faster, sector columns blank)",
+        help="Skip NSE constituent list downloads",
+    )
+    parser.add_argument(
+        "--yfinance",
+        action="store_true",
+        help=(
+            "Also enrich remaining stocks via Yahoo Finance (serial, rate-limited). "
+            "Requires: pip install yfinance"
+        ),
     )
     parser.add_argument(
         "--output",
         default=None,
         help="Output CSV path (default: stocks_universe.csv at project root)",
     )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Parallel workers for Yahoo Finance lookups (default: 8)",
-    )
     args = parser.parse_args()
 
     run_fetch(
         fo_only=args.fo_only,
-        use_yfinance=not args.no_yfinance,
+        use_nse=not args.no_nse,
+        use_yfinance=args.yfinance,
         output_path=Path(args.output) if args.output else None,
-        workers=args.workers,
     )
 
 

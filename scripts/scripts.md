@@ -86,14 +86,14 @@ Creates: `TradingCalendar`, `WatchedInstrument`, `SignalFeatureDaily`, `SignalPr
 Fetch all NSE equity stocks and indices from Kite, flag F&O eligibility from the live NFO dump, and optionally enrich sector/industry via Yahoo Finance. Writes `stocks_universe.csv` at the project root — same schema as `dbo.WatchedInstrument`.
 
 ```bash
-# Full universe with sector enrichment (takes ~5 min for ~2 000 stocks)
+# Full universe — sector from NSE constituent lists (fast, no auth, covers Nifty 500+)
 python scripts/fetch_stocks_universe.py
 
-# Skip Yahoo Finance — sector/industry columns will be blank
-python scripts/fetch_stocks_universe.py --no-yfinance
+# Only F&O-eligible stocks
+python scripts/fetch_stocks_universe.py --fo-only
 
-# Only F&O-eligible stocks (much smaller list)
-python scripts/fetch_stocks_universe.py --fo-only --no-yfinance
+# Also enrich remaining stocks via Yahoo Finance (serial, rate-limited)
+python scripts/fetch_stocks_universe.py --yfinance
 
 # Custom output path
 python scripts/fetch_stocks_universe.py --output data/my_stocks.csv
@@ -101,7 +101,9 @@ python scripts/fetch_stocks_universe.py --output data/my_stocks.csv
 
 CSV columns: `tradingsymbol, exchange, name, instrument_token, segment, tick_size, lot_size, instrument_type, sector, industry, is_fo_enabled, is_active`
 
-Requires `pip install yfinance` for sector enrichment.
+Sector data sources (in priority order):
+1. NSE constituent lists — Nifty 500, Nifty Midcap 150, Nifty Smallcap 250, Nifty Microcap 250. Covers all FO-eligible stocks.
+2. Yahoo Finance (`--yfinance`) — serial lookups for stocks not in NSE lists. Requires `pip install yfinance`.
 
 ### `populate_watched_instruments.py`
 
