@@ -1,10 +1,10 @@
-﻿# scripts/check_option_snapshot_coverage.py
+﻿# scripts/diagnostics/check_option_snapshot_coverage.py
 """
 Diagnostic: verify OptionSnapshot has 2 entries per option instrument per day.
 
 Usage:
-    python scripts/check_option_snapshot_coverage.py
-    python scripts/check_option_snapshot_coverage.py --underlying NIFTY
+    python scripts/diagnostics/check_option_snapshot_coverage.py
+    python scripts/diagnostics/check_option_snapshot_coverage.py --underlying NIFTY
 """
 
 import sys

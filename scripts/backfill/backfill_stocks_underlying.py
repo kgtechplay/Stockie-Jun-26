@@ -1,4 +1,4 @@
-﻿# scripts/backfill_stocks_underlying.py
+﻿# scripts/backfill/backfill_stocks_underlying.py
 """
 Backfill dbo.UnderlyingSnapshot (daily OHLC) and dbo.UnderlyingCandle5m (5-minute candles)
 for all STOCK-type instruments in dbo.WatchedInstrument.

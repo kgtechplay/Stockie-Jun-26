@@ -1,4 +1,4 @@
-﻿# scripts/backfill_stocks_options.py
+﻿# scripts/backfill/backfill_stocks_options.py
 """
 Backfill dbo.OptionSnapshot + dbo.OptionSnapshotCalc for STOCK option instruments.
 
@@ -12,9 +12,9 @@ For each row in dbo.OptionInstrument (underlying IN HDFCBANK, RELIANCE, etc.):
   - Uses Kite interval="day" (one API call per option covers the full range)
 
 Usage:
-    python scripts/backfill_stocks_options.py
-    python scripts/backfill_stocks_options.py --start 2025-01-01 --end 2026-04-30
-    python scripts/backfill_stocks_options.py --underlying HDFCBANK,RELIANCE
+    python scripts/backfill/backfill_stocks_options.py
+    python scripts/backfill/backfill_stocks_options.py --start 2025-01-01 --end 2026-04-30
+    python scripts/backfill/backfill_stocks_options.py --underlying HDFCBANK,RELIANCE
 """
 
 import sys
@@ -190,7 +190,7 @@ def _fetch_option_day_candles(
                     time.sleep(0.5)
                     if kite_client.re_authenticate():
                         continue
-                    print("[ERROR] Token reload failed. Run: python scripts/get_kite_access_token.py")
+                    print("[ERROR] Token reload failed. Run: python scripts/daily_get_kite_access_token.py")
                 token_expired_flag[0] = True
                 return None
             elif is_rate_limit and retry < MAX_RETRIES - 1:

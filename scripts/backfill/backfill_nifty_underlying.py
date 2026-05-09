@@ -1,4 +1,4 @@
-﻿# scripts/backfill_nifty_underlying.py
+﻿# scripts/backfill/backfill_nifty_underlying.py
 
 import sys
 from pathlib import Path
