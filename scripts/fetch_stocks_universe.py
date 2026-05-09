@@ -41,9 +41,12 @@ load_dotenv()
 from src.common.config import get_settings
 from src.data_manager.kite_client import KiteClient
 
-# Kite instrument_type values that map to our STOCK / INDEX types
-_EQ_TYPES = {"EQ", "BE", "BL", "SM", "ST", "TB", "N"}  # equity series on NSE
-_INDEX_TYPES = {"INDEX"}
+# Only these Kite instrument_type values are proper NSE equities.
+# Excluded intentionally: BL (block deal window), SM (SME), ST (suspended T2T),
+# TB (T+1 settlement), N/SG (state govt securities), GB (sovereign gold bonds),
+# and anything else that is not a tradeable equity or index.
+_STOCK_TYPES = {"EQ", "BE"}
+_INDEX_TYPES  = {"INDEX"}
 
 CSV_FIELDS = [
     "tradingsymbol", "exchange", "name", "instrument_token",
@@ -54,14 +57,16 @@ CSV_FIELDS = [
 
 def _our_type(kite_row: dict) -> str | None:
     """Map a Kite instruments row to our instrument_type, or None to skip."""
-    ktype = (kite_row.get("instrument_type") or "").strip().upper()
     seg   = (kite_row.get("segment") or "").strip().upper()
+    ktype = (kite_row.get("instrument_type") or "").strip().upper()
 
-    if ktype in _EQ_TYPES:
-        return "STOCK"
-    if ktype in _INDEX_TYPES or seg == "NSE-INDEX":
+    # Index check must come first — some index rows have segment NSE-INDEX
+    # but their ktype may look like an equity code on older Kite dumps.
+    if seg == "NSE-INDEX" or ktype in _INDEX_TYPES:
         return "INDEX"
-    return None
+    if ktype in _STOCK_TYPES:
+        return "STOCK"
+    return None  # bonds, gold bonds, SME, suspended, state-govt securities → skip
 
 
 def _build_fo_set(nfo_instruments: list[dict]) -> set[str]:
@@ -81,7 +86,11 @@ def _build_fo_set(nfo_instruments: list[dict]) -> set[str]:
 def _yfinance_sector(tradingsymbol: str) -> tuple[str, str | None, str | None]:
     """Fetch sector and industry for one NSE symbol via yfinance. Never raises."""
     try:
+        import logging
         import yfinance as yf
+        # yfinance logs HTTP errors at WARNING level — silence them to keep output clean.
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
         info = yf.Ticker(f"{tradingsymbol}.NS").info
         return tradingsymbol, info.get("sector"), info.get("industry")
     except Exception:
@@ -94,7 +103,12 @@ def _enrich_sectors(
 ) -> None:
     """Mutates rows in-place, adding sector/industry from Yahoo Finance."""
     try:
+        import logging
         import yfinance  # noqa: F401
+        # Silence HTTP 404 noise from yfinance and its urllib3 dependency.
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+        logging.getLogger("peewee").setLevel(logging.CRITICAL)
     except ImportError:
         print(
             "[WARN] yfinance is not installed — sector/industry will be blank.\n"
