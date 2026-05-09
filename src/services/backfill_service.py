@@ -72,8 +72,8 @@ class BackfillService:
                 underlyings=stock_symbols,
             )
             results["stock_options"] = run_backfill_stocks_options(
-                start_date=request.start_date,
-                end_date=request.end_date,
+                global_start=request.start_date,
+                global_end=request.end_date,
                 underlyings=stock_symbols,
             )
 
