@@ -236,6 +236,15 @@ def run_fetch(
             skipped += 1
             continue
 
+        # NSE equity tradingsymbols are pure alphanumeric (+ & for stocks like M&MFIN).
+        # A hyphen in the symbol marks non-equity series: -SG (state govt bonds),
+        # -GB (sovereign gold bonds), -BZ (suspended), -ST (suspended T2T), -N (NCDs).
+        # Kite sometimes assigns instrument_type=EQ to these, so the ktype filter alone
+        # is not enough — we must also exclude by tradingsymbol pattern.
+        if our_type == "STOCK" and "-" in sym:
+            skipped += 1
+            continue
+
         is_fo = sym.upper() in fo_set or (inst.get("name") or "").strip().upper() in fo_set
         if fo_only and our_type == "STOCK" and not is_fo:
             continue
