@@ -81,6 +81,28 @@ python scripts/run_migration.py
 
 Creates: `TradingCalendar`, `WatchedInstrument`, `SignalFeatureDaily`, `SignalPrediction`, `SignalBacktestLabel`, `OptionCandle5m`, `OptionTradePlan`, `OptionPaperTradeResult`, and all views.
 
+### `fetch_stocks_universe.py`
+
+Fetch all NSE equity stocks and indices from Kite, flag F&O eligibility from the live NFO dump, and optionally enrich sector/industry via Yahoo Finance. Writes `stocks_universe.csv` at the project root — same schema as `dbo.WatchedInstrument`.
+
+```bash
+# Full universe with sector enrichment (takes ~5 min for ~2 000 stocks)
+python scripts/fetch_stocks_universe.py
+
+# Skip Yahoo Finance — sector/industry columns will be blank
+python scripts/fetch_stocks_universe.py --no-yfinance
+
+# Only F&O-eligible stocks (much smaller list)
+python scripts/fetch_stocks_universe.py --fo-only --no-yfinance
+
+# Custom output path
+python scripts/fetch_stocks_universe.py --output data/my_stocks.csv
+```
+
+CSV columns: `tradingsymbol, exchange, name, instrument_token, segment, tick_size, lot_size, instrument_type, sector, industry, is_fo_enabled, is_active`
+
+Requires `pip install yfinance` for sector enrichment.
+
 ### `populate_watched_instruments.py`
 
 Seed `dbo.WatchedInstrument` with NIFTY/BANKNIFTY from `dbo.StockDB`, and register watched stocks. Run once after migration.
