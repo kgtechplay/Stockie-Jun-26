@@ -85,15 +85,24 @@ Creates: `TradingCalendar`, `WatchedInstrument`, `SignalFeatureDaily`, `SignalPr
 
 Fetch all NSE equity stocks and indices from Kite, flag F&O eligibility from the live NFO dump, and optionally enrich sector/industry via Yahoo Finance. Writes `stocks_universe.csv` at the project root — same schema as `dbo.WatchedInstrument`.
 
+Three-step pipeline:
+
+1. **NSE constituent lists** — downloads Kite instrument data and matches sector from Nifty 500 / Midcap 150 / Smallcap 250 / Microcap 250 CSVs. Only rows with a confirmed sector are kept → `nse_stocks.csv`
+2. **Yahoo Finance** — for stocks not covered by NSE lists, queries yfinance serially (rate-limited to avoid 401 Invalid Crumb) → `yf_stocks.csv`
+3. **Merge** — NSE rows take priority; yfinance rows fill gaps; remaining Kite rows added without sector for completeness → `stocks_universe.csv`
+
 ```bash
-# Full universe — sector from NSE constituent lists (fast, no auth, covers Nifty 500+)
+# Full pipeline: NSE + yfinance (recommended)
 python scripts/fetch_stocks_universe.py
+
+# Skip yfinance (fast — NSE sectors only, small-cap sectors blank)
+python scripts/fetch_stocks_universe.py --no-yfinance
 
 # Only F&O-eligible stocks
 python scripts/fetch_stocks_universe.py --fo-only
 
-# Also enrich remaining stocks via Yahoo Finance (serial, rate-limited)
-python scripts/fetch_stocks_universe.py --yfinance
+# Slower yfinance requests if you're seeing 401s
+python scripts/fetch_stocks_universe.py --yf-delay 0.8
 
 # Custom output path
 python scripts/fetch_stocks_universe.py --output data/my_stocks.csv
@@ -101,9 +110,7 @@ python scripts/fetch_stocks_universe.py --output data/my_stocks.csv
 
 CSV columns: `tradingsymbol, exchange, name, instrument_token, segment, tick_size, lot_size, instrument_type, sector, industry, is_fo_enabled, is_active`
 
-Sector data sources (in priority order):
-1. NSE constituent lists — Nifty 500, Nifty Midcap 150, Nifty Smallcap 250, Nifty Microcap 250. Covers all FO-eligible stocks.
-2. Yahoo Finance (`--yfinance`) — serial lookups for stocks not in NSE lists. Requires `pip install yfinance`.
+Requires `pip install yfinance` for Step 2.
 
 ### `populate_watched_instruments.py`
 
