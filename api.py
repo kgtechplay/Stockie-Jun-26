@@ -1,4 +1,4 @@
-# api.py
+﻿# api.py
 """
 Flask REST API backend for the Options Trading application.
 """
@@ -15,15 +15,14 @@ project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.core.config import get_settings
-from src.data.db_client import AzureSqlClient
-from src.services.options_service import process_underlying_once
-from src.fetchers.option_fetcher import _normalize_underlying
-from src.services.trend_service import fetch_option_trend_data
-from src.prediction.prediction_service import PredictionService
-from src.prediction.strategies.index_registry import load_index_prediction_strategies
-from src.backfill.index_backfill_service import IndexBackfillService, BackfillRequest
-from src.backtest.index.index_backtest import run_index_backtest_and_collect
+from src.common.config import get_settings
+from src.data_manager.db.database_client import DatabaseClient
+from src.services.options_service import process_underlying_once, fetch_option_trend_data
+from src.data_manager.kite_option_snapshot_builder import _normalize_underlying
+from src.services.prediction_service import PredictionService
+from src.technical_analysis.index_registry import load_index_prediction_strategies
+from src.services.backfill_service import BackfillService, BackfillRequest
+from src.backtest.index_backtest import run_index_backtest_and_collect
 from src.backtest.e2e_backtest import run_e2e_backtest_and_collect
 
 app = Flask(__name__)
@@ -76,10 +75,10 @@ def _run_backfill_endpoint(underlying: str):
     try:
         data = request.get_json() or {}
         start_date, end_date = _parse_backfill_dates(data)
-        service = IndexBackfillService()
-        result = service.run_full_backfill(
+        service = BackfillService()
+        result = service.run_backfill(
             BackfillRequest(
-                underlying=underlying,
+                underlyings=[underlying],
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -108,7 +107,7 @@ def run_banknifty_backfill():
 def get_underlying_backfill_range():
     try:
         underlying = (request.args.get("underlying") or "").strip().upper()
-        service = IndexBackfillService()
+        service = BackfillService()
         result = service.get_underlying_data_range(underlying)
         return jsonify({"success": True, "result": result}), 200
     except ValueError as exc:
@@ -124,7 +123,7 @@ def get_underlying_backfill_range():
 def get_options_backfill_range():
     try:
         underlying = (request.args.get("underlying") or "").strip().upper()
-        service = IndexBackfillService()
+        service = BackfillService()
         result = service.get_options_data_range(underlying)
         return jsonify({"success": True, "result": result}), 200
     except ValueError as exc:
@@ -141,7 +140,7 @@ def get_stock_count():
     """Debug endpoint to check total stock count in database."""
     try:
         settings = get_settings_safe()
-        db = AzureSqlClient(settings)
+        db = DatabaseClient(settings)
         db.connect()
         count = db.get_stock_count()
         db.close()
@@ -161,18 +160,18 @@ def search_stocks():
         data = request.get_json()
         query = data.get('query', '').strip()
         segment = data.get('segment', '').strip() or None  # Optional segment filter
-        
+
         if not query:
             return jsonify({"error": "Query parameter is required"}), 400
-        
+
         settings = get_settings_safe()
-        db = AzureSqlClient(settings)
+        db = DatabaseClient(settings)
         db.connect()
-        
+
         # No limit - return all matching results
         matches = db.search_stocks_by_name(query, limit=None, segment=segment)
         db.close()
-        
+
         matches_data = [
             {
                 "tradingsymbol": s.tradingsymbol,
@@ -182,9 +181,9 @@ def search_stocks():
             }
             for s in matches
         ]
-        
+
         return jsonify({"matches": matches_data}), 200
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -355,7 +354,7 @@ def get_latest_options():
             )
 
         settings = get_settings_safe()
-        db = AzureSqlClient(settings)
+        db = DatabaseClient(settings)
         db.connect()
         rows = db.fetch_latest_option_chain_for_underlying(normalized_underlying)
         db.close()
@@ -384,10 +383,10 @@ def get_latest_options():
 def get_option_trend():
     """
     Get historical trend data for a specific option instrument.
-    
+
     Request:
       GET /api/options/trend?option_instrument_id=123&days=30
-    
+
     Response:
       {
         "success": true,
@@ -415,13 +414,13 @@ def get_option_trend():
     try:
         option_instrument_id = request.args.get("option_instrument_id")
         days = request.args.get("days", "30")
-        
+
         if not option_instrument_id:
             return jsonify({
                 "success": False,
                 "error": "option_instrument_id query param is required"
             }), 400
-        
+
         try:
             option_instrument_id = int(option_instrument_id)
             days = int(days)
@@ -430,19 +429,19 @@ def get_option_trend():
                 "success": False,
                 "error": "option_instrument_id and days must be integers"
             }), 400
-        
+
         settings = get_settings_safe()
         trend_data = fetch_option_trend_data(
             option_instrument_id=option_instrument_id,
             days=days,
             settings=settings,
         )
-        
+
         return jsonify({
             "success": True,
             **trend_data,
         }), 200
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -458,7 +457,7 @@ def get_option_trend():
 def get_prediction_strategies():
     """
     Get list of all available prediction strategies.
-    
+
     Response:
     {
         "success": true,
@@ -484,14 +483,14 @@ def get_prediction_strategies():
 def run_predictions():
     """
     Run prediction generation for selected instrument and strategies.
-    
+
     Request body:
     {
         "instrument": "NIFTY" or "BANKNIFTY",
         "strategies": ["trendUpRangeBreakout", "MaTrend_001", ...],
         "use_agentic": true  # optional, defaults to USE_AGENTIC_AGGREGATOR env
     }
-    
+
     Response:
     {
         "success": true,
@@ -500,26 +499,26 @@ def run_predictions():
     }
     """
     import logging
-    
+
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-    
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "Request body is required"}), 400
-        
+
         instrument = data.get("instrument", "").strip().upper()
         strategies = data.get("strategies", [])
-        
+
         if instrument not in ["NIFTY", "BANKNIFTY"]:
             return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
-        
+
         if strategies is None:
             strategies = []
         if not isinstance(strategies, list):
             return jsonify({"success": False, "error": "strategies must be a list"}), 400
-        
+
         project_root = Path(__file__).parent
         service = PredictionService.from_project_root(project_root)
         use_agentic_raw = data.get("use_agentic")
@@ -530,7 +529,7 @@ def run_predictions():
                 use_agentic = use_agentic_raw
             else:
                 use_agentic = str(use_agentic_raw).strip().lower() in {"1", "true", "yes", "y"}
-        
+
         # Clear existing output files for this instrument before generating new ones
         # This ensures backtest only compares files from the current run
         output_dir = project_root / "output"
@@ -544,7 +543,7 @@ def run_predictions():
                     logger.info(f"Cleared existing file: {os.path.basename(file_path)}")
                 except Exception as e:
                     logger.warning(f"Could not remove {file_path}: {e}")
-        
+
         generated_files = []
         errors = []
         run_all = (not strategies) or any(str(s).strip().upper() == "ALL" for s in strategies)
@@ -589,7 +588,7 @@ def run_predictions():
                 except Exception as e:
                     errors.append(f"{strategy}: {str(e)}")
                     logger.error(f"Exception running {strategy}: {e}")
-        
+
         if generated_files:
             return jsonify({
                 "success": True,
@@ -603,7 +602,7 @@ def run_predictions():
                 "error": "No files generated",
                 "errors": errors
             }), 500
-            
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -617,12 +616,12 @@ def run_predictions():
 def run_backtest():
     """
     Run index backtest for selected instrument.
-    
+
     Request body:
     {
         "instrument": "NIFTY" or "BANKNIFTY"
     }
-    
+
     Response:
     {
         "success": true,
@@ -631,20 +630,20 @@ def run_backtest():
     }
     """
     import logging
-    
+
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-    
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "Request body is required"}), 400
-        
+
         instrument = data.get("instrument", "").strip().upper()
-        
+
         if instrument not in ["NIFTY", "BANKNIFTY"]:
             return jsonify({"success": False, "error": "instrument must be NIFTY or BANKNIFTY"}), 400
-        
+
         logger.info(f"Running backtest for {instrument}")
         result = run_index_backtest_and_collect(instrument)
         return jsonify({
@@ -714,10 +713,10 @@ def run_backtest_e2e():
 def list_prediction_files():
     """
     List all generated files in the output folder.
-    
+
     Query params:
     - instrument (optional): Filter by NIFTY or BANKNIFTY
-    
+
     Response:
     {
         "success": true,
@@ -734,24 +733,24 @@ def list_prediction_files():
     try:
         project_root = Path(__file__).parent
         output_dir = project_root / "output"
-        
+
         if not output_dir.exists():
             return jsonify({
                 "success": True,
                 "files": []
             }), 200
-        
+
         instrument_filter = request.args.get("instrument", "").strip().upper()
-        
+
         files = []
         for file_path in output_dir.iterdir():
             if file_path.is_file():
                 filename = file_path.name
-                
+
                 # Filter by instrument if specified
                 if instrument_filter and instrument_filter not in filename.upper():
                     continue
-                
+
                 # Determine file type
                 file_type = "unknown"
                 if "_predicted.csv" in filename:
@@ -762,22 +761,22 @@ def list_prediction_files():
                     file_type = "csv"
                 elif filename.endswith(".xlsx"):
                     file_type = "excel"
-                
+
                 files.append({
                     "name": filename,
                     "type": file_type,
                     "size": file_path.stat().st_size,
                     "url": f"/api/predictions/files/download?file={filename}"
                 })
-        
+
         # Sort by name
         files.sort(key=lambda x: x["name"])
-        
+
         return jsonify({
             "success": True,
             "files": files
         }), 200
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -791,35 +790,35 @@ def list_prediction_files():
 def download_prediction_file():
     """
     Download a generated prediction file.
-    
+
     Query params:
     - file: Filename to download (e.g., "NIFTY_trendUpRangeBreakout_predicted.csv")
-    
+
     Returns the file for download.
     """
     from flask import send_file
-    
+
     try:
         filename = request.args.get("file", "").strip()
         if not filename:
             return jsonify({"success": False, "error": "file parameter is required"}), 400
-        
+
         # Security: prevent directory traversal
         if ".." in filename or "/" in filename or "\\" in filename:
             return jsonify({"success": False, "error": "Invalid filename"}), 400
-        
+
         project_root = Path(__file__).parent
         file_path = project_root / "output" / filename
-        
+
         if not file_path.exists() or not file_path.is_file():
             return jsonify({"success": False, "error": "File not found"}), 404
-        
+
         return send_file(
             str(file_path),
             as_attachment=True,
             download_name=filename
         )
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -888,5 +887,3 @@ if __name__ == "__main__":
     # Local dev only (Railway uses gunicorn)
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True)
-
-

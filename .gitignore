@@ -1,4 +1,4 @@
-# =========================
+﻿# =========================
 # Python
 # =========================
 __pycache__/
@@ -17,11 +17,14 @@ dist/
 # =========================
 .env
 .secrets/
+kite_access_token.txt
 
 # =========================
 # Runtime / generated data
 # =========================
 predictions/output/
+output/
+.claude/
 
 # =========================
 # IDE
@@ -42,7 +45,7 @@ flutter_app/.pub-cache/
 flutter_app/.pub/
 flutter_app/build/
 
-# ❌ DO NOT ignore these (must be committed)
+# âŒ DO NOT ignore these (must be committed)
 !flutter_app/lib/
 !flutter_app/web/
 !flutter_app/pubspec.yaml

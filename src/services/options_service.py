@@ -1,11 +1,12 @@
-# src/options_service.py
+﻿# src/services/options_service.py
 import logging
-from typing import Tuple, List
+from datetime import datetime, timedelta, date
+from typing import Tuple, List, Dict, Any, Optional
 
-from src.core.config import Settings
-from src.data.db_client import AzureSqlClient
-from src.integrations.kite_client import KiteClient
-from src.fetchers.option_fetcher import (
+from src.common.config import Settings, get_settings
+from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.kite_client import KiteClient
+from src.data_manager.kite_option_snapshot_builder import (
     filter_options_for_underlyings,
     build_option_data_snapshot,
 )
@@ -28,7 +29,7 @@ def process_underlying_once(tradingsymbol: str, settings: Settings) -> Tuple[int
     kite_client = KiteClient(settings)
     kite_client.authenticate()
 
-    db = AzureSqlClient(settings)
+    db = DatabaseClient(settings)
     db.connect()
 
     # 1) fetch all NFO instruments
@@ -88,3 +89,75 @@ def process_underlying_once(tradingsymbol: str, settings: Settings) -> Tuple[int
     return len(option_contracts), len(mapped_rows)
 
 
+def fetch_option_trend_data(
+    option_instrument_id: int,
+    days: int = 30,
+    settings: Optional[Settings] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch historical trend data for a specific option instrument.
+    Returns OHLCV + IV/Greeks for the last N days, formatted for charting.
+    """
+    if settings is None:
+        settings = get_settings()
+
+    db = DatabaseClient(settings)
+    db.connect()
+    try:
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days)
+
+        option_data_list = db.fetch_option_data(
+            option_instrument_ids=[option_instrument_id],
+            from_time=from_date,
+            to_time=to_date,
+        )
+
+        option_info = db.get_option_instrument_by_id(option_instrument_id)
+        if not option_info:
+            return {
+                "option_instrument_id": option_instrument_id,
+                "tradingsymbol": "Unknown",
+                "strike": 0.0,
+                "expiry": "",
+                "instrument_type": "",
+                "data_points": [],
+                "error": "Option instrument not found",
+            }
+
+        data_points = sorted(
+            [
+                {
+                    "date": d.snapshot_time.date().isoformat(),
+                    "timestamp": d.snapshot_time.isoformat(),
+                    "underlying_price": d.underlying_price,
+                    "option_price": d.last_price,
+                    "implied_volatility": d.implied_volatility,
+                    "delta": d.delta,
+                    "gamma": d.gamma,
+                    "theta": d.theta,
+                    "vega": d.vega,
+                }
+                for d in option_data_list
+            ],
+            key=lambda x: x["date"],
+        )
+
+        expiry = option_info.get("expiry")
+        if isinstance(expiry, datetime):
+            expiry_str = expiry.date().isoformat()
+        elif isinstance(expiry, date):
+            expiry_str = expiry.isoformat()
+        else:
+            expiry_str = str(expiry) if expiry else ""
+
+        return {
+            "option_instrument_id": option_instrument_id,
+            "tradingsymbol": option_info.get("tradingsymbol", ""),
+            "strike": option_info.get("strike", 0.0),
+            "expiry": expiry_str,
+            "instrument_type": option_info.get("instrument_type", ""),
+            "data_points": data_points,
+        }
+    finally:
+        db.close()

@@ -1,0 +1,9 @@
+﻿agent_name: impactList
+description: Rank stocks that may be affected by the industries or commodities found by dailyNews.
+max_candidates: 50
+ranking_fields:
+  - direct_exposure
+  - earnings_sensitivity
+  - liquidity
+  - historical_news_reaction
+output_schema: output_schema.ImpactListOutput

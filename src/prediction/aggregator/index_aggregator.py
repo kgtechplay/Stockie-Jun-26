@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
@@ -6,7 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 from src.prediction.contracts import PredictionOutput, Signal, clamp01
-from src.prediction.strategies.index_registry import detect_regime, load_index_prediction_strategies
+from src.technical_analysis.index_registry import detect_regime, load_index_prediction_strategies
 
 
 def get_index_strategy_predictions(
@@ -75,4 +75,3 @@ def run_index_prediction(
         reasons=reasons,
         component_signals=ta_signals,
     )
-

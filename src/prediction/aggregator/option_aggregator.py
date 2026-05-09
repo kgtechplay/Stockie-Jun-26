@@ -1,8 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pandas as pd
 
-from src.prediction.strategies.option_registry import load_option_selection_strategies
+from src.technical_analysis.option_registry import load_option_selection_strategies
 
 OPTION_COLUMNS = [
     "option_trade_date",
@@ -79,4 +79,3 @@ def _clear_option_columns(preds: pd.DataFrame) -> pd.DataFrame:
         if col in preds.columns:
             preds[col] = pd.NA
     return preds
-

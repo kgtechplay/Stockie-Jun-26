@@ -1,0 +1,9 @@
+﻿agent_name: reviewList
+description: Review and approve impactList output before data backfill is triggered.
+required_checks:
+  - stock_exists
+  - instrument_token_available
+  - liquidity_threshold
+  - duplicate_exposure
+  - contradictory_news
+output_schema: output_schema.ReviewListOutput

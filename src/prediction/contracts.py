@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,4 +69,3 @@ class PredictionOutput:
 
     def __post_init__(self) -> None:
         self.confidence = clamp01(self.confidence)
-
