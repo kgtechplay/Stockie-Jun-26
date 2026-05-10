@@ -1,7 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from src.agents.dailyNews.output_schema import (
@@ -16,20 +16,36 @@ class DailyNewsAgent:
 
     config_path: Path = Path(__file__).with_name("config.yaml")
 
-    def run(self, as_of: datetime | None = None) -> DailyNewsOutput:
+    def run(
+        self,
+        reference_date: date | None = None,
+        as_of: datetime | None = None,
+    ) -> DailyNewsOutput:
+        """
+        Process news articles for reference_date.
+
+        reference_date — the date of the news article (used as N throughout the
+                         pipeline; backfill will cover N-90 → N-1).
+        as_of          — wall-clock timestamp for when this agent ran (defaults
+                         to now; can differ from reference_date when reprocessing
+                         historical articles).
+        """
+        ref_date  = reference_date or datetime.now().date()
         timestamp = as_of or datetime.now()
+
         return DailyNewsOutput(
+            reference_date=ref_date,
             as_of=timestamp,
             sources=self._configured_sources(),
             findings=[
                 DailyNewsFinding(
                     headline="Placeholder daily macro/micro news scan",
                     source="configured_news_sources",
-                    impacted_underlying="UNKNOWN",
+                    impacted_sector="UNKNOWN",
                     impact_type="UNKNOWN",
                     rationale=(
-                        "Replace with scraper and NLP extraction that maps news to "
-                        "industries, commodities, or macro factors."
+                        "Replace with scraper and NLP extraction that maps news "
+                        "headlines to NSE sector labels."
                     ),
                     confidence=0.0,
                 )

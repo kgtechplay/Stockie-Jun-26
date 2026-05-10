@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -61,11 +61,10 @@ class SectorConstituent:
 @dataclass
 class NSESectorConstituentProvider:
     """
-    Fetches sector constituents directly from NSE.
+    Fetches live sector constituents from NSE.
 
-    The service intentionally treats NSE as the sector-membership source of
-    truth. The local DB is only used later for Kite-token enrichment and
-    WatchedInstrument persistence.
+    NSE is the sector-membership source of truth. The local DB is only used
+    later for Kite-token enrichment and WatchedInstrument persistence.
     """
 
     timeout_seconds: int = 30
@@ -114,44 +113,55 @@ class NSESectorConstituentProvider:
 @dataclass
 class SectorWatchlistRequest:
     sectors: list[str]
-    as_of: datetime | None = None
+    reference_date: date           # date N — backfill covers N-backfill_days to N-1
     backfill_days: int = 90
 
 
 @dataclass
 class SectorWatchlistService:
     """
-    Expands reviewed sector ideas into watched stocks and backfills new entries.
+    Expands reviewed sector names into individual NSE stocks, registers them in
+    WatchedInstrument, backfills historical data (N-90 → N-1), and triggers the
+    prediction service for date N.
     """
 
-    constituent_provider: NSESectorConstituentProvider = field(default_factory=NSESectorConstituentProvider)
+    constituent_provider: NSESectorConstituentProvider = field(
+        default_factory=NSESectorConstituentProvider
+    )
     backfill_service: BackfillService = field(default_factory=BackfillService)
+    prediction_service: Any | None = None   # PredictionService injected by orchestrator
 
     def expand_from_review(
         self,
         review_output: ReviewListOutput,
-        as_of: datetime | None = None,
         backfill_days: int = 90,
     ) -> dict[str, Any]:
+        """
+        Entry point called by OrchestrationService.
+
+        Uses review_output.reference_date as N:
+          - backfill window : N - backfill_days  →  N - 1
+          - prediction date : N  (data through N-1 is used)
+        """
         return self.expand_and_backfill(
             SectorWatchlistRequest(
-                sectors=review_output.sectors(),
-                as_of=as_of or review_output.as_of,
+                sectors=review_output.approved_sectors(),
+                reference_date=review_output.reference_date,
                 backfill_days=backfill_days,
             )
         )
 
     def expand_and_backfill(self, request: SectorWatchlistRequest) -> dict[str, Any]:
-        timestamp = request.as_of or datetime.now()
         sectors = _dedupe_clean(request.sectors)
         if not sectors:
             return {
                 "triggered": False,
-                "reason": "No sectors supplied by reviewList.",
+                "reason": "No approved sectors from reviewList.",
                 "sectors": [],
                 "new_symbols": [],
             }
 
+        # ── 1. Expand sectors → NSE constituents ──────────────────────────
         sector_results: dict[str, Any] = {}
         all_constituents: dict[str, SectorConstituent] = {}
         for sector in sectors:
@@ -160,10 +170,10 @@ class SectorWatchlistService:
                 sector_results[sector] = {
                     "nse_index": normalize_nse_sector_index(sector),
                     "constituents_found": len(constituents),
-                    "symbols": [item.symbol for item in constituents],
+                    "symbols": [c.symbol for c in constituents],
                 }
-                for item in constituents:
-                    all_constituents.setdefault(item.symbol, item)
+                for c in constituents:
+                    all_constituents.setdefault(c.symbol, c)
             except Exception as exc:
                 sector_results[sector] = {
                     "nse_index": normalize_nse_sector_index(sector),
@@ -175,14 +185,15 @@ class SectorWatchlistService:
         if not all_constituents:
             return {
                 "triggered": False,
-                "reason": "No NSE constituents were resolved for the supplied sectors.",
+                "reason": "No NSE constituents resolved for the supplied sectors.",
                 "sectors": sectors,
                 "sector_results": sector_results,
                 "new_symbols": [],
             }
 
+        # ── 2. Register net-new stocks in WatchedInstrument ───────────────
         new_instruments = self._insert_new_watched_stocks(all_constituents)
-        new_symbols = [item.tradingsymbol for item in new_instruments]
+        new_symbols = [w.tradingsymbol for w in new_instruments]
         if not new_symbols:
             return {
                 "triggered": False,
@@ -192,13 +203,15 @@ class SectorWatchlistService:
                 "new_symbols": [],
             }
 
+        # ── 3. Load option instruments for new stocks ─────────────────────
         option_instruments = run_load_option_instruments(
             instrument_type="STOCK",
             underlyings=new_symbols,
         )
 
-        end_date = timestamp.date()
-        start_date = end_date - timedelta(days=request.backfill_days)
+        # ── 4. Backfill historical data: N-backfill_days → N-1 ────────────
+        end_date   = request.reference_date - timedelta(days=1)   # up to N-1
+        start_date = request.reference_date - timedelta(days=request.backfill_days)
         backfill = self.backfill_service.run_backfill(
             BackfillRequest(
                 start_date=start_date,
@@ -207,15 +220,32 @@ class SectorWatchlistService:
             )
         )
 
+        # ── 5. Trigger predictions for date N ─────────────────────────────
+        prediction_results: dict[str, Any] = {}
+        if self.prediction_service is not None:
+            as_of = datetime.combine(request.reference_date, datetime.min.time())
+            for symbol in new_symbols:
+                try:
+                    result = self.prediction_service.run_prediction(
+                        instrument=symbol,
+                        strategies=None,   # all configured strategies
+                        as_of=as_of,
+                    )
+                    prediction_results[symbol] = {"status": "ok", "output": result}
+                except Exception as exc:
+                    prediction_results[symbol] = {"status": "error", "error": str(exc)}
+
         return {
             "triggered": True,
             "sectors": sectors,
             "sector_results": sector_results,
             "new_symbols": new_symbols,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
+            "reference_date": request.reference_date.isoformat(),
+            "backfill_start": start_date.isoformat(),
+            "backfill_end": end_date.isoformat(),
             "option_instruments": option_instruments,
             "backfill": backfill,
+            "predictions": prediction_results,
         }
 
     def _insert_new_watched_stocks(
