@@ -2,6 +2,7 @@
 # Python
 # =========================
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -11,18 +12,19 @@ env/
 build/
 dist/
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # =========================
 # Environment / Secrets
 # =========================
 .env
 .secrets/
-kite_access_token.txt
 
 # =========================
 # Runtime / generated data
 # =========================
-predictions/output/
 output/
 .claude/
 
@@ -33,24 +35,6 @@ output/
 .idea/
 *.swp
 *.swo
-
-# =========================
-# Flutter / Dart
-# =========================
-flutter_app/.dart_tool/
-flutter_app/.flutter-plugins
-flutter_app/.flutter-plugins-dependencies
-flutter_app/.packages
-flutter_app/.pub-cache/
-flutter_app/.pub/
-flutter_app/build/
-
-# âŒ DO NOT ignore these (must be committed)
-!flutter_app/lib/
-!flutter_app/web/
-!flutter_app/pubspec.yaml
-!flutter_app/pubspec.lock
-!flutter_app/.metadata
 
 # =========================
 # OS

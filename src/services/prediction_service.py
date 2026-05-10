@@ -1,14 +1,18 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time
 from pathlib import Path
 
 import pandas as pd
 
-from src.prediction.aggregator.index_aggregator import run_index_prediction
-from src.prediction.aggregator.option_aggregator import apply_option_selection
-from src.prediction.contracts import PredictionOutput
+from src.technical_analysis.aggregator.underlying_aggregator import (
+    PredictionOutput,
+    add_aggregate_decision_column,
+    get_underlying_strategy_predictions,
+    run_underlying_prediction,
+)
+from src.technical_analysis.aggregator.option_aggregator import apply_option_selection
 from src.data_manager.option_history_reader import fetch_index_options_eod
 from src.data_manager.underlying_history_reader import (
     fetch_index_daily,
@@ -17,9 +21,9 @@ from src.data_manager.underlying_history_reader import (
 from src.technical_analysis.option_registry import (
     load_option_selection_strategies,
 )
-from src.technical_analysis.index_registry import (
+from src.technical_analysis.underlying_registry import (
     DEFAULT_LOOKBACK_DAYS,
-    load_index_prediction_strategies,
+    load_underlying_prediction_strategies,
 )
 
 
@@ -68,12 +72,109 @@ class PredictionService:
         if window.empty:
             raise ValueError(f"No underlying data available for {instrument} up to {as_of.date()}")
 
-        return run_index_prediction(
+        return run_underlying_prediction(
             instrument=instrument.upper(),
             window=window,
             as_of=as_of,
             strategies=strategies,
         )
+
+    def run_reference_date_predictions(
+        self,
+        instrument: str,
+        reference_date: date,
+        strategies: list[str] | None = None,
+        save_to_disk: bool = True,
+    ) -> dict[str, object]:
+        """
+        Run reference-date predictions for one underlying.
+
+        The saved output is the same matrix format used by
+        run_reference_date_predictions_for_symbols().
+        """
+        return self.run_reference_date_predictions_for_symbols(
+            instruments=[instrument],
+            reference_date=reference_date,
+            strategies=strategies,
+            save_to_disk=save_to_disk,
+        )
+
+    def run_reference_date_predictions_for_symbols(
+        self,
+        instruments: list[str],
+        reference_date: date,
+        strategies: list[str] | None = None,
+        save_to_disk: bool = True,
+    ) -> dict[str, object]:
+        strategy_registry = load_underlying_prediction_strategies()
+        selected = strategies or sorted(strategy_registry.keys())
+        unknown_strategies = [name for name in selected if name not in strategy_registry]
+        if unknown_strategies:
+            available = ", ".join(sorted(strategy_registry.keys()))
+            unknown = ", ".join(unknown_strategies)
+            raise ValueError(f"Unknown prediction strategy '{unknown}'. Available strategies: {available}")
+
+        as_of = datetime.combine(reference_date, time(hour=15, minute=15))
+        records: list[dict[str, object]] = []
+
+        for instrument in instruments:
+            row: dict[str, object] = {
+                "reference_date": reference_date.isoformat(),
+                "instrument": instrument.upper(),
+                "status": "ok",
+                "error": "",
+            }
+            try:
+                conn = get_db_connection()
+                try:
+                    window = self.get_underlying_window(
+                        db_conn=conn,
+                        instrument=instrument,
+                        as_of=as_of,
+                        lookback=self.default_lookback,
+                    )
+                finally:
+                    conn.close()
+                if window.empty:
+                    raise ValueError(f"No underlying data available for {instrument} up to {reference_date}")
+
+                predictions = get_underlying_strategy_predictions(
+                    window=window,
+                    strategies=selected,
+                )
+                for strategy in selected:
+                    row[strategy] = predictions.get(strategy, "NO_POSITION")
+            except Exception as exc:
+                row["status"] = "error"
+                row["error"] = str(exc)
+                for strategy in selected:
+                    row[strategy] = "NO_POSITION"
+            records.append(row)
+
+        output_df = add_aggregate_decision_column(
+            pd.DataFrame(records),
+            strategy_columns=selected,
+        )
+        records = output_df.to_dict(orient="records")
+        output_file = self.save_reference_prediction_matrix(reference_date, output_df) if save_to_disk else None
+
+        return {
+            "reference_date": reference_date.isoformat(),
+            "output_file": output_file,
+            "strategies": selected,
+            "records": records,
+        }
+
+    def save_reference_prediction_matrix(
+        self,
+        reference_date: date,
+        predictions_df: pd.DataFrame,
+    ) -> str:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{reference_date.isoformat()}.csv"
+        output_path = self.output_dir / filename
+        predictions_df.to_csv(output_path, index=False)
+        return filename
 
     def generate_predictions_for_strategy(
         self,
@@ -84,7 +185,7 @@ class PredictionService:
         end_date: str | None = None,
     ) -> pd.DataFrame:
         instrument = instrument.upper()
-        strategy_registry = load_index_prediction_strategies()
+        strategy_registry = load_underlying_prediction_strategies()
         if strategy not in strategy_registry:
             available = ", ".join(strategy_registry.keys())
             raise ValueError(f"Unknown prediction strategy '{strategy}'. Available strategies: {available}")
@@ -120,7 +221,7 @@ class PredictionService:
             decision_date = pd.to_datetime(df_daily.loc[i, "trade_date"])
 
             if use_agentic:
-                output = run_index_prediction(
+                output = run_underlying_prediction(
                     instrument=instrument,
                     window=window_df,
                     as_of=decision_date.to_pydatetime().replace(
@@ -151,7 +252,7 @@ class PredictionService:
         end_date: str | None = None,
     ) -> dict[str, pd.DataFrame]:
         instrument = instrument.upper()
-        strategy_registry = load_index_prediction_strategies()
+        strategy_registry = load_underlying_prediction_strategies()
         strategy_names = sorted(strategy_registry.keys())
         out: dict[str, pd.DataFrame] = {}
 
@@ -267,3 +368,4 @@ class PredictionService:
             base_path.unlink()
 
         return strategy_filename
+

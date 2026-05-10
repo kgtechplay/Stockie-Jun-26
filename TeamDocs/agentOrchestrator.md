@@ -1,35 +1,52 @@
-﻿# Agent Orchestrator
+# Agent Orchestrator
 
-This document explains the InstrumentWatcher agent flow and how it connects news analysis to stock data setup.
+This document explains the end-to-end flow from news articles to stock data setup and prediction output.
 
-Current code location: `src/agents`
-Main orchestrator: `src/services/orchestration_service.py`
-Sector expansion service: `src/services/sector_watchlist_service.py`
+Main service: `src/services/orchestration_service.py`  
+Agents: `src/agents`  
+Sector expansion: `src/services/sector_watchlist_service.py`  
+Backfill: `src/services/backfill_service.py`  
+Predictions: `src/services/prediction_service.py`
+Watched backtest: `src/backtest/watched_underlying_backtest.py`
 
-Note: older conversations may refer to this area as `InstrumentWatcher`. In the current repo, the agent folders live under `src/agents`.
-
-## Purpose
-
-The agent orchestrator turns news into a prepared data universe.
-
-The flow is:
+## Simple Flow
 
 ```text
-news articles
+news articles for reference_date
   -> dailyNews agent
   -> impactList agent
   -> reviewList agent
-  -> sector_watchlist_service
-  -> WatchedInstrument DB
-  -> option instrument refresh
-  -> 3-month backfill
+  -> SectorWatchlistService
+  -> BackfillService for newly added symbols
+  -> PredictionService for all identified symbols
+  -> output/<reference_date>.csv
+  -> watched underlying backtest
 ```
 
-The agents should decide what matters. The services should perform deterministic data work.
+The agents make judgement calls. The services do deterministic data work.
 
-## Agent Folders
+## What The Orchestrator Does
 
-Each agent has its own folder under `src/agents`:
+`OrchestrationService` is the main coordinator. Call it with:
+
+```python
+OrchestrationService.default().run(reference_date=...)
+```
+
+It runs these steps:
+
+1. `dailyNews` reads news for the reference date and identifies affected sectors, commodities, industries, and symbols mentioned in news.
+2. `impactList` turns those findings into a ranked impact list.
+3. `reviewList` reviews the ranked impact list and approves the sectors that should move forward.
+4. `SectorWatchlistService` expands approved sectors into NSE stocks, inserts missing stocks into `WatchedInstrument`, and skips duplicates.
+5. `BackfillService` runs only for `new_symbols`, because existing watched symbols should already have historical data.
+6. `PredictionService` runs for all identified `symbols`, not only new symbols.
+7. Prediction output is saved as one CSV file for the reference date.
+8. `watched_underlying_backtest` evaluates each `instrument x strategy` prediction against the next trading day.
+
+## Agent Roles
+
+Each agent has its own folder:
 
 ```text
 src/agents/
@@ -37,237 +54,182 @@ src/agents/
     agent.py
     output_schema.py
     config.yaml
-
   impactList/
     agent.py
     output_schema.py
     config.yaml
-
   reviewList/
     agent.py
     output_schema.py
     config.yaml
 ```
 
-Each folder has the same basic responsibilities:
+### dailyNews
 
-| File | Purpose |
-|---|---|
-| `agent.py` | Runtime agent implementation. Current versions are placeholders. |
-| `output_schema.py` | Dataclasses defining structured output from that agent. |
-| `config.yaml` | Agent config, intent, and expected checks. |
+Reads configured news sources for a `reference_date`.
 
-## Agent 1: `dailyNews`
+It should identify:
 
-Location: `src/agents/dailyNews`
+- the news item
+- impacted sector, industry, commodity, or theme
+- any raw company or symbol mentions
+- confidence and rationale
 
-Purpose:
+### impactList
 
-- Read daily news from a predetermined source list.
-- Identify macro or micro events.
-- Extract the impacted industry, commodity, sector, or underlying theme.
-- Preserve source headline/source information for downstream traceability.
+Consumes `dailyNews` output and creates an ordered impact list.
 
-Output schema:
+It should identify:
 
-| Object | Key Fields | Meaning |
-|---|---|---|
-| `DailyNewsOutput` | `as_of`, `sources`, `findings` | Full daily news scan result. |
-| `DailyNewsFinding` | `headline`, `source`, `impacted_underlying`, `impact_type`, `rationale`, `confidence`, `related_symbols` | One extracted event or market-impact finding. |
+- impacted sectors
+- impact direction, such as positive, negative, or neutral
+- impact score
+- source headlines and rationale
 
-Example output intent:
+### reviewList
 
-```text
-Headline: Crude oil prices rise after supply disruption
-Impacted underlying: Oil and Gas
-Impact type: commodity_supply_shock
-Related symbols: optional direct tickers if mentioned
-```
+Reviews the impact list before data work starts.
 
-## Agent 2: `impactList`
+It should:
 
-Location: `src/agents/impactList`
+- approve or reject impacted sectors
+- preserve the `reference_date`
+- return approved sectors in priority order
 
-Purpose:
-
-- Convert daily news findings into candidate impacted stocks or sectors.
-- Rank potential impact across industries/stocks.
-- Preserve rationale and source headlines.
-
-Output schema:
-
-| Object | Key Fields | Meaning |
-|---|---|---|
-| `ImpactListOutput` | `as_of`, `candidates` | Ranked candidate list. |
-| `ImpactCandidate` | `rank`, `tradingsymbol`, `name`, `industry`, `impact_direction`, `impact_score`, `rationale`, `source_headlines` | One candidate stock/industry impact record. |
-
-Current placeholder behavior:
-
-- Creates placeholder candidates.
-- Uses `finding.impacted_underlying` as the candidate `industry`.
-
-Expected future behavior:
-
-- Use news/event context plus sector/commodity exposure rules.
-- Return direct stock candidates when known.
-- Return sector/industry labels when the best action is to expand a sector through NSE.
-
-## Agent 3: `reviewList`
-
-Location: `src/agents/reviewList`
-
-Purpose:
-
-- Review and approve the ranked impact list.
-- Add checks before any data work is triggered.
-- Emit approved symbols and identified sectors for downstream setup.
-
-Output schema:
-
-| Object | Key Fields | Meaning |
-|---|---|---|
-| `ReviewListOutput` | `as_of`, `reviewed_candidates`, `identified_sectors` | Reviewed result from `impactList`. |
-| `ReviewedImpactCandidate` | `tradingsymbol`, `approved`, `final_rank`, `final_score`, `sector`, `industry`, `checks`, `review_notes` | Final reviewed candidate. |
-
-Important helper methods:
-
-| Method | Purpose |
-|---|---|
-| `approved_symbols()` | Returns approved direct stock symbols. |
-| `sectors()` | Returns de-duplicated sectors from `identified_sectors`, `sector`, and `industry`. |
-
-## `OrchestrationService`
-
-Location: `src/services/orchestration_service.py`
-
-Main method:
-
-```python
-OrchestrationService.default().run()
-```
-
-Execution order:
-
-1. Run `DailyNewsAgent`.
-2. Pass output to `ImpactListAgent`.
-3. Pass output to `ReviewListAgent`.
-4. Backfill directly approved symbols, if any.
-5. Pass reviewed sectors to `SectorWatchlistService`.
-
-Return payload:
-
-| Key | Meaning |
-|---|---|
-| `dailyNews` | Raw daily news findings. |
-| `impactList` | Ranked candidate impacts. |
-| `reviewList` | Reviewed/approved impact list. |
-| `backfill` | Backfill result for directly approved symbols. |
-| `sectorWatchlist` | Sector expansion, watchlist insertion, option-instrument refresh, and backfill result. |
-
-## `SectorWatchlistService`
+## SectorWatchlistService
 
 Location: `src/services/sector_watchlist_service.py`
 
-Purpose:
+This service converts reviewed sectors into stock symbols.
 
-- Take one or more sectors from `reviewList`.
-- Fetch sector constituents from NSE, not from the local DB.
-- Add missing stocks to `dbo.WatchedInstrument`.
-- Trigger option instrument setup.
-- Trigger last-3-month data backfill for newly added stocks.
+It does four things:
 
-This should remain code-based, not LLM-based.
+1. Takes approved sectors from `reviewList`.
+2. Finds relevant NSE stocks for those sectors.
+3. Inserts only missing stocks into `dbo.WatchedInstrument`.
+4. Returns both all identified symbols and newly added symbols.
 
-Why:
+Important return fields:
 
-- NSE is the source of truth for sector/index constituents.
-- DB inserts and backfills must be deterministic and repeatable.
-- LLMs can identify likely sectors from news, but should not invent constituent lists.
-
-## Sector Expansion Flow
-
-```text
-reviewList.sectors()
-  -> normalize sector name
-  -> NSE equity-stockIndices API
-  -> constituent symbols
-  -> skip symbols already active in WatchedInstrument
-  -> enrich from StockDB when available
-  -> insert new WatchedInstrument rows
-  -> daily_optionInstrument_refresh for new symbols
-  -> BackfillService for last 90 days
-```
-
-## NSE Sector Name Handling
-
-`SectorWatchlistService` normalizes common labels to NSE index names.
-
-Examples:
-
-| Agent Sector | NSE Index |
+| Field | Meaning |
 |---|---|
-| `Auto` | `NIFTY AUTO` |
-| `Oil and Gas` | `NIFTY OIL & GAS` |
-| `IT` | `NIFTY IT` |
-| `Pharma` | `NIFTY PHARMA` |
-| `Financial Services` | `NIFTY FINANCIAL SERVICES` |
+| `symbols` | All resolved stocks for the approved sectors. Predictions run for this list. |
+| `new_symbols` | Stocks newly inserted into `WatchedInstrument`. Backfill runs for this list. |
+| `sector_results` | Per-sector expansion details and diagnostics. |
+| `option_instruments` | Option-instrument refresh result for newly inserted symbols. |
 
-If no alias exists, the service assumes `NIFTY {SECTOR}`.
+## Backfill Logic
 
-## WatchedInstrument Insert Behavior
+The orchestrator calls `BackfillService` only when `new_symbols` is not empty.
 
-For each new NSE constituent:
-
-1. Check if the symbol already exists as an active `STOCK` in `WatchedInstrument`.
-2. Look up the symbol in `StockDB` for Kite metadata.
-3. Insert a `WatchedInstrument` row with:
-   - `instrument_type = STOCK`
-   - `exchange = NSE`
-   - `is_fo_enabled = True`
-   - `is_active = True`
-   - `sector = NSE index name`
-   - `industry = NSE industry when available, otherwise NSE index name`
-
-If the stock is not present in `StockDB`, the row is still inserted with basic NSE symbol information. Token resolution can still happen later in backfill scripts.
-
-## Backfill Trigger
-
-When new stocks are inserted:
-
-1. `daily_optionInstrument_refresh.run_load_option_instruments()` runs for the new symbols.
-2. `BackfillService.run_backfill()` runs for the last `90` days by default.
-3. For stocks, the backfill covers:
-   - `UnderlyingSnapshot`
-   - `UnderlyingCandle5m`
-   - `OptionInstrument`
-   - `OptionSnapshot`
-   - `OptionSnapshotCalc`
-
-## Morning Job Relationship
-
-The daily morning job is still separate from the agent flow.
-
-Recommended morning job:
+Backfill window:
 
 ```text
-daily_get_kite_access_token.py
-daily_optionInstrument_refresh.py
-daily_market_refresh.py
+start_date = reference_date - 90 days
+end_date   = reference_date - 1 day
 ```
 
-Agent orchestration is event/news driven. The morning job is routine market-data maintenance.
+Backfill prepares:
+
+- `UnderlyingSnapshot`
+- `UnderlyingCandle5m`
+- `OptionInstrument`
+- `OptionSnapshot`
+- `OptionSnapshotCalc`
+
+This means a newly discovered stock gets enough recent history before prediction and later option workflows.
+
+## Prediction Logic
+
+The orchestrator calls:
+
+```python
+PredictionService.run_reference_date_predictions_for_symbols(
+    instruments=symbols,
+    reference_date=review_reference_date,
+    strategies=prediction_strategies,
+)
+```
+
+Important detail:
+
+- Backfill runs for `new_symbols`.
+- Predictions run for `symbols`.
+
+That distinction matters because a stock can already exist in the watchlist and still be relevant to today's reviewed news.
+
+## Prediction Output
+
+Predictions are saved as one CSV file per reference date:
+
+```text
+output/<reference_date>.csv
+```
+
+Example:
+
+```text
+output/2026-05-08.csv
+```
+
+The CSV has one row per stock/index and one column per prediction strategy.
+
+Example shape:
+
+```text
+reference_date,instrument,status,error,MaTrend_001,RsiMeanReversion_6535,aggregate_decision
+2026-05-08,INFY,ok,,CALL,PUT,NO_POSITION
+2026-05-08,TCS,ok,,CALL,CALL,CALL
+```
+
+The final `aggregate_decision` column is produced by majority vote across the strategy columns.
+
+## Watched Backtest
+
+After prediction, the orchestrator calls the watched underlying backtest.
+
+Input:
+
+```text
+output/<reference_date>.csv
+```
+
+The watched backtest expects CSV input.
+
+The backtest explodes the prediction matrix into one row per:
+
+```text
+instrument x strategy
+```
+
+It compares each prediction with the next trading day's underlying move and marks results such as:
+
+- `CORRECT`
+- `INCORRECT`
+- `OK_NO_TRADE`
+- `MISSED_CALL`
+- `MISSED_PUT`
+- `N/A`
+
+Those results are added back to the same prediction file as columns such as:
+
+```text
+MaTrend_001_backtest_result
+aggregate_decision_backtest_result
+```
 
 ## Design Rule
 
-Use agents for judgment:
+Use agents for judgement:
 
-- What news matters?
+- Which news matters?
 - Which sector or commodity is impacted?
-- Should the impact list be approved?
+- Which reviewed sectors should move forward?
 
-Use services for deterministic data work:
+Use services for deterministic work:
 
-- Fetch NSE sector constituents.
-- Insert rows into `WatchedInstrument`.
-- Refresh option instruments.
-- Backfill market data.
+- Expand sectors into NSE stocks.
+- Insert watched instruments.
+- Run backfill.
+- Run technical-analysis predictions.
+- Save the prediction output file.
