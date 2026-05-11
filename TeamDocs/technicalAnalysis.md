@@ -1,163 +1,117 @@
 # Technical Analysis
 
-This document explains how technical-analysis strategies are organized, how aggregators combine their output, and how to add a new strategy.
+## Gist
 
-Code location: `src/technical_analysis`  
-Aggregators: `src/technical_analysis/aggregator`  
-Prediction service: `src/services/prediction_service.py`
+Technical analysis is separate from the news-analysis signal journal.
+
+Use it when you want to:
+
+- add or test an underlying direction strategy
+- run one-date predictions for one watched stock/index
+- generate 30-day historical predictions for one underlying
+- backtest strategy columns and `aggregate_decision`
+
+Main outputs:
+
+```text
+output/<underlying>_prediction_<reference-date>.csv
+output/historical/<underlying>_prediction.csv
+```
+
+Backtest details live in `TeamDocs/backtestStrategy.md`.
+
+Code location: `src/technical_analysis`
+
+The Flask Technical Analysis tab loads its stock/index dropdown from active rows in `WatchedInstrument`, so users only run predictions against instruments where the project is expected to have historical data.
 
 ## Folder Layout
 
 ```text
 src/technical_analysis/
-  underlying_prediction_*.py          underlying direction strategies
-  underlying_prediction_common.py     shared helper functions
-  underlying_registry.py              stable import path for strategy discovery
-  underlying_strategy_registry.py     implementation of strategy discovery
+  underlying_prediction_common.py
+  option_selection_common.py
 
-  option_selection_*.py               option contract selection strategies
-  option_selection_common.py          shared option-selection helpers
-  option_registry.py                  stable import path for option selector discovery
-  option_strategy_registry.py         implementation of option selector discovery
+  prediction/
+    underlying_prediction_*.py
+    underlying_registry.py
+    underlying_strategy_registry.py
+
+  selection/
+    option_selection_*.py
+    option_registry.py
+    option_strategy_registry.py
 
   aggregator/
-    underlying_aggregator.py          runs/combines underlying predictions
-    option_aggregator.py              applies option selection to prediction rows
+    underlying_aggregator.py
+    option_aggregator.py
 ```
-
-## Strategy Types
-
-| Type | File Pattern | Required Function | Required Constant | Output |
-|---|---|---|---|---|
-| Underlying prediction | `underlying_prediction_*.py` | `predict(window)` | `STRATEGY_NAME` | `CALL`, `PUT`, or `NO_POSITION` |
-| Option selection | `option_selection_*.py` | `select(chain_df, prediction, trade_date)` | `STRATEGY_NAME` | Selected option dict or `None` |
 
 ## Underlying Prediction Strategies
 
-Underlying strategies decide the direction for a stock or index.
+Underlying strategies predict direction for a stock or index.
 
-Current strategy files:
+Required pattern:
 
-| File | Purpose |
-|---|---|
-| `underlying_prediction_MaTrend_001.py` | Moving-average trend signal with a 0.1 percent band. |
-| `underlying_prediction_MaTrend_0005.py` | Moving-average trend signal with a tighter 0.05 percent band. |
-| `underlying_prediction_trendUpMaTrend_001.py` | Moving-average trend signal gated to `TREND_UP` regime. |
-| `underlying_prediction_trendUpMaTrend_0005.py` | Tighter moving-average trend signal gated to `TREND_UP` regime. |
-| `underlying_prediction_trendDownMaTrend_001.py` | Moving-average trend signal gated to `TREND_DOWN` regime. |
-| `underlying_prediction_trendDownMaTrend_0005.py` | Tighter moving-average trend signal gated to `TREND_DOWN` regime. |
-| `underlying_prediction_RsiMeanReversion_7030.py` | RSI mean reversion using 70/30 thresholds. |
-| `underlying_prediction_RsiMeanReversion_6535.py` | RSI mean reversion using 65/35 thresholds. |
-| `underlying_prediction_rangeRsiMeanReversion_7030.py` | RSI mean reversion gated to `RANGE` regime. |
-| `underlying_prediction_rangeRsiMeanReversion_6535.py` | RSI mean reversion gated to `RANGE` regime with 65/35 thresholds. |
-| `underlying_prediction_BollingerMeanReversion.py` | Bollinger-band mean reversion. |
-| `underlying_prediction_rangeBollingerMeanReversion.py` | Bollinger-band mean reversion gated to `RANGE` regime. |
-| `underlying_prediction_trendUpRangeBreakout.py` | Range breakout gated to `TREND_UP` regime. |
-| `underlying_prediction_trendDownRangeBreakout.py` | Range breakout gated to `TREND_DOWN` regime. |
-| `underlying_prediction_choppy.py` | Choppy-regime strategy variant. |
-| `underlying_prediction_unknown.py` | Fallback strategy for unknown regimes. |
+```text
+file name: underlying_prediction_<name>.py
+constant:  STRATEGY_NAME
+function:  predict(window)
+returns:   CALL, PUT, or NO_POSITION
+```
 
-Shared helpers live in `underlying_prediction_common.py`.
+Rules:
 
-Important helpers:
-
-| Helper | Purpose |
-|---|---|
-| `get_closes(window)` | Extracts close prices from a Series/DataFrame. |
-| `compute_rsi(closes)` | Computes RSI. |
-| `signal_rsi_mean_reversion(...)` | Generic RSI mean-reversion signal. |
-| `signal_ma_trend(...)` | Generic moving-average trend signal. |
-| `signal_bollinger_mean_reversion(...)` | Generic Bollinger-band mean-reversion signal. |
-| `signal_range_breakout(...)` | Generic range breakout signal. |
-| `detect_regime(window)` | Classifies `TREND_UP`, `TREND_DOWN`, `CHOPPY`, `RANGE`, or `UNKNOWN`. |
+- use only data available in the supplied window
+- avoid look-ahead bias
+- return `NO_POSITION` when data is insufficient
+- keep thresholds explicit and easy to test
 
 ## Underlying Aggregator
 
 Location: `src/technical_analysis/aggregator/underlying_aggregator.py`
 
-The underlying aggregator is not a strategy. It combines strategy outputs.
-
-It does three main jobs:
-
-1. Loads selected strategy functions from `underlying_registry`.
-2. Runs each strategy against the same price window.
-3. Produces a majority-vote decision.
+The aggregator runs selected strategies and combines their outputs.
 
 Voting rules:
 
-- Count only `CALL` and `PUT`.
-- If `CALL` count is greater than `PUT`, aggregate decision is `CALL`.
-- If `PUT` count is greater than `CALL`, aggregate decision is `PUT`.
-- If there is a tie, or every strategy returns `NO_POSITION`, aggregate decision is `NO_POSITION`.
+- count `CALL` and `PUT`
+- majority `CALL` returns `CALL`
+- majority `PUT` returns `PUT`
+- tie or no actionable votes returns `NO_POSITION`
 
-In the reference-date prediction output, the aggregator adds:
+## Option Selection Strategies
+
+Option selectors choose a specific option contract after an underlying direction exists.
+
+Required pattern:
 
 ```text
-aggregate_decision
+file name: option_selection_<name>.py
+constant:  STRATEGY_NAME
+function:  select(chain_df, prediction, trade_date)
+returns:   selected option dict or None
+```
+
+Rules:
+
+- return `None` when no valid contract exists
+- use shared helpers from `option_selection_common.py`
+- output standard selected-option fields
+
+## Adding A New Underlying Strategy
+
+Create:
+
+```text
+src/technical_analysis/prediction/underlying_prediction_myStrategy.py
 ```
 
 Example:
 
-```text
-instrument,MaTrend_001,RsiMeanReversion_6535,aggregate_decision
-INFY,CALL,PUT,NO_POSITION
-TCS,CALL,CALL,CALL
-```
-
-## Option Selection Strategies
-
-Option selectors choose a concrete option contract after an underlying prediction has produced `CALL` or `PUT`.
-
-Current selector files:
-
-| File | Purpose |
-|---|---|
-| `option_selection_nearestExpiryATM.py` | Select nearest-expiry ATM option with liquidity tie-breakers. |
-| `option_selection_nearestExpiryHighOI.py` | Select nearest-expiry option with high open interest. |
-| `option_selection_highestDeltaPriceRatio.py` | Select option using delta-to-price style scoring. |
-
-Shared helpers live in `option_selection_common.py`.
-
-## Option Aggregator
-
-Location: `src/technical_analysis/aggregator/option_aggregator.py`
-
-The option aggregator applies option-selection strategies to prediction rows.
-
-It:
-
-- receives prediction rows
-- receives option snapshot/chain data
-- skips rows where prediction is not `CALL` or `PUT`
-- applies the selected option strategy
-- fills standard selected-option columns
-
-Standard selected-option columns:
-
-| Column | Meaning |
-|---|---|
-| `option_trade_date` | Date of selected option trade. |
-| `option_instrument_token` | Selected option token. |
-| `option_tradingsymbol` | Selected option symbol. |
-| `option_strike` | Selected strike. |
-| `option_expiry` | Selected expiry. |
-| `option_type` | `CALL` or `PUT`. |
-| `selection_option_price_1515` | Option price used for selection. |
-
-## Adding An Underlying Prediction Strategy
-
-Create a new file:
-
-```text
-src/technical_analysis/underlying_prediction_myStrategy.py
-```
-
-Template:
-
 ```python
 from __future__ import annotations
 
-from .underlying_prediction_common import PredictionInput, signal_ma_trend
+from ..underlying_prediction_common import PredictionInput, signal_ma_trend
 
 STRATEGY_NAME = "myStrategy"
 
@@ -166,32 +120,17 @@ def predict(window: PredictionInput) -> str:
     return signal_ma_trend(window, short_window=5, long_window=20, band=0.001)
 ```
 
-Rules:
+The registry discovers files automatically when they match `underlying_prediction_*.py`.
 
-- File name must start with `underlying_prediction_`.
-- Define `STRATEGY_NAME`.
-- Define `predict(window)`.
-- Return only `CALL`, `PUT`, or `NO_POSITION`.
-- Use only data available inside the supplied `window`.
-- Do not look into future rows.
-- Return `NO_POSITION` when required columns or enough history are missing.
-- Do not mutate the input DataFrame unless you copy it first.
+## Adding A New Option Selector
 
-Discovery is automatic. The registry scans:
+Create:
 
 ```text
-src/technical_analysis/underlying_prediction_*.py
+src/technical_analysis/selection/option_selection_mySelector.py
 ```
 
-## Adding An Option Selection Strategy
-
-Create a new file:
-
-```text
-src/technical_analysis/option_selection_mySelector.py
-```
-
-Template:
+Example:
 
 ```python
 from __future__ import annotations
@@ -200,7 +139,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from .option_selection_common import _common_filter, build_selection_output
+from ..option_selection_common import _common_filter, build_selection_output
 
 STRATEGY_NAME = "mySelector"
 
@@ -218,83 +157,52 @@ def select(
     return build_selection_output(row, prediction, row["_trade_date_norm"])
 ```
 
-Rules:
+The registry discovers files automatically when they match `option_selection_*.py`.
 
-- File name must start with `option_selection_`.
-- Define `STRATEGY_NAME`.
-- Define `select(chain_df, prediction, trade_date)`.
-- Return `None` when no valid option exists.
-- Return the standard dict from `build_selection_output()` when an option is selected.
+## Historical Prediction Service
 
-Discovery is automatic. The registry scans:
+Location: `src/services/historical_prediction.py`
 
-```text
-src/technical_analysis/option_selection_*.py
-```
+This service runs underlying strategies for one requested underlying across historical dates.
 
-## Prediction Output
-
-`PredictionService.run_reference_date_predictions_for_symbols()` uses the underlying strategies and aggregator to write one CSV file per reference date:
+Output:
 
 ```text
-output/<reference_date>.csv
+output/historical/<underlying>_prediction.csv
 ```
 
-Example:
+Each file has one row per date, one column per strategy, and an `aggregate_decision` column.
+Historical backtests append per-strategy result columns to the same file.
+
+Typical command:
+
+```powershell
+python src/services/historical_prediction.py --underlying RELIANCE
+```
+
+By default this generates the last 60 days. Pass `--start`, `--end`, or `--strategy` to narrow the run.
+
+Point-in-time predictions use `PredictionService` directly and write:
 
 ```text
-output/2026-05-08.csv
+output/<underlying>_prediction_<reference-date>.csv
 ```
 
-File shape:
-
-```text
-reference_date,instrument,status,error,<strategy_1>,<strategy_2>,...,aggregate_decision
-```
-
-Each row is a stock or index. Each strategy column stores that strategy's direction for that instrument. The final column is the majority-vote aggregate decision.
+That file has the same consolidated schema but only one date row.
 
 ## Backtesting
 
-There are two backtest styles:
-
-| File | Purpose |
-|---|---|
-| `src/backtest/watched_underlying_backtest.py` | Backtests the new watched prediction matrix for one reference date. |
-| `src/backtest/watched_e2e_backtest.py` | Wrapper for watched end-to-end backtesting. Currently runs the underlying leg and marks the option leg skipped until selected option contracts are included in the watched output. |
-| `src/backtest/historical_underlying_backtest.py` | Historical batch backtest for older per-underlying/per-strategy prediction CSV files. |
-| `src/backtest/historical_e2e_backtest.py` | Historical batch end-to-end backtest for older prediction plus option-selection CSV files. |
-
-Historical prediction generation lives in:
+Backtesting details are documented in:
 
 ```text
-src/services/historical_prediction.py
+TeamDocs/backtestStrategy.md
 ```
 
-It writes one file per watched underlying and strategy:
+Backtest thresholds differ between the two paths:
 
 ```text
-output/historical/<underlying>_<strategy>.csv
+historical underlying backtest:  profit target = 1%,  stop loss = 0.5%
+news signal backtest:            profit target = 3%,  stop loss = 2%
 ```
 
-Each historical file has date rows and a `prediction` column, which lets `historical_underlying_backtest.py` add result columns back to the same file.
-
-Watched backtest input:
-
-```text
-output/<reference_date>.csv
-```
-
-The watched backtest evaluates every `instrument x strategy` combination, including `aggregate_decision`, against the next trading day. It adds result columns back to the same `output/<reference_date>.csv` file.
-
-## Quality Checklist
-
-Before keeping a strategy:
-
-- It handles short windows gracefully.
-- It returns `NO_POSITION` instead of throwing for normal missing-data cases.
-- It avoids look-ahead bias.
-- It uses clear thresholds.
-- It has a clear `STRATEGY_NAME`.
-- It can be tested with a small DataFrame.
-- It works for stocks and indices when the required columns are present.
+Historical backtesting returns a summary dictionary with profit hits, stop hits, hit rates, and recall for `aggregate_decision` plus every individual strategy column.

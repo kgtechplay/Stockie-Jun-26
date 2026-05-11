@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from src.technical_analysis.option_registry import load_option_selection_strategies
+from src.technical_analysis.selection.option_registry import load_option_selection_strategies
 
 OPTION_COLUMNS = [
     "option_trade_date",

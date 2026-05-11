@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -18,10 +18,10 @@ from src.data_manager.underlying_history_reader import (
     fetch_index_daily,
     get_db_connection,
 )
-from src.technical_analysis.option_registry import (
+from src.technical_analysis.selection.option_registry import (
     load_option_selection_strategies,
 )
-from src.technical_analysis.underlying_registry import (
+from src.technical_analysis.prediction.underlying_registry import (
     DEFAULT_LOOKBACK_DAYS,
     load_underlying_prediction_strategies,
 )
@@ -87,16 +87,82 @@ class PredictionService:
         save_to_disk: bool = True,
     ) -> dict[str, object]:
         """
-        Run reference-date predictions for one underlying.
+        Run all selected strategies for one underlying on one reference date.
 
-        The saved output is the same matrix format used by
-        run_reference_date_predictions_for_symbols().
+        Output shape:
+          date,underlying,<strategy columns>,aggregate_decision
         """
-        return self.run_reference_date_predictions_for_symbols(
-            instruments=[instrument],
+        output_df = self.generate_reference_date_prediction(
+            instrument=instrument,
             reference_date=reference_date,
             strategies=strategies,
-            save_to_disk=save_to_disk,
+        )
+        output_file = (
+            self.save_reference_prediction_file(instrument, reference_date, output_df)
+            if save_to_disk
+            else None
+        )
+        return {
+            "reference_date": reference_date.isoformat(),
+            "underlying": instrument.upper(),
+            "output_file": output_file,
+            "strategies": self.get_selected_strategy_names(strategies),
+            "records": output_df.to_dict(orient="records"),
+        }
+
+    def generate_reference_date_prediction(
+        self,
+        instrument: str,
+        reference_date: date,
+        strategies: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Generate one prediction row for one underlying.
+
+        The row is labeled with reference_date, but the strategy window uses the
+        latest available DB row up to that date. This supports morning predictions
+        when the most recent persisted market data is still N-1.
+        """
+        instrument = instrument.upper()
+        selected = self.get_selected_strategy_names(strategies)
+        warmup_start = reference_date - timedelta(days=max(self.default_lookback * 3, 45))
+
+        conn = get_db_connection()
+        try:
+            df_daily = fetch_index_daily(
+                conn=conn,
+                underlying=instrument,
+                start_date=warmup_start.isoformat(),
+                end_date=reference_date.isoformat(),
+                join_activity=True,
+            )
+        finally:
+            conn.close()
+
+        if df_daily.empty:
+            raise ValueError(f"[{instrument}] fetched 0 rows from DB for daily data up to {reference_date}.")
+
+        df_daily = df_daily.copy()
+        df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"])
+        df_daily = df_daily.sort_values("trade_date").reset_index(drop=True)
+        if len(df_daily) < self.default_lookback:
+            raise ValueError(f"Not enough rows to generate predictions for {instrument}.")
+
+        window_df = df_daily.tail(self.default_lookback).copy()
+        predictions = get_underlying_strategy_predictions(
+            window=window_df,
+            strategies=selected,
+        )
+        row: dict[str, object] = {
+            "date": reference_date.isoformat(),
+            "underlying": instrument,
+        }
+        for strategy in selected:
+            row[strategy] = predictions.get(strategy, "NO_POSITION")
+
+        return add_aggregate_decision_column(
+            pd.DataFrame([row]),
+            strategy_columns=selected,
         )
 
     def run_reference_date_predictions_for_symbols(
@@ -175,6 +241,93 @@ class PredictionService:
         output_path = self.output_dir / filename
         predictions_df.to_csv(output_path, index=False)
         return filename
+
+    def save_reference_prediction_file(
+        self,
+        instrument: str,
+        reference_date: date,
+        predictions_df: pd.DataFrame,
+    ) -> str:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{instrument.upper()}_prediction_{reference_date.isoformat()}.csv"
+        output_path = self.output_dir / filename
+        predictions_df.to_csv(output_path, index=False)
+        return filename
+
+    def get_selected_strategy_names(self, strategies: list[str] | None = None) -> list[str]:
+        strategy_registry = load_underlying_prediction_strategies()
+        selected = strategies or sorted(strategy_registry.keys())
+        unknown_strategies = [name for name in selected if name not in strategy_registry]
+        if unknown_strategies:
+            available = ", ".join(sorted(strategy_registry.keys()))
+            unknown = ", ".join(unknown_strategies)
+            raise ValueError(f"Unknown prediction strategy '{unknown}'. Available strategies: {available}")
+        return selected
+
+    def generate_consolidated_predictions(
+        self,
+        instrument: str,
+        start_date: date,
+        end_date: date,
+        strategies: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Generate one consolidated prediction table for one underlying.
+
+        Output shape:
+          date,underlying,<strategy columns>,aggregate_decision
+        """
+        instrument = instrument.upper()
+        selected = self.get_selected_strategy_names(strategies)
+        warmup_start = start_date - timedelta(days=max(self.default_lookback * 3, 45))
+
+        conn = get_db_connection()
+        try:
+            df_daily = fetch_index_daily(
+                conn=conn,
+                underlying=instrument,
+                start_date=warmup_start.isoformat(),
+                end_date=end_date.isoformat(),
+                join_activity=True,
+            )
+        finally:
+            conn.close()
+
+        if df_daily.empty:
+            raise ValueError(f"[{instrument}] fetched 0 rows from DB for daily data.")
+
+        df_daily = df_daily.copy()
+        df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"])
+        df_daily = df_daily.sort_values("trade_date").reset_index(drop=True)
+        if len(df_daily) < self.default_lookback:
+            raise ValueError(f"Not enough rows to generate predictions for {instrument}.")
+
+        records: list[dict[str, object]] = []
+        for i in range(self.default_lookback - 1, len(df_daily)):
+            decision_date = pd.to_datetime(df_daily.loc[i, "trade_date"]).date()
+            if decision_date < start_date or decision_date > end_date:
+                continue
+
+            window_df = df_daily.loc[i - self.default_lookback + 1 : i].copy()
+            predictions = get_underlying_strategy_predictions(
+                window=window_df,
+                strategies=selected,
+            )
+            row: dict[str, object] = {
+                "date": decision_date.isoformat(),
+                "underlying": instrument,
+            }
+            for strategy in selected:
+                row[strategy] = predictions.get(strategy, "NO_POSITION")
+            records.append(row)
+
+        if not records:
+            return pd.DataFrame(columns=["date", "underlying", *selected, "aggregate_decision"])
+
+        return add_aggregate_decision_column(
+            pd.DataFrame(records),
+            strategy_columns=selected,
+        )
 
     def generate_predictions_for_strategy(
         self,

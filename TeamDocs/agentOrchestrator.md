@@ -1,235 +1,210 @@
 # Agent Orchestrator
 
-This document explains the end-to-end flow from news articles to stock data setup and prediction output.
+## Gist
 
-Main service: `src/services/orchestration_service.py`  
-Agents: `src/agents`  
-Sector expansion: `src/services/sector_watchlist_service.py`  
-Backfill: `src/services/backfill_service.py`  
-Predictions: `src/services/prediction_service.py`
-Watched backtest: `src/backtest/watched_underlying_backtest.py`
-
-## Simple Flow
+This workflow turns news into stock-level trade signals.
 
 ```text
-news articles for reference_date
-  -> dailyNews agent
-  -> impactList agent
-  -> reviewList agent
-  -> SectorWatchlistService
-  -> BackfillService for newly added symbols
-  -> PredictionService for all identified symbols
-  -> output/<reference_date>.csv
-  -> watched underlying backtest
+news -> dailyNews -> impactList -> reviewList -> signal_normalizer
+     -> output/trade_signal_journal.csv
+     -> sector expansion + backfill + news backtest
 ```
 
-The agents make judgement calls. The services do deterministic data work.
+Read this doc when you need to understand how the news-analysis pieces connect. For backtest math, go to `TeamDocs/backtestStrategy.md`.
 
-## What The Orchestrator Does
+## Key Files
 
-`OrchestrationService` is the main coordinator. Call it with:
+Main service: `src/services/orchestration_service.py`  
+News-analysis folders: `src/news_analysis/dailyNews`, `src/news_analysis/impactList`, `src/news_analysis/reviewList`  
+Signal normalizer: `src/news_analysis/signal_normalizer.py`  
+Sector expansion: `src/services/sector_expansion_service.py`  
+News signal backtest: `src/backtest/news_underlying_backtest.py`
 
-```python
-OrchestrationService.default().run(reference_date=...)
+## Flow
+
+```text
+news/article context
+  -> dailyNews
+  -> impactList
+  -> reviewList
+  -> signal_normalizer
+  -> output/trade_signal_journal.csv
+  -> SectorExpansionService
+  -> BackfillService
+  -> news_underlying_backtest
 ```
 
-It runs these steps:
+The news-analysis components reason. Python services normalize, persist, backfill, and backtest.
 
-1. `dailyNews` reads news for the reference date and identifies affected sectors, commodities, industries, and symbols mentioned in news.
-2. `impactList` turns those findings into a ranked impact list.
-3. `reviewList` reviews the ranked impact list and approves the sectors that should move forward.
-4. `SectorWatchlistService` expands approved sectors into NSE stocks, inserts missing stocks into `WatchedInstrument`, and skips duplicates.
-5. `BackfillService` runs only for `new_symbols`, because existing watched symbols should already have historical data.
-6. `PredictionService` runs for all identified `symbols`, not only new symbols.
-7. Prediction output is saved as one CSV file for the reference date.
-8. `watched_underlying_backtest` evaluates each `instrument x strategy` prediction against the next trading day.
+## What Each Piece Owns
+
+| Piece | Owns |
+|---|---|
+| `dailyNews` | Finds impacted commodities from news. |
+| `impactList` | Maps commodities to sectors/stocks. |
+| `reviewList` | Emits approved stock-level signals. |
+| `signal_normalizer` | Calculates ID, score, entry time, holding period. |
+| `SectorExpansionService` | Expands sectors into NSE stocks and watched instruments. |
+| `BackfillService` | Ensures required underlying/option history exists. |
+| `news_underlying_backtest` | Backtests finalized news signals. |
+
+## Folder Contract
+
+Each news-analysis agent folder follows the same structure:
+
+```text
+agent_definition.md   prompt and responsibility description
+config.yaml           thresholds, rules, and guardrails
+output_schema.py      Python dataclass contract used by code
+agent.py              Azure-backed agent runner
+```
+
+The `agent_definition.md` file is documentation/prompt text. The `output_schema.py` file stays as Python because orchestration imports its dataclasses.
+
+## Azure Setup
+
+The agent runners use `src/news_analysis/azure_agent_client.py`.
+
+Supported environment variables:
+
+```text
+AZURE_OPENAI_ENDPOINT
+AZURE_OPENAI_API_KEY
+AZURE_OPENAI_DEPLOYMENT
+AZURE_OPENAI_API_VERSION
+```
+
+Aliases are also supported:
+
+```text
+AZURE_AI_ENDPOINT
+AZURE_AI_API_KEY
+AZURE_AI_DEPLOYMENT
+AZURE_AI_API_VERSION
+```
+
+If Azure is not configured, the agents return placeholder outputs so local import and dry-run checks still work.
 
 ## Agent Roles
 
-Each agent has its own folder:
-
-```text
-src/agents/
-  dailyNews/
-    agent.py
-    output_schema.py
-    config.yaml
-  impactList/
-    agent.py
-    output_schema.py
-    config.yaml
-  reviewList/
-    agent.py
-    output_schema.py
-    config.yaml
-```
-
 ### dailyNews
 
-Reads configured news sources for a `reference_date`.
+Location: `src/news_analysis/dailyNews`
 
-It should identify:
+Purpose:
 
-- the news item
-- impacted sector, industry, commodity, or theme
-- any raw company or symbol mentions
-- confidence and rationale
+- read a news item or daily news context
+- identify impacted commodities
+- classify commodity direction, mechanism, timeline, and confidence
+- avoid stock recommendations
+
+Output class: `DailyNewsOutput`
 
 ### impactList
 
-Consumes `dailyNews` output and creates an ordered impact list.
+Location: `src/news_analysis/impactList`
 
-It should identify:
+Purpose:
 
-- impacted sectors
-- impact direction, such as positive, negative, or neutral
-- impact score
-- source headlines and rationale
+- map commodity impacts into sectors
+- identify relevant stocks where the mapping is clear
+- rank sector impact by directness, sensitivity, confidence, and timeline
+
+Output class: `ImpactListOutput`
 
 ### reviewList
 
-Reviews the impact list before data work starts.
+Location: `src/news_analysis/reviewList`
 
-It should:
+Purpose:
 
-- approve or reject impacted sectors
-- preserve the `reference_date`
-- return approved sectors in priority order
+- review and filter impactList output
+- remove weak or speculative causal chains
+- emit flat `approved_trade_signals`
 
-## SectorWatchlistService
+Output class: `ReviewListOutput`
 
-Location: `src/services/sector_watchlist_service.py`
+Important: `reviewList` should not calculate `signal_id`, `final_trade_score`, `entry_allowed_from`, or `suggested_max_holding_days`. Those are deterministic fields calculated by `signal_normalizer.py`.
 
-This service converts reviewed sectors into stock symbols.
+## Signal Normalizer
 
-It does four things:
+Location: `src/news_analysis/signal_normalizer.py`
 
-1. Takes approved sectors from `reviewList`.
-2. Finds relevant NSE stocks for those sectors.
-3. Inserts only missing stocks into `dbo.WatchedInstrument`.
-4. Returns both all identified symbols and newly added symbols.
+Responsibilities:
 
-Important return fields:
+- validate `reviewList.approved_trade_signals`
+- drop invalid signals
+- calculate `final_trade_score`
+- calculate `entry_allowed_from`
+- calculate `suggested_max_holding_days`
+- assign deterministic `signal_id`
+- persist finalized rows to `output/trade_signal_journal.csv`
 
-| Field | Meaning |
-|---|---|
-| `symbols` | All resolved stocks for the approved sectors. Predictions run for this list. |
-| `new_symbols` | Stocks newly inserted into `WatchedInstrument`. Backfill runs for this list. |
-| `sector_results` | Per-sector expansion details and diagnostics. |
-| `option_instruments` | Option-instrument refresh result for newly inserted symbols. |
+Weights come from `src/news_analysis/reviewList/config.yaml`.
 
-## Backfill Logic
-
-The orchestrator calls `BackfillService` only when `new_symbols` is not empty.
-
-Backfill window:
+`signal_id` identifies one ticker-level signal from one news event and is generated from:
 
 ```text
-start_date = reference_date - 90 days
-end_date   = reference_date - 1 day
-```
-
-Backfill prepares:
-
-- `UnderlyingSnapshot`
-- `UnderlyingCandle5m`
-- `OptionInstrument`
-- `OptionSnapshot`
-- `OptionSnapshotCalc`
-
-This means a newly discovered stock gets enough recent history before prediction and later option workflows.
-
-## Prediction Logic
-
-The orchestrator calls:
-
-```python
-PredictionService.run_reference_date_predictions_for_symbols(
-    instruments=symbols,
-    reference_date=review_reference_date,
-    strategies=prediction_strategies,
-)
-```
-
-Important detail:
-
-- Backfill runs for `new_symbols`.
-- Predictions run for `symbols`.
-
-That distinction matters because a stock can already exist in the watchlist and still be relevant to today's reviewed news.
-
-## Prediction Output
-
-Predictions are saved as one CSV file per reference date:
-
-```text
-output/<reference_date>.csv
+news_event_id + published_at + ticker + expected_stock_direction
 ```
 
 Example:
 
 ```text
-output/2026-05-08.csv
+SIG_EVT20260511001_20260511_INDIGO_DOWN_4E2802
 ```
 
-The CSV has one row per stock/index and one column per prediction strategy.
+## OrchestrationService
 
-Example shape:
+Call:
+
+```python
+from src.services.orchestration_service import OrchestrationService
+
+result = OrchestrationService.default().run(reference_date=...)
+```
+
+What it does:
+
+1. Runs `dailyNews`.
+2. Runs `impactList`.
+3. Runs `reviewList`.
+4. Calls `normalize_review_signals`.
+5. Persists finalized signals to the signal journal.
+6. Expands finalized signal sectors using `SectorExpansionService`.
+7. Backfills finalized signal tickers for the last 90 days.
+8. Runs `news_underlying_backtest` against the signal journal.
+
+## SectorExpansionService
+
+Location: `src/services/sector_expansion_service.py`
+
+This service expands sectors into NSE stocks and inserts missing records into `WatchedInstrument`.
+
+Current orchestration uses finalized signal sectors for sector expansion, while backfill runs on finalized signal tickers. If the business rule changes to backfill every newly added sector constituent, orchestration should use `sectorExpansion.new_symbols` for backfill too.
+
+## Output
+
+Finalized signals are stored in:
 
 ```text
-reference_date,instrument,status,error,MaTrend_001,RsiMeanReversion_6535,aggregate_decision
-2026-05-08,INFY,ok,,CALL,PUT,NO_POSITION
-2026-05-08,TCS,ok,,CALL,CALL,CALL
+output/trade_signal_journal.csv
 ```
 
-The final `aggregate_decision` column is produced by majority vote across the strategy columns.
+News backtest result columns are added back to the same journal file.
 
-## Watched Backtest
-
-After prediction, the orchestrator calls the watched underlying backtest.
-
-Input:
+Backtest thresholds, result columns, and summary dictionaries are documented in:
 
 ```text
-output/<reference_date>.csv
+TeamDocs/backtestStrategy.md
 ```
 
-The watched backtest expects CSV input.
+## Local App
 
-The backtest explodes the prediction matrix into one row per:
+Run:
 
-```text
-instrument x strategy
+```powershell
+python flask_app.py
 ```
 
-It compares each prediction with the next trading day's underlying move and marks results such as:
-
-- `CORRECT`
-- `INCORRECT`
-- `OK_NO_TRADE`
-- `MISSED_CALL`
-- `MISSED_PUT`
-- `N/A`
-
-Those results are added back to the same prediction file as columns such as:
-
-```text
-MaTrend_001_backtest_result
-aggregate_decision_backtest_result
-```
-
-## Design Rule
-
-Use agents for judgement:
-
-- Which news matters?
-- Which sector or commodity is impacted?
-- Which reviewed sectors should move forward?
-
-Use services for deterministic work:
-
-- Expand sectors into NSE stocks.
-- Insert watched instruments.
-- Run backfill.
-- Run technical-analysis predictions.
-- Save the prediction output file.
+The app exposes a technical-analysis path and a news-signal backtest path. News prediction is disabled in the UI for now. See `run_local.md` at the repo root for full step-by-step instructions.

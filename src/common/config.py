@@ -2,7 +2,7 @@
 from pathlib import Path
 from dotenv import load_dotenv
 
-_repo_root_env = Path(__file__).resolve().parents[1] / ".env"
+_repo_root_env = Path(__file__).resolve().parents[2] / ".env"
 # Load repo-root .env deterministically so running from different working dirs still works.
 # Do not override existing environment variables (so deployment env wins).
 load_dotenv(dotenv_path=_repo_root_env if _repo_root_env.exists() else None, override=False)

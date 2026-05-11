@@ -8,7 +8,18 @@ from uuid import uuid4
 
 import pandas as pd
 
-from src.technical_analysis.underlying_registry import detect_regime, load_underlying_prediction_strategies
+from src.technical_analysis.prediction.underlying_registry import (
+    detect_regime,
+    load_underlying_prediction_strategies,
+)
+
+REGIME_STRATEGY_GROUPS = {
+    "TREND_UP": ["trendUpRangeBreakout"],
+    "TREND_DOWN": ["trendDownRangeBreakout"],
+    "RANGE": ["rangeBollingerMeanReversion", "rangeRsiMeanReversion_6535"],
+    "CHOPPY": ["choppy"],
+    "UNKNOWN": ["unknown"],
+}
 
 
 def clamp01(x: float) -> float:
@@ -74,10 +85,17 @@ def majority_vote(predictions: dict[str, str]) -> str:
     return "NO_POSITION"
 
 
+def get_regime_strategy_columns(regime: str, strategy_columns: list[str]) -> list[str]:
+    regime_group = REGIME_STRATEGY_GROUPS.get(str(regime or "").upper(), [])
+    selected = [name for name in regime_group if name in strategy_columns]
+    return selected or strategy_columns
+
+
 def aggregate_underlying_decision(row: pd.Series, strategy_columns: list[str]) -> str:
+    selected_columns = get_regime_strategy_columns(str(row.get("regime", "")), strategy_columns)
     predictions = {
         strategy: row.get(strategy)
-        for strategy in strategy_columns
+        for strategy in selected_columns
         if row.get(strategy) in ("CALL", "PUT", "NO_POSITION")
     }
     return majority_vote(predictions)
@@ -104,7 +122,10 @@ def run_underlying_prediction(
 ) -> PredictionOutput:
     regime = detect_regime(window)
     per_strategy = get_underlying_strategy_predictions(window=window, strategies=strategies)
-    final_decision = majority_vote(per_strategy)
+    selected_names = get_regime_strategy_columns(regime, list(per_strategy.keys()))
+    final_decision = majority_vote(
+        {name: per_strategy[name] for name in selected_names if name in per_strategy}
+    )
 
     ta_signals: list[Signal] = []
     for name, direction in per_strategy.items():
@@ -122,9 +143,11 @@ def run_underlying_prediction(
             )
         )
 
-    non_neutral = [d for d in per_strategy.values() if d in ("CALL", "PUT")]
+    non_neutral = [per_strategy[name] for name in selected_names if per_strategy.get(name) in ("CALL", "PUT")]
     confidence = 0.5 if not non_neutral else min(0.85, len(non_neutral) / max(len(per_strategy), 1))
-    reasons = [f"TA:{name}:{decision}" for name, decision in per_strategy.items()][:5]
+    reasons = [f"regime:{regime}"]
+    reasons.extend(f"TA:{name}:{per_strategy[name]}" for name in selected_names if name in per_strategy)
+    reasons = reasons[:5]
 
     return PredictionOutput(
         instrument=instrument,

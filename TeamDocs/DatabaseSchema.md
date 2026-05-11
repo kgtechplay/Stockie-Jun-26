@@ -1,4 +1,17 @@
 ﻿# Database Schema
+## Gist
+
+The database has three active areas today:
+
+| Area | Main Tables | Why It Matters |
+|---|---|---|
+| Instrument universe | `StockDB`, `WatchedInstrument`, `OptionInstrument` | Defines what symbols/contracts we track. |
+| Market history | `UnderlyingSnapshot`, `UnderlyingCandle5m`, `OptionSnapshot`, `OptionSnapshotCalc`, `MarketActivityDaily` | Feeds prediction and backtesting. |
+| Calendar/auth | `TradingCalendar`, `KiteAccessToken` | Supports trading-day logic and Kite API access. |
+
+Most signal/trade/live tables are planned or partial. Start with the active tables above unless you are changing future model/trading workflows.
+
+## Reference
 
 This is the single reference for database tables and views used by the project.
 
@@ -664,3 +677,4 @@ SignalFeatureDaily
 | `scripts/backfill/backfill_nifty_options.py` | Index option snapshot backfill. |
 | `scripts/backfill/backfill_stocks_options.py` | Stock option snapshot backfill. |
 | `scripts/backfill/backfill_nifty_volumeproxy.py` | Market activity/OI/volume proxy backfill. |
+

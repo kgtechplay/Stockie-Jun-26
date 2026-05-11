@@ -1,4 +1,19 @@
 ﻿# Scripts Reference
+## Gist
+
+Daily refresh order:
+
+```text
+Kite token -> stocks universe -> option instruments -> market refresh
+```
+
+Use the wrapper for the normal daily job:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_daily_watched_refresh.ps1
+```
+
+Schedule it at 8:30 AM IST after the Kite token is available.
 
 All scripts live in `scripts/` and are run from the project root.
 
@@ -194,3 +209,17 @@ Marks:
 - `is_monthly_expiry` - last Thursday of each month that is a trading day
 
 Re-run yearly when NSE publishes the next holiday list.
+
+## Flask App
+
+Run the lightweight local app:
+
+```powershell
+python flask_app.py
+```
+
+The app has two paths:
+
+- Technical Analysis: select an active watched stock/index from `WatchedInstrument`, predict today, or generate/backtest the last 60 days.
+- News Signal Backtest: backtest existing `trade_signal_journal.csv` rows for a selected published date. News prediction is disabled for now.
+

@@ -1,9 +1,0 @@
-﻿agent_name: dailyNews
-description: Identify industries, commodities, and macro factors affected by daily news.
-lookback_hours: 24
-sources:
-  - https://www.reuters.com/markets/
-  - https://www.moneycontrol.com/news/business/markets/
-  - https://economictimes.indiatimes.com/markets
-  - https://www.livemint.com/market
-output_schema: output_schema.DailyNewsOutput
