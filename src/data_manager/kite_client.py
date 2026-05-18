@@ -1,4 +1,5 @@
 ﻿import time
+import os
 from pathlib import Path
 from typing import Any, List, Iterable, Dict
 
@@ -56,7 +57,11 @@ class KiteClient:
             return False
 
     def _load_token(self) -> str | None:
-        """Load token from file or database. Returns cleaned token or None."""
+        """Load token from env, file, or database. Returns cleaned token or None."""
+        env_token = _clean_token(os.getenv("KITE_ACCESS_TOKEN", ""))
+        if env_token and len(env_token) >= 10:
+            return env_token
+
         token_path = _get_token_path(self.settings)
 
         # Try file first
