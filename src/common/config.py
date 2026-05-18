@@ -35,6 +35,79 @@ def _normalize_azure_sql_conn_str(conn_str: str) -> str:
     return s
 
 
+def _split_conn_str(conn_str: str) -> list[str]:
+    return [part.strip() for part in (conn_str or "").split(";") if part.strip()]
+
+
+def _join_conn_str(parts: list[str]) -> str:
+    return ";".join(parts) + (";" if parts else "")
+
+
+def _set_conn_attr(parts: list[str], key: str, value: str) -> list[str]:
+    lowered_key = key.lower()
+    updated: list[str] = []
+    replaced = False
+    for part in parts:
+        if "=" not in part:
+            updated.append(part)
+            continue
+        current_key, _ = part.split("=", 1)
+        if current_key.strip().lower() == lowered_key:
+            updated.append(f"{key}={value}")
+            replaced = True
+        else:
+            updated.append(part)
+    if not replaced:
+        updated.append(f"{key}={value}")
+    return updated
+
+
+def _remove_tcp_prefix(parts: list[str]) -> list[str]:
+    updated: list[str] = []
+    for part in parts:
+        if "=" not in part:
+            updated.append(part)
+            continue
+        current_key, current_value = part.split("=", 1)
+        if current_key.strip().lower() == "server" and current_value.lower().startswith("tcp:"):
+            updated.append(f"{current_key}={current_value[4:]}")
+        else:
+            updated.append(part)
+    return updated
+
+
+def get_azure_sql_conn_str_variants(conn_str: str) -> list[str]:
+    normalized = _normalize_azure_sql_conn_str(conn_str)
+    if not normalized:
+        return []
+
+    parts = _split_conn_str(normalized)
+    variants: list[str] = [_join_conn_str(parts)]
+
+    trust_cert_parts = _set_conn_attr(parts, "TrustServerCertificate", "yes")
+    variants.append(_join_conn_str(trust_cert_parts))
+
+    trust_cert_no_tcp = _remove_tcp_prefix(trust_cert_parts)
+    variants.append(_join_conn_str(trust_cert_no_tcp))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        if variant and variant not in seen:
+            deduped.append(variant)
+            seen.add(variant)
+    return deduped
+
+
+def _normalize_supabase_conn_str(conn_str: str) -> str:
+    value = (conn_str or "").strip().strip('"').strip("'")
+    for prefix in ("SUPABASE_CONN_STR=", "DATABASE_URL="):
+        if value.upper().startswith(prefix):
+            value = value[len(prefix):].strip().strip('"').strip("'")
+            break
+    return value
+
+
 class Settings:
     def __init__(self) -> None:
         self.kite_api_key = os.getenv("KITE_API_KEY", "")
@@ -48,6 +121,10 @@ class Settings:
         self.azure_sql_conn_str = _normalize_azure_sql_conn_str(
             os.getenv("AZURE_SQL_CONN_STR", "")
         )
+        self.supabase_conn_str = _normalize_supabase_conn_str(
+            os.getenv("SUPABASE_CONN_STR", "")
+        )
+        self.database_provider = os.getenv("DATABASE_PROVIDER", "").strip().lower()
         self.target_underlyings = os.getenv(
             "TARGET_UNDERLYINGS", "NIFTY,BANKNIFTY"
         ).split(",")
