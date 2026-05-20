@@ -89,8 +89,9 @@ def resolve_scheduled_snapshot_label(
     """
     Pick the snapshot label for a scheduler run.
 
-    If a label is supplied, use it directly and validate it against the configured
-    schedule when known. Without a label, choose the nearest configured snapshot.
+    If the run is inside a configured schedule window, use that scheduled label.
+    If it fires outside the window, write an ad-hoc LIVE_HHMM label instead of
+    failing or polluting the scheduled OPEN_0915/CLOSE_1515 rows.
     """
     if explicit_label:
         target = SCHEDULED_SNAPSHOTS.get(explicit_label)
@@ -111,14 +112,14 @@ def resolve_scheduled_snapshot_label(
     )
 
     if not within_tolerance and not allow_outside_window:
-        raise RuntimeError(
-            "Scheduled snapshot fired outside the allowed window: "
-            f"label={label}, target_ist={target_text}, "
-            f"actual_ist={snapshot_time:%H:%M:%S}, "
-            f"delta_seconds={delta_seconds}, "
-            f"tolerance_seconds={schedule_tolerance_seconds}. "
-            "Use --allow-outside-window to override."
+        ad_hoc_label = f"LIVE_{snapshot_time:%H%M}"
+        print(
+            "Scheduled snapshot fired outside the allowed window; "
+            f"capturing ad-hoc snapshot_label={ad_hoc_label} instead of {label}. "
+            f"target_ist={target_text}, actual_ist={snapshot_time:%H:%M:%S}, "
+            f"delta_seconds={delta_seconds}, tolerance_seconds={schedule_tolerance_seconds}."
         )
+        return ad_hoc_label, target_text, delta_seconds, within_tolerance
 
     return label, target_text, delta_seconds, within_tolerance
 
@@ -815,14 +816,15 @@ def capture_all_option_instruments_snapshot(
             )
 
         snapshot_time = now_ist_naive()
-        snapshot_label, scheduled_target_time, schedule_delta_seconds, within_schedule_tolerance = (
-            resolve_scheduled_snapshot_label(
-                snapshot_time=snapshot_time,
-                explicit_label=snapshot_label,
-                schedule_tolerance_seconds=schedule_tolerance_seconds,
-                allow_outside_window=allow_outside_window,
+        if snapshot_label in SCHEDULED_SNAPSHOTS:
+            snapshot_label, scheduled_target_time, schedule_delta_seconds, within_schedule_tolerance = (
+                resolve_scheduled_snapshot_label(
+                    snapshot_time=snapshot_time,
+                    explicit_label=snapshot_label,
+                    schedule_tolerance_seconds=schedule_tolerance_seconds,
+                    allow_outside_window=allow_outside_window,
+                )
             )
-        )
         spot = get_spot_quote(kite_client, underlying, spot_key)
 
         print(
