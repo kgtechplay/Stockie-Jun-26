@@ -151,7 +151,11 @@ def pg_table_name(name: str) -> str:
 
 def ensure_snapshot_schema(db: DatabaseClient, snapshot_table: str) -> None:
     if getattr(db, "db_kind", "") == "postgres":
-        db.create_core_tables()
+        try:
+            db.create_core_tables()
+        except Exception as exc:
+            db.conn.rollback()
+            print(f"[WARN] Supabase schema check skipped after error: {exc}")
         return
 
     full_name = table_object_name(snapshot_table)
