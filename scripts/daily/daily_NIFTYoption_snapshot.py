@@ -340,7 +340,8 @@ def load_all_live_option_instruments(
     sql += f" ORDER BY {expiry_expr}, strike, instrument_type"
 
     cursor = db.conn.cursor()
-    rows = cursor.execute(sql, params).fetchall()
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
     cursor.close()
 
     instruments: list[dict[str, Any]] = []
@@ -684,7 +685,7 @@ def get_option_snapshot_ids(
     snapshot_ids: list[int] = []
 
     for row in rows:
-        result = cursor.execute(
+        cursor.execute(
             f"""
             SELECT id
             FROM {table}
@@ -695,7 +696,8 @@ def get_option_snapshot_ids(
             (row["option_instrument_id"], row["trade_date"], row["snapshot_label"])
             if is_postgres
             else (row["option_instrument_id"], row["trade_date"], row["snapshot_label"]),
-        ).fetchone()
+        )
+        result = cursor.fetchone()
 
         if result is not None:
             snapshot_ids.append(int(result[0] if is_postgres else result.id))
