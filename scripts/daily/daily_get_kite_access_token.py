@@ -239,16 +239,22 @@ def automate_kite_login(login_url: str) -> None:
             two_factor_input = page.locator("input[type='text'], input[type='number'], input[type='password']").first
             two_factor_input.wait_for(timeout=20_000)
             two_factor_input.fill(two_factor_value)
-            click_first_available(
-                page,
-                [
-                    "button[type='submit']",
-                    "button:has-text('Continue')",
-                    "button:has-text('Login')",
-                    "button:has-text('Submit')",
-                    "input[type='submit']",
-                ],
-            )
+            try:
+                click_first_available(
+                    page,
+                    [
+                        "button[type='submit']",
+                        "button:has-text('Continue')",
+                        "button:has-text('Login')",
+                        "button:has-text('Submit')",
+                        "input[type='submit']",
+                    ],
+                )
+            except PlaywrightTimeoutError:
+                # Kite auto-submits when all TOTP digits are entered; the button
+                # becomes disabled before click() can complete. This is expected —
+                # the form is already submitted, so just proceed to wait for the redirect.
+                print("Submit button timed out (likely auto-submitted). Proceeding to wait for redirect.")
 
         try:
             print("Waiting for Kite callback or browser URL containing request_token.")
