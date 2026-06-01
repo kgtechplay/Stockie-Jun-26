@@ -139,6 +139,9 @@ KITE_PASSWORD=...
 KITE_TOTP_SECRET=...
 ```
 
+`KITE_LOGIN_HEADLESS` must be `1` on Render. Render cron jobs do not have an
+X server/display, so headed browser mode fails at launch.
+
 Do not set `KITE_ACCESS_TOKEN` on Render cron jobs. The token cron writes the
 new access token to Supabase, and the other cron jobs read it from
 `KiteAccessToken`.

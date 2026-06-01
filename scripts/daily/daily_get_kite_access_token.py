@@ -38,6 +38,9 @@ KITE_2FA_MODE = os.getenv("KITE_2FA_MODE", "totp").strip().lower()
 
 AUTO_LOGIN = os.getenv("KITE_AUTO_LOGIN", "1").strip().lower() not in {"0", "false", "no"}
 HEADLESS = os.getenv("KITE_LOGIN_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
+if not HEADLESS and os.name != "nt" and not os.getenv("DISPLAY"):
+    print("Warning: KITE_LOGIN_HEADLESS=0 but no DISPLAY is available; forcing headless browser mode.")
+    HEADLESS = True
 REDIRECT_HOST = os.getenv("KITE_REDIRECT_HOST", "127.0.0.1")
 REDIRECT_PORT = int(os.getenv("KITE_REDIRECT_PORT", "5000"))
 TOKEN_WAIT_SECONDS = int(os.getenv("KITE_TOKEN_WAIT_SECONDS", "180"))
