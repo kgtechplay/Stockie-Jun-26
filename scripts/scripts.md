@@ -19,8 +19,13 @@ All scripts live in `scripts/` and are run from the project root.
 
 Required env vars in `.env`:
 
-- `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_ACCESS_TOKEN_PATH`
-- `AZURE_SQL_CONN_STR`
+- `KITE_API_KEY`, `KITE_API_SECRET`
+- One database connection: `SUPABASE_CONN_STR` with `DATABASE_PROVIDER=supabase`, or `AZURE_SQL_CONN_STR`
+- Optional local cache path: `KITE_ACCESS_TOKEN_PATH`
+
+Do not configure a rotating `KITE_ACCESS_TOKEN` env var for cron jobs. The shared
+`KiteClient` reads the latest access token from the configured database table
+`KiteAccessToken` and only falls back to `KITE_ACCESS_TOKEN_PATH` as a local cache.
 
 ## Daily Scripts
 
@@ -42,20 +47,26 @@ At 8:30 AM IST, `daily_market_refresh.py` defaults to yesterday because market c
 Get a fresh Kite access token before market open.
 
 ```bash
-python scripts/daily_get_kite_access_token.py
-python scripts/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
+python scripts/daily/daily_get_kite_access_token.py
+python scripts/daily/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
 ```
 
-Saves the token to `KITE_ACCESS_TOKEN_PATH` and persists it to `dbo.KiteAccessToken`.
+Saves the token to `KITE_ACCESS_TOKEN_PATH` and persists it to the configured database
+table `KiteAccessToken`. With `DATABASE_PROVIDER=supabase` or `SUPABASE_CONN_STR`,
+this writes to Supabase.
+
+Local token-file writes are best-effort only. On Render or another cron host,
+the script can update the database even if `KITE_ACCESS_TOKEN_PATH` is absent or
+the local filesystem is ephemeral.
 
 ### 2. `daily_fetch_stocks_universe.py`
 
 Refresh `stocks_universe.csv` from Kite instrument data + NSE constituent lists. Run after the access token step so Kite credentials are available. yfinance is skipped by default (fast, ~30 s); pass `--yfinance` for a periodic deep refresh that also covers small-cap sectors.
 
 ```bash
-python scripts/daily_fetch_stocks_universe.py
-python scripts/daily_fetch_stocks_universe.py --yfinance    # also enrich via Yahoo Finance (slow)
-python scripts/daily_fetch_stocks_universe.py --fo-only     # only F&O-enabled stocks + indices
+python scripts/daily/daily_fetch_stocks_universe.py
+python scripts/daily/daily_fetch_stocks_universe.py --yfinance    # also enrich via Yahoo Finance (slow)
+python scripts/daily/daily_fetch_stocks_universe.py --fo-only     # only F&O-enabled stocks + indices
 ```
 
 ### 3. `daily_optionInstrument_refresh.py`
@@ -63,10 +74,10 @@ python scripts/daily_fetch_stocks_universe.py --fo-only     # only F&O-enabled s
 Sync `dbo.OptionInstrument` from the live Kite NFO instrument list for all active `WatchedInstrument` rows. Run once per day before the market data refresh.
 
 ```bash
-python scripts/daily_optionInstrument_refresh.py
-python scripts/daily_optionInstrument_refresh.py --type INDEX
-python scripts/daily_optionInstrument_refresh.py --type STOCK
-python scripts/daily_optionInstrument_refresh.py --dry-run
+python scripts/daily/daily_optionInstrument_refresh.py
+python scripts/daily/daily_optionInstrument_refresh.py --type INDEX
+python scripts/daily/daily_optionInstrument_refresh.py --type STOCK
+python scripts/daily/daily_optionInstrument_refresh.py --dry-run
 ```
 
 ### 4. `daily_market_refresh.py`
@@ -79,17 +90,58 @@ Main daily data refresh. Delegates to `BackfillService` and covers:
 
 ```bash
 # Default: refreshes yesterday, or today if after 15:35 IST. Uses 1-day lookback.
-python scripts/daily_market_refresh.py
+python scripts/daily/daily_market_refresh.py
 
 # Explicit date range
-python scripts/daily_market_refresh.py --start 2026-05-08 --end 2026-05-09
+python scripts/daily/daily_market_refresh.py --start 2026-05-08 --end 2026-05-09
 
 # Extend lookback to cover missed days
-python scripts/daily_market_refresh.py --lookback 5
+python scripts/daily/daily_market_refresh.py --lookback 5
 
 # Specific underlyings only
-python scripts/daily_market_refresh.py --underlying NIFTY --underlying RELIANCE
+python scripts/daily/daily_market_refresh.py --underlying NIFTY --underlying RELIANCE
 ```
+
+## Render Cron Jobs
+
+Render cron schedules are UTC. Use `30 1 * * *` for a 7:00 AM IST token
+refresh.
+
+Token refresh cron:
+
+```bash
+python scripts/daily/daily_get_kite_access_token.py
+```
+
+Build command:
+
+```bash
+pip install -r requirements.txt && python -m playwright install chromium
+```
+
+If Chromium needs OS packages on the Render image, use:
+
+```bash
+pip install -r requirements.txt && python -m playwright install --with-deps chromium
+```
+
+Required Render env vars for the token cron:
+
+```text
+DATABASE_PROVIDER=supabase
+SUPABASE_CONN_STR=...
+KITE_API_KEY=...
+KITE_API_SECRET=...
+KITE_AUTO_LOGIN=1
+KITE_LOGIN_HEADLESS=1
+KITE_USER_ID=...
+KITE_PASSWORD=...
+KITE_TOTP_SECRET=...
+```
+
+Do not set `KITE_ACCESS_TOKEN` on Render cron jobs. The token cron writes the
+new access token to Supabase, and the other cron jobs read it from
+`KiteAccessToken`.
 
 ## Single Daily Job
 
@@ -110,7 +162,7 @@ daily_market_refresh.py --lookback 1
 Kite token refresh is special because Zerodha/Kite requires browser login and a daily `request_token`. Run this manually before the scheduled job:
 
 ```powershell
-python scripts/daily_get_kite_access_token.py
+python scripts/daily/daily_get_kite_access_token.py
 ```
 
 If you already have the full redirect URL, you can include it in the wrapper:
@@ -153,7 +205,7 @@ Historical data loading is handled by `BackfillService` (`src/services/backfill_
 `daily_market_refresh.py` is the CLI entry point for both daily and historical backfill. Pass a wider `--start` / `--end` range.
 
 ```bash
-python scripts/daily_market_refresh.py --start 2025-01-01 --end 2026-05-09
+python scripts/daily/daily_market_refresh.py --start 2025-01-01 --end 2026-05-09
 ```
 
 `BackfillService.run_backfill()` automatically classifies instruments into `INDEX` vs `STOCK` and runs the correct underlying and options pipelines for each.
@@ -177,9 +229,9 @@ Creates: `TradingCalendar`, `WatchedInstrument`, `SignalFeatureDaily`, `SignalPr
 Refresh `stocks_universe.csv` from Kite and NSE constituent data.
 
 ```bash
-python scripts/daily_fetch_stocks_universe.py
-python scripts/daily_fetch_stocks_universe.py --yfinance
-python scripts/daily_fetch_stocks_universe.py --fo-only
+python scripts/daily/daily_fetch_stocks_universe.py
+python scripts/daily/daily_fetch_stocks_universe.py --yfinance
+python scripts/daily/daily_fetch_stocks_universe.py --fo-only
 ```
 
 CSV columns: `tradingsymbol, exchange, name, instrument_token, segment, tick_size, lot_size, instrument_type, sector, industry, is_fo_enabled, is_active`.
@@ -222,4 +274,3 @@ The app has two paths:
 
 - Technical Analysis: select an active watched stock/index from `WatchedInstrument`, predict today, or generate/backtest the last 60 days.
 - News Signal Backtest: backtest existing `trade_signal_journal.csv` rows for a selected published date. News prediction is disabled for now.
-

@@ -15,9 +15,9 @@ Most signal/trade/live tables are planned or partial. Start with the active tabl
 
 This is the single reference for database tables and views used by the project.
 
-Database: Azure SQL Server / SQL Server
-Schema: `dbo`
-Main DB client: `src/data_manager/db/database_client.py`
+Database: Azure SQL Server / SQL Server or Supabase Postgres
+Schema: `dbo` on SQL Server, quoted public tables on Supabase
+Main DB clients: `src/data_manager/db/database_client.py`, `src/data_manager/db/supabase_client.py`
 Main migration: `src/data_manager/db/migrations/001_create_trading_system_tables.sql`
 
 ## Data Areas
@@ -588,8 +588,12 @@ Stores the current Kite access token.
 
 Notes:
 
-- `database_client.py` creates this table dynamically if missing.
-- `get_kite_access_token()` also checks legacy/case variants: `kiteAccessToken`, `KiteAccessToken`, with and without `dbo`.
+- `database_client.py` creates `dbo.KiteAccessToken` dynamically for Azure SQL if missing.
+- `supabase_client.py` creates public `"KiteAccessToken"` dynamically for Supabase if missing.
+- `scripts/daily/daily_get_kite_access_token.py` writes the latest token to the configured database.
+- `src/data_manager/kite_client.py` reads the latest token from the configured database first. The local `KITE_ACCESS_TOKEN_PATH` file is only a cache/fallback.
+- Render cron jobs should not use a rotating `KITE_ACCESS_TOKEN` environment variable. Keep `DATABASE_PROVIDER=supabase`, `SUPABASE_CONN_STR`, `KITE_API_KEY`, and `KITE_API_SECRET`; the cron scripts read from `"KiteAccessToken"`.
+- SQL Server `get_kite_access_token()` also checks legacy/case variants: `kiteAccessToken`, `KiteAccessToken`, with and without `dbo`.
 
 ## Views
 
@@ -652,13 +656,13 @@ SignalFeatureDaily
 | `StockDB` | `DatabaseClient` stock insert/truncate methods. |
 | `WatchedInstrument` | `scripts/populate_watched_instruments.py`, `DatabaseClient.upsert_watched_instruments()`. |
 | `OptionInstrument` | `scripts/daily_optionInstrument_refresh.py`, `DatabaseClient.upsert_option_instruments()`. |
-| `UnderlyingSnapshot` | `scripts/daily_market_refresh.py`, `scripts/backfill/backfill_nifty_underlying.py`, `scripts/backfill/backfill_stocks_underlying.py`. |
-| `UnderlyingCandle5m` | `scripts/daily_market_refresh.py`, `scripts/backfill/backfill_nifty_underlying.py`, `scripts/backfill/backfill_stocks_underlying.py`. |
+| `UnderlyingSnapshot` | `scripts/daily_market_refresh.py`, `scripts/backfill/backfill_underlying.py`. |
+| `UnderlyingCandle5m` | `scripts/daily_market_refresh.py`, `scripts/backfill/backfill_underlying.py`. |
 | `OptionSnapshot` | `scripts/daily_market_refresh.py`, `scripts/backfill/backfill_nifty_options.py`, `scripts/backfill/backfill_stocks_options.py`, `DatabaseClient.bulk_insert_option_data()`. |
 | `OptionSnapshotCalc` | Same as `OptionSnapshot`; calculated during option data ingestion. |
 | `MarketActivityDaily` | `scripts/backfill/backfill_nifty_volumeproxy.py`. |
 | `TradingCalendar` | `scripts/build_trading_calendar.py`. |
-| `KiteAccessToken` | `scripts/daily_get_kite_access_token.py`, `DatabaseClient.save_kite_access_token()`. |
+| `KiteAccessToken` | `scripts/daily/daily_get_kite_access_token.py`, `DatabaseClient.save_kite_access_token()`, `SupabaseDatabaseClient.save_kite_access_token()`. |
 
 ## Source Files
 
@@ -672,8 +676,7 @@ SignalFeatureDaily
 | `scripts/daily_market_refresh.py` | Daily orchestrated market data refresh. |
 | `scripts/daily_market_refresh.py` | Main daily refresh entrypoint for underlying and option market data via `BackfillService`. |
 | `scripts/daily_optionInstrument_refresh.py` | Daily option instrument refresh. |
-| `scripts/backfill/backfill_nifty_underlying.py` | Index underlying backfill. |
-| `scripts/backfill/backfill_stocks_underlying.py` | Stock underlying backfill. |
+| `scripts/backfill/backfill_underlying.py` | Shared index/stock underlying backfill. |
 | `scripts/backfill/backfill_nifty_options.py` | Index option snapshot backfill. |
 | `scripts/backfill/backfill_stocks_options.py` | Stock option snapshot backfill. |
 | `scripts/backfill/backfill_nifty_volumeproxy.py` | Market activity/OI/volume proxy backfill. |

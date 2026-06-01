@@ -22,6 +22,8 @@ dist/
 # =========================
 .env
 .secrets/
+kite_access_token.txt
+kite_access_token.json
 
 # =========================
 # Runtime / generated data

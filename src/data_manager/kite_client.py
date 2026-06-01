@@ -1,5 +1,4 @@
 ﻿import time
-import os
 from pathlib import Path
 from typing import Any, List, Iterable, Dict
 
@@ -33,13 +32,13 @@ class KiteClient:
         self.kite = KiteConnect(api_key=self.settings.kite_api_key)
 
     def authenticate(self) -> None:
-        """Set the access token from file or database."""
+        """Set the access token from the configured database, with file fallback."""
         access_token = self._load_token()
         if not access_token:
             token_path = _get_token_path(self.settings)
             raise RuntimeError(
-                f"Access token not found in file ({token_path}) or database.\n"
-                "Run: python scripts/daily_get_kite_access_token.py"
+                f"Access token not found in database or file ({token_path}).\n"
+                "Run: python scripts/daily/daily_get_kite_access_token.py"
             )
         self.kite.set_access_token(access_token)
 
@@ -57,14 +56,29 @@ class KiteClient:
             return False
 
     def _load_token(self) -> str | None:
-        """Load token from env, file, or database. Returns cleaned token or None."""
-        env_token = _clean_token(os.getenv("KITE_ACCESS_TOKEN", ""))
-        if env_token and len(env_token) >= 10:
-            return env_token
-
+        """Load token from the configured database first, then local file cache."""
         token_path = _get_token_path(self.settings)
 
-        # Try file first
+        # Try database first. With DATABASE_PROVIDER=supabase or SUPABASE_CONN_STR
+        # configured, client_factory returns SupabaseDatabaseClient.
+        try:
+            from src.data_manager.db.client_factory import get_database_client
+
+            db_client = get_database_client(self.settings)
+            db_client.connect()
+            try:
+                db_token = db_client.get_kite_access_token()
+            finally:
+                db_client.close()
+
+            access_token = _clean_token(str(db_token or ""))
+            if access_token and len(access_token) >= 10:
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(access_token, encoding="utf-8")
+                return access_token
+        except Exception:
+            pass
+
         if token_path.exists():
             try:
                 file_token = _clean_token(token_path.read_text(encoding="utf-8"))
@@ -72,24 +86,6 @@ class KiteClient:
                     return file_token
             except Exception:
                 pass
-
-        # Try database as fallback
-        try:
-            from src.data_manager.db.database_client import DatabaseClient
-            db_client = DatabaseClient(self.settings)
-            db_client.connect()
-            db_token = db_client.get_kite_access_token()
-            db_client.close()
-
-            if db_token:
-                access_token = _clean_token(str(db_token))
-                if access_token and len(access_token) >= 10:
-                    # Update file with token from database
-                    token_path.parent.mkdir(parents=True, exist_ok=True)
-                    token_path.write_text(access_token, encoding="utf-8")
-                    return access_token
-        except Exception:
-            pass
 
         return None
 

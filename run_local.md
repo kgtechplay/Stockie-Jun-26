@@ -4,20 +4,24 @@
 
 - Python virtual environment activated (`.venv`)
 - `.env` file present at repo root (copy from `.env.example` and fill in values)
-- Azure SQL database reachable
-- Kite access token refreshed for today (see step below if needed)
+- Supabase or Azure SQL database reachable
+- Kite access token refreshed for today in `KiteAccessToken` (see step below if needed)
 
 ## 1. Refresh Kite Access Token (once per trading day)
 
 ```powershell
-python scripts/daily_get_kite_access_token.py
+python scripts/daily/daily_get_kite_access_token.py
 ```
 
 If you already have the redirect URL from the Kite login flow:
 
 ```powershell
-python scripts/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
+python scripts/daily/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
 ```
+
+The token helper writes the access token to the configured database table
+`KiteAccessToken`. Local `kite_access_token.txt` writes are best-effort cache
+writes only, so Render/cron runs do not depend on local files.
 
 ## 2. Start the Flask App
 
@@ -131,5 +135,5 @@ Run `python scripts/populate_watched_instruments.py` and ensure `WatchedInstrume
 Run the daily market refresh to populate `UnderlyingSnapshot` and `UnderlyingCandle5m`:
 
 ```powershell
-python scripts/daily_market_refresh.py --lookback 90 --underlying RELIANCE
+python scripts/daily/daily_market_refresh.py --lookback 90 --underlying RELIANCE
 ```
