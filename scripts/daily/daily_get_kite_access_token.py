@@ -308,11 +308,15 @@ def wait_for_token_from_callback_or_url(page) -> None:
 def click_first_available(page, selectors: list[str]) -> None:
     for selector in selectors:
         target = page.locator(selector).first
-        if target.count() and target.is_visible():
+        if target.count() and target.is_visible() and target.is_enabled():
             target.click(no_wait_after=True)
             return
 
-    page.keyboard.press("Enter")
+    # If buttons exist but are all disabled/processing, the form likely auto-submitted
+    # (e.g. Kite auto-submits when all 6 TOTP digits are entered). Do nothing and let
+    # wait_for_token_from_callback_or_url detect the redirect.
+    if not any(page.locator(s).count() for s in selectors):
+        page.keyboard.press("Enter")
 
 
 def start_callback_server() -> ServerThread:
