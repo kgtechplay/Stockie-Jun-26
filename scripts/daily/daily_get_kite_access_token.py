@@ -215,6 +215,38 @@ def automate_kite_login(login_url: str) -> None:
         page = browser.new_page()
         page.set_default_timeout(PLAYWRIGHT_STEP_TIMEOUT_MS)
 
+        # Intercept the Kite callback redirect at the network layer so Playwright
+        # never tries to open a TCP connection to 127.0.0.1:5000 — which fails on
+        # some remote hosts (Render) giving chrome-error://chromewebdata/.
+        # Instead we extract request_token here and exchange it directly.
+        redirect_base = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}"
+
+        def _intercept_callback(route, request):
+            global latest_access_token
+            url = request.url
+            if "request_token=" in url:
+                request_token_val = parse_qs(urlparse(url).query).get("request_token", [None])[0]
+                if request_token_val:
+                    try:
+                        session_data = kite.generate_session(
+                            request_token=request_token_val, api_secret=API_SECRET
+                        )
+                        latest_access_token = session_data["access_token"]
+                        persist_access_token(latest_access_token)
+                        token_event.set()
+                        route.fulfill(
+                            status=200,
+                            content_type="text/html",
+                            body="<h3>Kite access token generated successfully.</h3>",
+                        )
+                        return
+                    except Exception as exc:
+                        route.fulfill(status=500, body=f"Token exchange error: {exc}")
+                        return
+            route.fulfill(status=200, body="OK")
+
+        page.route(lambda url: redirect_base in url, _intercept_callback)
+
         print("Opening Kite login page in browser.")
         page.goto(login_url, wait_until="domcontentloaded")
 
