@@ -204,6 +204,46 @@ class SupabaseDatabaseClient:
         self.conn.commit()
         return {"prepared": len(rows), "upserted": len(rows)}
 
+    # ---------- KITE ACCESS TOKEN ----------
+
+    def save_kite_access_token(self, access_token: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "KiteAccessToken" (
+                    id SERIAL PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("SELECT COUNT(*) FROM \"KiteAccessToken\"")
+            count = cur.fetchone()[0]
+            if count == 0:
+                cur.execute(
+                    "INSERT INTO \"KiteAccessToken\" (access_token) VALUES (%s)",
+                    (access_token,),
+                )
+            else:
+                cur.execute(
+                    "UPDATE \"KiteAccessToken\" SET access_token = %s, updated_at = now() "
+                    "WHERE id = (SELECT id FROM \"KiteAccessToken\" ORDER BY updated_at DESC LIMIT 1)",
+                    (access_token,),
+                )
+        self.conn.commit()
+
+    def get_kite_access_token(self) -> str | None:
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT access_token FROM \"KiteAccessToken\" ORDER BY updated_at DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip()
+            except Exception:
+                self.conn.rollback()
+        return None
+
 
 SUPABASE_CORE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS "WatchedInstrument" (
