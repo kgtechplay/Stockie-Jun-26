@@ -12,6 +12,11 @@ from src.technical_analysis.prediction.underlying_registry import (
     detect_regime,
     load_underlying_prediction_strategies,
 )
+from src.technical_analysis.prediction.features import compute_underlying_features
+from src.technical_analysis.prediction.aggregator import build_strategy_signals
+from src.technical_analysis.prediction.schema import UnderlyingView
+from src.technical_analysis.prediction.snapshot import build_feature_snapshot, build_regime_snapshot
+from src.technical_analysis.prediction.view import build_underlying_view
 
 REGIME_STRATEGY_GROUPS = {
     "TREND_UP": ["trendUpRangeBreakout"],
@@ -69,8 +74,32 @@ def get_underlying_strategy_predictions(
         fn = registry.get(name)
         if fn is None:
             continue
-        output[name] = fn(window)
+        prediction = str(fn(window)).strip().upper()
+        output[name] = prediction if prediction in {"CALL", "PUT", "NO_POSITION"} else "NO_POSITION"
     return output
+
+
+def get_underlying_strategy_details(
+    window: pd.Series | pd.DataFrame,
+    strategies: list[str] | None = None,
+) -> dict[str, Any]:
+    _ = strategies
+    return compute_underlying_features(window)
+
+
+def get_underlying_strategy_detail_map(
+    window: pd.Series | pd.DataFrame,
+    strategies: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    registry = load_underlying_prediction_strategies()
+    selected = strategies or sorted(registry.keys())
+    features = compute_underlying_features(window)
+    feature_columns = list(features.keys())
+    detail_map: dict[str, dict[str, Any]] = {}
+    for strategy_name in selected:
+        if strategy_name in registry:
+            detail_map[strategy_name] = {key: features.get(key) for key in feature_columns}
+    return detail_map
 
 
 def majority_vote(predictions: dict[str, str]) -> str:
@@ -92,7 +121,8 @@ def get_regime_strategy_columns(regime: str, strategy_columns: list[str]) -> lis
 
 
 def aggregate_underlying_decision(row: pd.Series, strategy_columns: list[str]) -> str:
-    selected_columns = get_regime_strategy_columns(str(row.get("regime", "")), strategy_columns)
+    regime_value = row.get("detected_regime", row.get("regime", ""))
+    selected_columns = get_regime_strategy_columns(str(regime_value), strategy_columns)
     predictions = {
         strategy: row.get(strategy)
         for strategy in selected_columns
@@ -157,5 +187,42 @@ def run_underlying_prediction(
         regime=regime,
         reasons=reasons,
         component_signals=ta_signals,
+    )
+
+
+def run_underlying_view_prediction(
+    instrument: str,
+    window: pd.Series | pd.DataFrame,
+    as_of: datetime,
+    strategies: list[str] | None = None,
+    sector_window: pd.Series | pd.DataFrame | None = None,
+    benchmark_window: pd.Series | pd.DataFrame | None = None,
+    sector_regime: str | None = None,
+    benchmark_regime: str | None = None,
+    ruleset_version: str = "v1",
+) -> UnderlyingView:
+    stock_regime = detect_regime(window)
+    per_strategy = get_underlying_strategy_predictions(window=window, strategies=strategies)
+    feature_snapshot = build_feature_snapshot(
+        symbol=instrument,
+        trade_date=as_of,
+        window=window,
+        sector_window=sector_window,
+        benchmark_window=benchmark_window,
+    )
+    regime_snapshot = build_regime_snapshot(
+        stock_regime=stock_regime,
+        sector_regime=sector_regime,
+        benchmark_regime=benchmark_regime,
+        regime_reasons=[f"Stock regime detected as {stock_regime}"],
+    )
+    strategy_signals = build_strategy_signals(per_strategy, feature_snapshot, regime_snapshot)
+    return build_underlying_view(
+        symbol=instrument,
+        trade_date=as_of.date().isoformat(),
+        stock_features=feature_snapshot,
+        regime_snapshot=regime_snapshot,
+        strategy_signals=strategy_signals,
+        ruleset_version=ruleset_version,
     )
 

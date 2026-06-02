@@ -17,6 +17,11 @@ from src.data_manager.underlying_history_reader import (
     fetch_index_daily,
     get_db_connection,
 )
+from src.technical_analysis.prediction.underlying_registry import (
+    DEFAULT_LOOKBACK_DAYS,
+    detect_regime,
+    load_underlying_prediction_strategies,
+)
 
 PRED_DIR = Path("output") / "historical"
 SIGNIFICANT_MOVE_THRESH = 0.01   # 1% — threshold for actual_move classification
@@ -26,10 +31,12 @@ STOP_LOSS_PCT = 0.005
 METADATA_COLUMNS = {
     "underlying",
     "date",
+    "today_volume",
     "next_date",
     "today_close",
     "next_open",
     "next_close",
+    "next_volume",
     "max_high_price",
     "min_low_price",
     "actual_move",
@@ -44,10 +51,12 @@ METADATA_COLUMNS = {
 _FIXED_COLS = [
     "underlying",
     "date",
+    "today_volume",
     "next_date",
     "today_close",
     "next_open",
     "next_close",
+    "next_volume",
     "max_high_price",
     "min_low_price",
     "actual_move",
@@ -86,6 +95,8 @@ def run_historical_underlying_backtest(request: HistoricalUnderlyingBacktestRequ
         for key, value in row_market.items():
             if key in enriched.columns:
                 enriched.at[idx, key] = value
+        if "detected_regime" in enriched.columns and pd.isna(enriched.at[idx, "detected_regime"]):
+            enriched.at[idx, "detected_regime"] = regime_for_date(market, date_value)
 
         actual_move, max_delta = compute_actual_move_and_delta(row_market)
         enriched.at[idx, "actual_move"] = actual_move
@@ -124,20 +135,24 @@ def validate_prediction_file(predictions: pd.DataFrame, path: Path) -> None:
 
 
 def get_prediction_columns(predictions: pd.DataFrame) -> list[str]:
-    columns = []
-    for column in predictions.columns:
-        if column in METADATA_COLUMNS:
-            continue
-        if column.endswith(("_result",)):
-            continue
-        if predictions[column].isin(["CALL", "PUT", "NO_POSITION"]).any():
-            columns.append(column)
+    strategy_names = set(load_underlying_prediction_strategies().keys())
+    columns = [column for column in predictions.columns if column in strategy_names]
+    if "aggregate_decision" in predictions.columns:
+        columns.append("aggregate_decision")
     return columns
 
 
 def ensure_backtest_columns(predictions: pd.DataFrame, strategy_columns: list[str]) -> pd.DataFrame:
     out = predictions.copy()
-    for column in ["today_close", "next_date", "next_open", "next_close",
+    if "volume" in out.columns and "today_volume" not in out.columns:
+        out["today_volume"] = out["volume"]
+    if "volume" in out.columns:
+        out = out.drop(columns=["volume"])
+    if "regime" in out.columns and "detected_regime" not in out.columns:
+        out["detected_regime"] = out["regime"]
+    if "regime" in out.columns:
+        out = out.drop(columns=["regime"])
+    for column in ["today_volume", "next_date", "next_open", "next_close", "next_volume",
                    "max_high_price", "min_low_price", "actual_move", "max_delta_pct",
                    "detected_regime", "next_day_move_pct", "market_data_error"]:
         if column not in out.columns:
@@ -203,21 +218,26 @@ def market_for_date(market: dict[str, Any], date_value: pd.Timestamp) -> dict[st
 
     next_date = next_map.get(date_value)
     today_close = float(daily_by_date.loc[date_value, "close_price"])
+    today_volume = _optional_int(daily_by_date.loc[date_value].get("volume"))
     if pd.isna(next_date) or next_date not in daily_by_date.index:
         return {
             **empty_market_data("No next trading day available"),
             "today_close": today_close,
+            "today_volume": today_volume,
         }
 
     next_row = daily_by_date.loc[next_date]
     next_open = float(next_row["open_price"])
     next_close = float(next_row["close_price"])
+    next_volume = _optional_int(next_row.get("volume"))
     candle = candles.get(pd.to_datetime(next_date).normalize(), {})
     return {
         "today_close": today_close,
+        "today_volume": today_volume,
         "next_date": pd.to_datetime(next_date).date().isoformat(),
         "next_open": next_open,
         "next_close": next_close,
+        "next_volume": next_volume,
         # directional move from open to close — used by evaluate_prediction NO_POSITION
         "next_day_move_pct": (next_close - next_open) / next_open if next_open else None,
         "max_high_price": candle.get("max_high_price"),
@@ -226,17 +246,46 @@ def market_for_date(market: dict[str, Any], date_value: pd.Timestamp) -> dict[st
     }
 
 
+def regime_for_date(market: dict[str, Any], date_value: pd.Timestamp) -> str:
+    daily = market.get("daily")
+    if daily is None or daily.empty:
+        return "UNKNOWN"
+    history = daily[daily["trade_date"] <= date_value].copy()
+    if history.empty:
+        return "UNKNOWN"
+    window = history.tail(DEFAULT_LOOKBACK_DAYS).copy()
+    if len(window) < DEFAULT_LOOKBACK_DAYS:
+        return "UNKNOWN"
+    return detect_regime(window)
+
+
 def empty_market_data(error: str) -> dict[str, Any]:
     return {
         "today_close": None,
+        "today_volume": None,
         "next_date": None,
         "next_open": None,
         "next_close": None,
+        "next_volume": None,
         "next_day_move_pct": None,
         "max_high_price": None,
         "min_low_price": None,
         "market_data_error": error,
     }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def compute_actual_move_and_delta(market: dict[str, Any]) -> tuple[str, float | None]:
@@ -304,20 +353,29 @@ def normalize_prediction(value: Any) -> str:
 def _reorder_columns(df: pd.DataFrame, strategy_columns: list[str]) -> pd.DataFrame:
     """
     Return df with columns in the canonical output order:
-      fixed prefix | aggregate_decision pair | remaining strategy pairs
+      fixed prefix | feature columns | regime/aggregate columns | strategy pairs
     Internal columns (next_day_move_pct, market_data_error) are dropped.
     """
-    strategy_pairs: list[str] = []
+    known_strategy_related = set(strategy_columns) | {f"{col}_result" for col in strategy_columns}
+    indicator_columns = [
+        c for c in df.columns
+        if c not in _FIXED_COLS
+        and c not in known_strategy_related
+        and c not in {"aggregate_decision", "aggregate_decision_result", "detected_regime"}
+        and c not in {"next_day_move_pct", "market_data_error"}
+    ]
+
+    ordered = [c for c in _FIXED_COLS if c in df.columns]
+    ordered += [c for c in indicator_columns if c not in ordered]
+    if "detected_regime" in df.columns and "detected_regime" not in ordered:
+        ordered.append("detected_regime")
     if "aggregate_decision" in strategy_columns:
-        strategy_pairs += ["aggregate_decision", "aggregate_decision_result", "detected_regime"]
+        ordered += [c for c in ["aggregate_decision", "aggregate_decision_result"] if c in df.columns]
     for col in sorted(strategy_columns):
         if col == "aggregate_decision":
             continue
-        strategy_pairs += [col, f"{col}_result"]
-
-    ordered = [c for c in _FIXED_COLS + strategy_pairs if c in df.columns]
+        ordered += [c for c in [col, f"{col}_result"] if c in df.columns]
     return df[ordered]
-
 
 def summarize_results(predictions: pd.DataFrame, strategy_columns: list[str]) -> dict[str, Any]:
     primary_column = "aggregate_decision" if "aggregate_decision" in strategy_columns else (

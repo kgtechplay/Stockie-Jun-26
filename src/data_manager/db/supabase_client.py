@@ -246,6 +246,55 @@ class SupabaseDatabaseClient:
         self.conn.commit()
         return {"prepared": len(rows), "updated": 0, "inserted": len(rows), "skipped_duplicates": 0}
 
+    # ---------- TRADING CALENDAR ----------
+
+    def upsert_trading_calendar(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "TradingCalendar" (
+                    calendar_date date NOT NULL,
+                    exchange varchar(10) NOT NULL,
+                    is_trading_day boolean NOT NULL DEFAULT false,
+                    is_weekly_expiry boolean NOT NULL DEFAULT false,
+                    is_monthly_expiry boolean NOT NULL DEFAULT false,
+                    is_special_session boolean NOT NULL DEFAULT false,
+                    notes text,
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    CONSTRAINT pk_trading_calendar PRIMARY KEY (calendar_date, exchange)
+                )
+            """)
+            execute_values(
+                cur,
+                """
+                INSERT INTO "TradingCalendar"
+                    (calendar_date, exchange, is_trading_day, is_weekly_expiry,
+                     is_monthly_expiry, is_special_session, notes)
+                VALUES %s
+                ON CONFLICT (calendar_date, exchange) DO UPDATE SET
+                    is_trading_day     = EXCLUDED.is_trading_day,
+                    is_weekly_expiry   = EXCLUDED.is_weekly_expiry,
+                    is_monthly_expiry  = EXCLUDED.is_monthly_expiry,
+                    is_special_session = EXCLUDED.is_special_session,
+                    notes              = EXCLUDED.notes,
+                    updated_at         = now()
+                """,
+                [
+                    (
+                        r["calendar_date"], r["exchange"],
+                        r["is_trading_day"], r["is_weekly_expiry"],
+                        r["is_monthly_expiry"], r["is_special_session"],
+                        r.get("notes"),
+                    )
+                    for r in rows
+                ],
+            )
+        self.conn.commit()
+        return len(rows)
+
     # ---------- KITE ACCESS TOKEN ----------
 
     def save_kite_access_token(self, access_token: str) -> None:

@@ -4,8 +4,8 @@ import pyodbc
 import pandas as pd
 from dotenv import load_dotenv
 
-from src.common.config import get_settings
-from src.data_manager.db.database_client import DatabaseClient
+from src.common.config import get_azure_sql_conn_str_variants, get_settings
+from src.data_manager.db.client_factory import get_database_client
 
 load_dotenv()
 
@@ -18,81 +18,87 @@ def get_db_connection() -> pyodbc.Connection:
             "AZURE_SQL_CONN_STR is not set in environment or .env file. "
             "Please set it in your .env file."
         )
-    return pyodbc.connect(conn_str)
+    last_error: Exception | None = None
+    for candidate in get_azure_sql_conn_str_variants(conn_str):
+        try:
+            return pyodbc.connect(candidate, timeout=10)
+        except pyodbc.Error as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("No valid Azure SQL connection string variants could be generated.")
 
 
 def get_active_underlyings(instrument_type: str | None = "INDEX") -> list[str]:
     """Return tradingsymbols of active watched instruments from WatchedInstrument."""
     settings = get_settings()
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
     try:
-        return db.get_active_underlyings(instrument_type=instrument_type)
+        watched = db.get_watched_instruments(instrument_type=instrument_type)
+        return [w.tradingsymbol for w in watched if w.is_active]
     finally:
         db.close()
 
 
 def fetch_index_daily(
-    conn: pyodbc.Connection,
-    snapshot_table: str = "dbo.UnderlyingSnapshot",
-    activity_table: str = "dbo.MarketActivityDaily",
+    conn,
+    snapshot_table: str | None = None,
+    activity_table: str | None = None,
     underlying: str = "NIFTY",
     start_date: str | None = None,
     end_date: str | None = None,
     join_activity: bool = True,
 ) -> pd.DataFrame:
-    """Fetch daily index rows, optionally enriched with futures activity proxies."""
-    where = ["s.underlying = ?"]
+    """Fetch daily index rows. Works with both pyodbc (Azure SQL) and psycopg2 (Supabase)."""
+    is_postgres = hasattr(conn, "cursor") and not hasattr(conn, "autocommit")
+    try:
+        import psycopg2
+        is_postgres = isinstance(conn, psycopg2.extensions.connection)
+    except ImportError:
+        pass
+
+    ph = "%s" if is_postgres else "?"
+    if snapshot_table is None:
+        snapshot_table = '"UnderlyingSnapshot"' if is_postgres else "dbo.UnderlyingSnapshot"
+    if activity_table is None:
+        activity_table = '"MarketActivityDaily"' if is_postgres else "dbo.MarketActivityDaily"
+
+    where = [f"s.underlying = {ph}"]
     params: list[object] = [underlying]
 
     if start_date:
-        where.append("s.trade_date >= ?")
+        where.append(f"s.trade_date >= {ph}")
         params.append(pd.to_datetime(start_date).date())
 
     if end_date:
-        where.append("s.trade_date <= ?")
+        where.append(f"s.trade_date <= {ph}")
         params.append(pd.to_datetime(end_date).date())
 
     where_clause = " AND ".join(where)
 
-    if join_activity:
+    # Supabase doesn't have MarketActivityDaily — fall back to no-join
+    if join_activity and not is_postgres:
         sql = f"""
         SELECT
-            s.trade_date,
-            s.open_price,
-            s.high_price,
-            s.low_price,
-            s.close_price,
-            s.volume,
-            m.expiry_date      AS fut_expiry_date,
-            m.close_price      AS fut_close_price,
-            m.settle_price     AS fut_settle_price,
-            m.underlying_price AS fut_underlying_price,
-            m.open_interest    AS fut_open_interest,
-            m.change_in_oi     AS fut_change_in_oi,
-            m.traded_volume    AS fut_traded_volume,
-            m.traded_value     AS fut_traded_value
+            s.trade_date, s.open_price, s.high_price, s.low_price, s.close_price, s.volume,
+            m.expiry_date AS fut_expiry_date, m.close_price AS fut_close_price,
+            m.settle_price AS fut_settle_price, m.underlying_price AS fut_underlying_price,
+            m.open_interest AS fut_open_interest, m.change_in_oi AS fut_change_in_oi,
+            m.traded_volume AS fut_traded_volume, m.traded_value AS fut_traded_value
         FROM {snapshot_table} s
         LEFT JOIN {activity_table} m
-          ON m.underlying = s.underlying
-         AND m.trade_date = s.trade_date
-         AND m.fin_instrm_tp = 'IDF'
-         AND m.tckr_symb = s.underlying
+          ON m.underlying = s.underlying AND m.trade_date = s.trade_date
+         AND m.fin_instrm_tp = 'IDF' AND m.tckr_symb = s.underlying
         WHERE {where_clause}
-        ORDER BY s.trade_date;
+        ORDER BY s.trade_date
         """
     else:
         sql = f"""
-        SELECT
-            s.trade_date,
-            s.open_price,
-            s.high_price,
-            s.low_price,
-            s.close_price,
-            s.volume
+        SELECT s.trade_date, s.open_price, s.high_price, s.low_price, s.close_price, s.volume
         FROM {snapshot_table} s
         WHERE {where_clause}
-        ORDER BY s.trade_date;
+        ORDER BY s.trade_date
         """
 
     df = pd.read_sql(sql, conn, params=params)
@@ -109,7 +115,7 @@ def fetch_index_daily(
 
 
 def fetch_5m_candles_for_dates(
-    conn: pyodbc.Connection,
+    conn,
     underlying: str,
     dates: list,
 ) -> pd.DataFrame:
@@ -126,14 +132,23 @@ def fetch_5m_candles_for_dates(
     if not unique_dates:
         return pd.DataFrame()
 
-    placeholders = ",".join(["?" for _ in unique_dates])
+    is_postgres = False
+    try:
+        import psycopg2
+        is_postgres = isinstance(conn, psycopg2.extensions.connection)
+    except ImportError:
+        pass
+
+    ph = "%s" if is_postgres else "?"
+    table = '"UnderlyingCandle5m"' if is_postgres else "dbo.UnderlyingCandle5m"
+    placeholders = ",".join([ph for _ in unique_dates])
     sql = f"""
         SELECT
             trade_date,
             MIN(low_price) AS min_low_price,
             MAX(high_price) AS max_high_price
-        FROM dbo.UnderlyingCandle5m
-        WHERE underlying = ?
+        FROM {table}
+        WHERE underlying = {ph}
           AND trade_date IN ({placeholders})
         GROUP BY trade_date
         ORDER BY trade_date

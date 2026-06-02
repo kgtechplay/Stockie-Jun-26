@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 from typing import Tuple, List, Dict, Any, Optional
 
 from src.common.config import Settings, get_settings
-from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.db.client_factory import get_database_client
 from src.data_manager.kite_client import KiteClient
 from src.data_manager.kite_option_snapshot_builder import (
     filter_options_for_underlyings,
@@ -29,7 +29,7 @@ def process_underlying_once(tradingsymbol: str, settings: Settings) -> Tuple[int
     kite_client = KiteClient(settings)
     kite_client.authenticate()
 
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
 
     # 1) fetch all NFO instruments
@@ -101,7 +101,7 @@ def fetch_option_trend_data(
     if settings is None:
         settings = get_settings()
 
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
     try:
         to_date = datetime.now()

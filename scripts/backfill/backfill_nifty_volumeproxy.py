@@ -40,7 +40,7 @@ sys.path.insert(0, str(project_root))
 load_dotenv()
 
 from src.common.config import get_settings
-from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.db.client_factory import get_database_client
 
 
 # -----------------------
@@ -365,7 +365,7 @@ def run_backfill_volumeproxy(
 
 def _underlyings_from_watched() -> list[str]:
     settings = get_settings()
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
     try:
         return db.get_active_underlyings(instrument_type="INDEX")

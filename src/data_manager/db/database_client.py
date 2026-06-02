@@ -6,7 +6,7 @@ import pyodbc
 
 logger = logging.getLogger(__name__)
 
-from src.common.config import Settings
+from src.common.config import Settings, get_azure_sql_conn_str_variants
 from src.common.models import StockInstrument, OptionInstrument, OptionData, WatchedInstrument
 
 
@@ -24,11 +24,17 @@ class DatabaseClient:
     def connect(self) -> None:
         if self._conn is None:
             try:
-                # For Azure SQL, we may need to add encryption and other parameters
-                # Try the connection string as-is first
-                self._conn = pyodbc.connect(self._conn_str, timeout=10)
-                # Set transaction isolation to READ COMMITTED to see latest data
-                self._conn.autocommit = True
+                last_error: pyodbc.Error | None = None
+                for candidate in get_azure_sql_conn_str_variants(self._conn_str):
+                    try:
+                        self._conn = pyodbc.connect(candidate, timeout=10)
+                        self._conn.autocommit = True
+                        return
+                    except pyodbc.Error as exc:
+                        last_error = exc
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("No valid Azure SQL connection string variants could be generated.")
             except pyodbc.Error as e:
                 error_msg = str(e)
                 suggestions = []
@@ -50,6 +56,9 @@ class DatabaseClient:
                     )
                     suggestions.append(
                         "3. Avoid wrapping the password in braces unless it contains semicolons."
+                    )
+                    suggestions.append(
+                        "4. If ODBC Driver 18 TLS negotiation fails on this machine, try TrustServerCertificate=yes."
                     )
 
                 if "Login failed for user" in error_msg or "18456" in error_msg or "28000" in error_msg:
@@ -76,6 +85,9 @@ class DatabaseClient:
                     )
                     suggestions.append(
                         "5. For Azure SQL, you may need to add: Encrypt=yes;TrustServerCertificate=no"
+                    )
+                    suggestions.append(
+                        "6. If the client SSL store is the issue, try TrustServerCertificate=yes."
                     )
 
                 raise RuntimeError(
@@ -528,14 +540,13 @@ class DatabaseClient:
         self, data_rows: Iterable[OptionData], batch_size: int = 1000
     ) -> None:
         """
-        Store OptionData rows into dbo.OptionSnapshot + dbo.OptionSnapshotCalc.
+        Store OptionData rows into dbo.OptionSnapshot.
 
         Strategy (all-batch, no row-by-row):
           1. executemany INSERT into OptionSnapshot (fast)
-          2. SELECT back the auto-generated IDs by (option_instrument_id, snapshot_time)
-          3. executemany INSERT into OptionSnapshotCalc using those IDs
 
-        IV / Greeks are already computed in the caller — no SQL computation needed.
+        OptionSnapshotCalc is intentionally calculated by
+        scripts/calculate_option_snapshot_calc.py.
         """
         data_list = list(data_rows)
         if not data_list:
@@ -568,60 +579,6 @@ class DatabaseClient:
                         for d in batch
                     ],
                 )
-
-                # Step 2: query back the IDs by (option_instrument_id, snapshot_time)
-                # We know the exact instrument_ids and time range we just inserted.
-                inst_ids = list({d.option_instrument_id for d in batch})
-                min_time = min(d.snapshot_time for d in batch)
-                max_time = max(d.snapshot_time for d in batch)
-
-                id_map: Dict[tuple, int] = {}
-                id_chunk_size = 1000
-                for i in range(0, len(inst_ids), id_chunk_size):
-                    id_chunk = inst_ids[i:i + id_chunk_size]
-                    placeholders = ",".join("?" for _ in id_chunk)
-                    cursor.execute(
-                        f"""
-                        SELECT id, option_instrument_id, snapshot_time
-                        FROM dbo.OptionSnapshot
-                        WHERE option_instrument_id IN ({placeholders})
-                          AND snapshot_time >= ? AND snapshot_time <= ?
-                        """,
-                        id_chunk + [min_time, max_time],
-                    )
-                    for row in cursor.fetchall():
-                        snap_t = row[2]
-                        if hasattr(snap_t, "tzinfo"):
-                            snap_t = snap_t.replace(tzinfo=None)
-                        id_map[(int(row[1]), snap_t)] = int(row[0])
-
-                # Step 3: batch-insert OptionSnapshotCalc
-                calc_rows = []
-                for d in batch:
-                    snap_t = d.snapshot_time
-                    if hasattr(snap_t, "tzinfo"):
-                        snap_t = snap_t.replace(tzinfo=None)
-                    snapshot_id = id_map.get((d.option_instrument_id, snap_t))
-                    if snapshot_id is not None:
-                        calc_rows.append((
-                            snapshot_id,
-                            d.implied_volatility,
-                            d.delta,
-                            d.gamma,
-                            d.theta,
-                            d.vega,
-                        ))
-
-                if calc_rows:
-                    cursor.executemany(
-                        """
-                        INSERT INTO dbo.OptionSnapshotCalc (
-                            option_snapshot_id,
-                            implied_volatility, delta, gamma, theta, vega
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        calc_rows,
-                    )
 
                 self.conn.commit()
 

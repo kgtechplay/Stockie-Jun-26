@@ -30,7 +30,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.common.config import get_settings
-from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.db.client_factory import get_database_client
 
 load_dotenv()
 
@@ -70,7 +70,7 @@ def _last_thursday_of_month(year: int, month: int, trading_days: Set[date]) -> d
 
 def build_calendar(start: date, end: date) -> None:
     settings = get_settings()
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
 
     print(f"Fetching NSE trading days ({start} to {end}) from exchange_calendars...")

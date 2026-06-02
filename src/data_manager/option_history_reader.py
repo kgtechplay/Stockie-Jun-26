@@ -30,7 +30,7 @@ import pandas as pd
 import pyodbc
 
 from src.common.config import get_settings
-from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.db.client_factory import get_database_client
 
 
 # -----------------------------
@@ -68,7 +68,7 @@ def _to_datestr(d) -> str:
 def get_active_underlyings(instrument_type: str | None = "INDEX") -> list[str]:
     """Return tradingsymbols of active watched instruments from WatchedInstrument."""
     settings = get_settings()
-    db = DatabaseClient(settings)
+    db = get_database_client(settings)
     db.connect()
     try:
         return db.get_active_underlyings(instrument_type=instrument_type)

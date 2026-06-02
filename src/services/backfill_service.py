@@ -5,12 +5,9 @@ from datetime import date, datetime
 from typing import Any
 
 from src.common.config import get_settings
-from src.data_manager.db.database_client import DatabaseClient
-from scripts.backfill.backfill_nifty_underlying import run_backfill_underlying
-from scripts.backfill.backfill_nifty_options import run_backfill_options
-from scripts.backfill.backfill_nifty_volumeproxy import run_backfill_volumeproxy
-from scripts.backfill.backfill_stocks_underlying import run_backfill_stocks_underlying
-from scripts.backfill.backfill_stocks_options import run_backfill_stocks_options
+from src.data_manager.db.client_factory import get_database_client
+from scripts.backfill.backfill_underlying import run_backfill_underlying_data
+from scripts.backfill.backfill_NIFTYoptions_from_historical import run_backfill_options_from_historical
 
 
 @dataclass
@@ -49,29 +46,26 @@ class BackfillService:
         results: dict[str, Any] = {}
 
         if index_symbols:
-            results["index_underlying"] = run_backfill_underlying(
+            results["index_underlying"] = run_backfill_underlying_data(
+                instrument_type="INDEX",
                 start_date=request.start_date,
                 end_date=request.end_date,
                 underlyings=index_symbols,
             )
-            results["index_options"] = run_backfill_options(
+            results["index_options"] = run_backfill_options_from_historical(
                 global_start=request.start_date,
                 global_end=request.end_date,
                 underlyings=index_symbols,
             )
-            results["index_volumeproxy"] = run_backfill_volumeproxy(
-                start_date=request.start_date,
-                end_date=request.end_date,
-                underlyings=index_symbols,
-            )
 
         if stock_symbols:
-            results["stock_underlying"] = run_backfill_stocks_underlying(
+            results["stock_underlying"] = run_backfill_underlying_data(
+                instrument_type="STOCK",
                 start_date=request.start_date,
                 end_date=request.end_date,
                 underlyings=stock_symbols,
             )
-            results["stock_options"] = run_backfill_stocks_options(
+            results["stock_options"] = run_backfill_options_from_historical(
                 global_start=request.start_date,
                 global_end=request.end_date,
                 underlyings=stock_symbols,
@@ -90,67 +84,37 @@ class BackfillService:
 
     def get_underlying_data_range(self, underlying: str) -> dict[str, Any]:
         symbol = self._clean_symbol(underlying)
-        db = DatabaseClient(get_settings())
+        db = get_database_client(get_settings())
         db.connect()
+        pg = getattr(db, "db_kind", "") == "postgres"
+        ph, snap, candle = ("%s", '"UnderlyingSnapshot"', '"UnderlyingCandle5m"') if pg else ("?", "dbo.UnderlyingSnapshot", "dbo.UnderlyingCandle5m")
         try:
-            daily = self._query_date_range(
-                db,
-                """
-                SELECT MIN(CAST(trade_date AS date)),
-                       MAX(CAST(trade_date AS date)),
-                       COUNT(1)
-                FROM dbo.UnderlyingSnapshot
-                WHERE underlying = ?
-                """,
-                [symbol],
-            )
-            intraday = self._query_date_range(
-                db,
-                """
-                SELECT MIN(CAST(trade_date AS date)),
-                       MAX(CAST(trade_date AS date)),
-                       COUNT(1)
-                FROM dbo.UnderlyingCandle5m
-                WHERE underlying = ?
-                """,
-                [symbol],
-            )
+            daily = self._query_date_range(db,
+                f"SELECT MIN(trade_date), MAX(trade_date), COUNT(1) FROM {snap} WHERE underlying = {ph}",
+                [symbol])
+            intraday = self._query_date_range(db,
+                f"SELECT MIN(trade_date), MAX(trade_date), COUNT(1) FROM {candle} WHERE underlying = {ph}",
+                [symbol])
         finally:
             db.close()
-
         return {"underlying": symbol, "daily": daily, "candles_5m": intraday}
 
     def get_options_data_range(self, underlying: str) -> dict[str, Any]:
         symbol = self._clean_symbol(underlying)
-        db = DatabaseClient(get_settings())
+        db = get_database_client(get_settings())
         db.connect()
+        pg = getattr(db, "db_kind", "") == "postgres"
+        ph, snap, inst = ("%s", '"OptionSnapshot"', '"OptionInstrument"') if pg else ("?", "dbo.OptionSnapshot", "dbo.OptionInstrument")
         try:
-            snapshots = self._query_date_range(
-                db,
-                """
-                SELECT MIN(CAST(s.snapshot_time AS date)),
-                       MAX(CAST(s.snapshot_time AS date)),
-                       COUNT(1)
-                FROM dbo.OptionSnapshot s
-                INNER JOIN dbo.OptionInstrument oi ON oi.id = s.option_instrument_id
-                WHERE oi.underlying = ?
-                """,
-                [symbol],
-            )
-            instruments = self._query_date_range(
-                db,
-                """
-                SELECT MIN(CAST(fetch_date AS date)),
-                       MAX(CAST(fetch_date AS date)),
-                       COUNT(1)
-                FROM dbo.OptionInstrument
-                WHERE underlying = ?
-                """,
-                [symbol],
-            )
+            snapshots = self._query_date_range(db,
+                f"SELECT MIN(s.trade_date), MAX(s.trade_date), COUNT(1) FROM {snap} s "
+                f"JOIN {inst} oi ON oi.id = s.option_instrument_id WHERE oi.underlying = {ph}",
+                [symbol])
+            instruments = self._query_date_range(db,
+                f"SELECT MIN(fetch_date), MAX(fetch_date), COUNT(1) FROM {inst} WHERE underlying = {ph}",
+                [symbol])
         finally:
             db.close()
-
         return {"underlying": symbol, "snapshots": snapshots, "instruments": instruments}
 
     # ------------------------------------------------------------------
@@ -161,13 +125,8 @@ class BackfillService:
         self,
         underlyings: list[str] | None,
     ) -> tuple[list[str], list[str]]:
-        """
-        Return (index_symbols, stock_symbols) by querying WatchedInstrument.
-        If `underlyings` is None, returns all active instruments.
-        If `underlyings` is provided, restricts to those symbols (case-insensitive).
-        """
         settings = get_settings()
-        tdb = DatabaseClient(settings)
+        tdb = get_database_client(settings)
         tdb.connect()
         try:
             all_index = tdb.get_watched_instruments(instrument_type="INDEX")
@@ -198,7 +157,7 @@ class BackfillService:
         return symbol
 
     @staticmethod
-    def _query_date_range(db: DatabaseClient, sql: str, params: list[Any]) -> dict[str, Any]:
+    def _query_date_range(db, sql: str, params: list[Any]) -> dict[str, Any]:
         cur = db.conn.cursor()
         cur.execute(sql, params)
         row = cur.fetchone()

@@ -3,14 +3,18 @@
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from src.technical_analysis.aggregator.underlying_aggregator import (
     PredictionOutput,
     add_aggregate_decision_column,
+    get_underlying_strategy_detail_map,
+    get_underlying_strategy_details,
     get_underlying_strategy_predictions,
     run_underlying_prediction,
+    run_underlying_view_prediction,
 )
 from src.technical_analysis.aggregator.option_aggregator import apply_option_selection
 from src.data_manager.option_history_reader import fetch_index_options_eod
@@ -21,10 +25,14 @@ from src.data_manager.underlying_history_reader import (
 from src.technical_analysis.selection.option_registry import (
     load_option_selection_strategies,
 )
+from src.technical_analysis.optionselection import select_option_strategy
+from src.technical_analysis.prediction.schema import UnderlyingView
 from src.technical_analysis.prediction.underlying_registry import (
     DEFAULT_LOOKBACK_DAYS,
+    detect_regime,
     load_underlying_prediction_strategies,
 )
+from src.technical_analysis.prediction.features import FEATURE_COLUMNS
 
 
 @dataclass
@@ -78,6 +86,51 @@ class PredictionService:
             as_of=as_of,
             strategies=strategies,
         )
+
+    def run_underlying_view(
+        self,
+        instrument: str,
+        strategies: list[str] | None,
+        as_of: datetime,
+    ):
+        conn = get_db_connection()
+        try:
+            window = self.get_underlying_window(
+                db_conn=conn,
+                instrument=instrument,
+                as_of=as_of,
+                lookback=self.default_lookback,
+            )
+        finally:
+            conn.close()
+        if window.empty:
+            raise ValueError(f"No underlying data available for {instrument} up to {as_of.date()}")
+
+        return run_underlying_view_prediction(
+            instrument=instrument.upper(),
+            window=window,
+            as_of=as_of,
+            strategies=strategies,
+        )
+
+    def select_option_for_underlying_view(
+        self,
+        underlying_view: UnderlyingView,
+        spot_price: float,
+        as_of_time: str | None = None,
+        atm_iv_history_90d: list[float] | None = None,
+    ):
+        conn = get_db_connection()
+        try:
+            return select_option_strategy(
+                db_client=conn,
+                underlying_view=underlying_view,
+                spot_price=spot_price,
+                as_of_time=as_of_time,
+                atm_iv_history_90d=atm_iv_history_90d,
+            )
+        finally:
+            conn.close()
 
     def run_reference_date_predictions(
         self,
@@ -153,16 +206,41 @@ class PredictionService:
             window=window_df,
             strategies=selected,
         )
+        detected_regime = detect_regime(window_df)
+        underlying_view = run_underlying_view_prediction(
+            instrument=instrument,
+            window=window_df,
+            as_of=datetime.combine(reference_date, time(hour=15, minute=15)),
+            strategies=selected,
+        )
         row: dict[str, object] = {
             "date": reference_date.isoformat(),
             "underlying": instrument,
+            "today_volume": _optional_int(window_df.iloc[-1].get("volume")),
+            "detected_regime": detected_regime,
+            "underlying_raw_signal": underlying_view.raw_signal,
+            "underlying_direction": underlying_view.direction,
+            "underlying_strength_score": underlying_view.strength_score,
+            "underlying_confidence": underlying_view.confidence,
+            "underlying_setup_type": underlying_view.setup_type,
+            "underlying_primary_strategy": underlying_view.primary_strategy,
+            "underlying_expected_move_pct": underlying_view.expected_move_pct,
+            "underlying_expected_move_abs": underlying_view.expected_move_abs,
+            "underlying_expected_holding_days": underlying_view.expected_holding_days,
+            "underlying_option_bias": underlying_view.option_bias,
+            "underlying_is_option_eligible": underlying_view.is_option_eligible,
         }
+        row.update(get_underlying_strategy_details(window=window_df, strategies=selected))
         for strategy in selected:
             row[strategy] = predictions.get(strategy, "NO_POSITION")
 
-        return add_aggregate_decision_column(
-            pd.DataFrame([row]),
-            strategy_columns=selected,
+        return self._order_prediction_columns(
+            add_aggregate_decision_column(
+                pd.DataFrame([row]),
+                strategy_columns=selected,
+            ),
+            selected,
+            detail_map=get_underlying_strategy_detail_map(window=window_df, strategies=selected),
         )
 
     def run_reference_date_predictions_for_symbols(
@@ -204,6 +282,27 @@ class PredictionService:
                 if window.empty:
                     raise ValueError(f"No underlying data available for {instrument} up to {reference_date}")
 
+                detected_regime = detect_regime(window)
+                underlying_view = run_underlying_view_prediction(
+                    instrument=instrument,
+                    window=window,
+                    as_of=as_of,
+                    strategies=selected,
+                )
+                row["today_volume"] = _optional_int(window.iloc[-1].get("volume"))
+                row["detected_regime"] = detected_regime
+                row["underlying_raw_signal"] = underlying_view.raw_signal
+                row["underlying_direction"] = underlying_view.direction
+                row["underlying_strength_score"] = underlying_view.strength_score
+                row["underlying_confidence"] = underlying_view.confidence
+                row["underlying_setup_type"] = underlying_view.setup_type
+                row["underlying_primary_strategy"] = underlying_view.primary_strategy
+                row["underlying_expected_move_pct"] = underlying_view.expected_move_pct
+                row["underlying_expected_move_abs"] = underlying_view.expected_move_abs
+                row["underlying_expected_holding_days"] = underlying_view.expected_holding_days
+                row["underlying_option_bias"] = underlying_view.option_bias
+                row["underlying_is_option_eligible"] = underlying_view.is_option_eligible
+                row.update(get_underlying_strategy_details(window=window, strategies=selected))
                 predictions = get_underlying_strategy_predictions(
                     window=window,
                     strategies=selected,
@@ -221,6 +320,12 @@ class PredictionService:
             pd.DataFrame(records),
             strategy_columns=selected,
         )
+        if records:
+            output_df = self._order_prediction_columns(
+                output_df,
+                selected,
+                detail_map=self._derive_detail_map_for_output(output_df, selected),
+            )
         records = output_df.to_dict(orient="records")
         output_file = self.save_reference_prediction_matrix(reference_date, output_df) if save_to_disk else None
 
@@ -313,20 +418,52 @@ class PredictionService:
                 window=window_df,
                 strategies=selected,
             )
+            detected_regime = detect_regime(window_df)
+            underlying_view = run_underlying_view_prediction(
+                instrument=instrument,
+                window=window_df,
+                as_of=datetime.combine(decision_date, time(hour=15, minute=15)),
+                strategies=selected,
+            )
             row: dict[str, object] = {
                 "date": decision_date.isoformat(),
                 "underlying": instrument,
+                "today_volume": _optional_int(df_daily.loc[i].get("volume")),
+                "detected_regime": detected_regime,
+                "underlying_raw_signal": underlying_view.raw_signal,
+                "underlying_direction": underlying_view.direction,
+                "underlying_strength_score": underlying_view.strength_score,
+                "underlying_confidence": underlying_view.confidence,
+                "underlying_setup_type": underlying_view.setup_type,
+                "underlying_primary_strategy": underlying_view.primary_strategy,
+                "underlying_expected_move_pct": underlying_view.expected_move_pct,
+                "underlying_expected_move_abs": underlying_view.expected_move_abs,
+                "underlying_expected_holding_days": underlying_view.expected_holding_days,
+                "underlying_option_bias": underlying_view.option_bias,
+                "underlying_is_option_eligible": underlying_view.is_option_eligible,
             }
+            row.update(get_underlying_strategy_details(window=window_df, strategies=selected))
             for strategy in selected:
                 row[strategy] = predictions.get(strategy, "NO_POSITION")
             records.append(row)
 
         if not records:
-            return pd.DataFrame(columns=["date", "underlying", *selected, "aggregate_decision"])
+            return pd.DataFrame(
+                columns=self._ordered_prediction_columns(selected, {}, base_columns=["date", "underlying"])
+            )
 
-        return add_aggregate_decision_column(
-            pd.DataFrame(records),
-            strategy_columns=selected,
+        return self._order_prediction_columns(
+            add_aggregate_decision_column(
+                pd.DataFrame(records),
+                strategy_columns=selected,
+            ),
+            selected,
+            detail_map=get_underlying_strategy_detail_map(
+                window=df_daily.loc[
+                    len(df_daily) - self.default_lookback : len(df_daily) - 1
+                ].copy(),
+                strategies=selected,
+            ),
         )
 
     def generate_predictions_for_strategy(
@@ -392,7 +529,9 @@ class PredictionService:
                     }
                 )
             else:
-                pred = ta_fn(window_df)
+                pred = str(ta_fn(window_df)).strip().upper()
+                if pred not in {"CALL", "PUT", "NO_POSITION"}:
+                    pred = "NO_POSITION"
                 records.append({"date": decision_date, "prediction": pred})
 
         return pd.DataFrame(records).sort_values("date").reset_index(drop=True)
@@ -521,4 +660,79 @@ class PredictionService:
             base_path.unlink()
 
         return strategy_filename
+
+    def _derive_detail_map_for_output(
+        self,
+        predictions_df: pd.DataFrame,
+        strategies: list[str],
+    ) -> dict[str, list[str]]:
+        detail_map: dict[str, list[str]] = {}
+        existing_columns = set(predictions_df.columns)
+        for strategy in strategies:
+            detail_map[strategy] = [column for column in self._detail_columns_for_strategy(strategy) if column in existing_columns]
+        return detail_map
+
+    def _detail_columns_for_strategy(self, strategy: str) -> list[str]:
+        _ = strategy
+        return FEATURE_COLUMNS
+
+    def _ordered_prediction_columns(
+        self,
+        strategies: list[str],
+        detail_map: dict[str, list[str]] | dict[str, dict[str, object]],
+        base_columns: list[str] | None = None,
+    ) -> list[str]:
+        ordered = list(base_columns or ["date", "underlying"])
+        for column in ["reference_date", "instrument", "status", "error", "today_volume"]:
+            if column not in ordered:
+                ordered.append(column)
+        seen = set(ordered)
+        detail_columns: list[str] = []
+        for strategy in strategies:
+            details = detail_map.get(strategy, [])
+            if isinstance(details, dict):
+                strategy_detail_columns = list(details.keys())
+            else:
+                strategy_detail_columns = list(details)
+            for column in strategy_detail_columns:
+                if column not in seen:
+                    detail_columns.append(column)
+                    seen.add(column)
+        ordered.extend(detail_columns)
+        if "detected_regime" not in seen:
+            ordered.append("detected_regime")
+            seen.add("detected_regime")
+        if "aggregate_decision" not in seen:
+            ordered.append("aggregate_decision")
+            seen.add("aggregate_decision")
+        for strategy in strategies:
+            if strategy not in seen:
+                ordered.append(strategy)
+                seen.add(strategy)
+        return ordered
+
+    def _order_prediction_columns(
+        self,
+        predictions_df: pd.DataFrame,
+        strategies: list[str],
+        detail_map: dict[str, list[str]] | dict[str, dict[str, object]],
+    ) -> pd.DataFrame:
+        base_columns = [column for column in ["date", "underlying", "reference_date", "instrument", "status", "error"] if column in predictions_df.columns]
+        ordered = self._ordered_prediction_columns(strategies, detail_map, base_columns=base_columns)
+        remaining = [column for column in predictions_df.columns if column not in ordered]
+        return predictions_df[[column for column in ordered if column in predictions_df.columns] + remaining]
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 

@@ -273,6 +273,13 @@ def json_safe(value: Any) -> Any:
 
 PAGE_TEMPLATE = r"""
 {% macro result_panel(headline, csv_rows, csv_columns, result, csv_download_url) -%}
+  {% set error_message = result.get('error') if result and result.get('error') else '' %}
+  {% if error_message %}
+    <div class="notice error">
+      <strong>Run failed.</strong><br>
+      {{ error_message }}
+    </div>
+  {% endif %}
   {% if headline %}
     <div class="metric-grid">
       {% for key, value in headline.items() %}
@@ -280,7 +287,7 @@ PAGE_TEMPLATE = r"""
       {% endfor %}
     </div>
   {% endif %}
-  {% if csv_rows %}
+  {% if csv_rows and not error_message %}
     <div class="result-toolbar">
       <div>
         <strong>CSV Preview</strong>
@@ -302,7 +309,7 @@ PAGE_TEMPLATE = r"""
         </tbody>
       </table>
     </div>
-  {% elif result %}
+  {% elif result and not error_message %}
     <div class="notice">No CSV preview available for this run.</div>
   {% else %}
     <div class="empty-state">

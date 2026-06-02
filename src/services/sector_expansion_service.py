@@ -12,7 +12,7 @@ from scripts.daily_optionInstrument_refresh import run_load_option_instruments
 from src.news_analysis.reviewList.output_schema import ReviewListOutput
 from src.common.config import get_settings
 from src.common.models import WatchedInstrument
-from src.data_manager.db.database_client import DatabaseClient
+from src.data_manager.db.client_factory import get_database_client
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -286,7 +286,7 @@ class SectorExpansionService:
         constituents_by_symbol: dict[str, SectorConstituent],
     ) -> list[WatchedInstrument]:
         settings = get_settings()
-        db = DatabaseClient(settings)
+        db = get_database_client(settings)
         db.connect()
         try:
             existing = db.get_watched_symbol_set(exchange="NSE", instrument_type="STOCK")

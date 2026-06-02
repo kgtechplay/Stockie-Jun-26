@@ -293,7 +293,7 @@ By default, historical prediction generates the last 60 days.
 Schema before backtest:
 
 ```text
-date,underlying,<strategy_1>,<strategy_2>,...,aggregate_decision
+date,underlying,today_volume,<indicator_columns>,detected_regime,aggregate_decision,<strategy_1>,<strategy_2>,...
 ```
 
 The same backtest can also process a single-date prediction file from `PredictionService`:
@@ -309,11 +309,15 @@ For each date row, the backtest enriches with next-day market data and classifie
 **Output column order:**
 
 ```text
-underlying, date, next_date, today_close, next_open, next_close,
+underlying, date, today_volume,
+next_date, today_close, next_open, next_close, next_volume,
 max_high_price, min_low_price, actual_move, max_delta_pct,
-aggregate_decision, aggregate_decision_result, detected_regime,
+<indicator_columns grouped before their strategy>,
+detected_regime, aggregate_decision, aggregate_decision_result,
 <strategy_1>, <strategy_1_result>, ...
 ```
+
+`today_volume` comes from `dbo.UnderlyingSnapshot.volume` for the signal date. `next_volume` is the next trading day's daily volume.
 
 **actual_move classification** (two-sided threshold against `next_open`):
 
