@@ -204,6 +204,48 @@ class SupabaseDatabaseClient:
         self.conn.commit()
         return {"prepared": len(rows), "upserted": len(rows)}
 
+    def upsert_underlying_candles_5m(
+        self,
+        rows: list[tuple[str, date, datetime, float, float, float, float, "int | None"]],
+    ) -> dict[str, int]:
+        if not rows:
+            return {"prepared": 0, "updated": 0, "inserted": 0, "skipped_duplicates": 0}
+        from psycopg2.extras import execute_values
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "UnderlyingCandle5m" (
+                    underlying varchar(50) NOT NULL,
+                    trade_date date NOT NULL,
+                    candle_time timestamp NOT NULL,
+                    open_price double precision NOT NULL,
+                    high_price double precision NOT NULL,
+                    low_price double precision NOT NULL,
+                    close_price double precision NOT NULL,
+                    volume bigint,
+                    CONSTRAINT pk_underlying_candle_5m PRIMARY KEY (underlying, candle_time)
+                )
+            """)
+            execute_values(
+                cur,
+                """
+                INSERT INTO "UnderlyingCandle5m"
+                    (underlying, trade_date, candle_time, open_price, high_price,
+                     low_price, close_price, volume)
+                VALUES %s
+                ON CONFLICT (underlying, candle_time) DO UPDATE SET
+                    trade_date = EXCLUDED.trade_date,
+                    open_price = EXCLUDED.open_price,
+                    high_price = EXCLUDED.high_price,
+                    low_price = EXCLUDED.low_price,
+                    close_price = EXCLUDED.close_price,
+                    volume = EXCLUDED.volume
+                """,
+                rows,
+            )
+        self.conn.commit()
+        return {"prepared": len(rows), "updated": 0, "inserted": len(rows), "skipped_duplicates": 0}
+
     # ---------- KITE ACCESS TOKEN ----------
 
     def save_kite_access_token(self, access_token: str) -> None:
