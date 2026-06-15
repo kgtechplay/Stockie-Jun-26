@@ -1,16 +1,15 @@
 # scripts/export_option_snapshots_to_excel.py
 """
-Export NIFTY option snapshot history for a token CSV into an Excel workbook.
+Export NIFTY option snapshot history into an Excel workbook.
 
-Input CSV format, no header. Both orders are accepted:
+Optional token CSV format, no header. Both orders are accepted:
     instrument_token,tradingsymbol
     tradingsymbol,instrument_token
 
-Each token is queried from OptionInstrument/OptionSnapshot/OptionSnapshotCalc.
-By default, the "close" option snapshot is exported, with the NIFTY close
-price for that trade date. If older rows do not have snapshot_label populated,
-the query falls back to exact 15:15:00 rows. Each token gets one worksheet
-named after its tradingsymbol.
+Rows are queried from Supabase/Postgres tables:
+OptionInstrument, OptionSnapshot, OptionSnapshotCalc, and UnderlyingSnapshot.
+Historical and live rows are merged by instrument + trade_date + snapshot label,
+preferring live Kite quotes when both sources are present.
 """
 
 import argparse
@@ -32,6 +31,7 @@ from src.data_manager.db.client_factory import get_database_client
 load_dotenv()
 
 DEFAULT_COLUMNS = [
+    "option_snapshot_id",
     "option_instrument_id",
     "instrument_token",
     "underlying",
@@ -40,9 +40,13 @@ DEFAULT_COLUMNS = [
     "expiry",
     "instrument_type",
     "snapshot_time",
+    "snapshot_label",
     "trade_date",
+    "data_source",
     "nifty_close_price",
     "option_price",
+    "bid_price",
+    "ask_price",
     "volume",
     "open_interest",
     "implied_volatility",
@@ -52,45 +56,115 @@ DEFAULT_COLUMNS = [
     "vega",
 ]
 
-QUERY = """
+POSTGRES_QUERY = """
+WITH ranked_snapshots AS (
+    SELECT
+        os.id AS option_snapshot_id,
+        oi.id AS option_instrument_id,
+        oi.instrument_token,
+        oi.underlying,
+        oi.tradingsymbol,
+        oi.strike,
+        oi.expiry,
+        oi.instrument_type,
+        os.snapshot_time,
+        CASE
+            WHEN os.snapshot_label IS NULL
+             AND os.snapshot_time::time = TIME '15:15:00'
+                THEN 'CLOSE_1515'
+            ELSE os.snapshot_label
+        END AS snapshot_label,
+        os.trade_date,
+        os.data_source,
+        us.close_price AS nifty_close_price,
+        os.last_price AS option_price,
+        os.bid_price,
+        os.ask_price,
+        os.volume,
+        os.open_interest,
+        osc.implied_volatility,
+        osc.delta,
+        osc.gamma,
+        osc.theta,
+        osc.vega,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                oi.id,
+                os.trade_date,
+                CASE
+                    WHEN os.snapshot_label IS NULL
+                     AND os.snapshot_time::time = TIME '15:15:00'
+                        THEN 'CLOSE_1515'
+                    ELSE os.snapshot_label
+                END
+            ORDER BY
+                CASE
+                    WHEN os.data_source = 'KITE_QUOTE_LIVE' THEN 0
+                    WHEN os.data_source = 'KITE_HISTORICAL_5M_CLOSE_PROXY' THEN 1
+                    ELSE 2
+                END,
+                os.snapshot_time DESC,
+                os.id DESC
+        ) AS source_rank
+    FROM "OptionInstrument" oi
+    JOIN "OptionSnapshot" os
+      ON os.option_instrument_id = oi.id
+    LEFT JOIN "OptionSnapshotCalc" osc
+      ON osc.option_snapshot_id = os.id
+    LEFT JOIN "UnderlyingSnapshot" us
+      ON us.underlying = oi.underlying
+     AND us.trade_date = os.trade_date
+    WHERE oi.underlying = %(underlying)s
+      AND (%(instrument_token)s IS NULL OR oi.instrument_token = %(instrument_token)s)
+      AND os.trade_date >= %(start_date)s
+      AND os.trade_date <= %(end_date)s
+      AND os.data_source IN ('KITE_QUOTE_LIVE', 'KITE_HISTORICAL_5M_CLOSE_PROXY')
+      AND (
+          %(snapshot_label)s = 'all'
+          OR (
+              %(snapshot_label)s = 'close'
+              AND (
+                  UPPER(COALESCE(os.snapshot_label, '')) = 'CLOSE_1515'
+                  OR (
+                      os.snapshot_label IS NULL
+                      AND os.snapshot_time::time = TIME '15:15:00'
+                  )
+              )
+          )
+          OR (
+              %(snapshot_label)s = 'open'
+              AND UPPER(COALESCE(os.snapshot_label, '')) = 'OPEN_0915'
+          )
+          OR LOWER(COALESCE(os.snapshot_label, '')) = %(snapshot_label)s
+      )
+)
 SELECT
-    oi.id AS option_instrument_id,
-    oi.instrument_token,
-    oi.underlying,
-    oi.tradingsymbol,
-    oi.strike,
-    oi.expiry,
-    oi.instrument_type,
-    os.snapshot_time,
-    os.snapshot_label,
-    CAST(os.snapshot_time AS DATE) AS trade_date,
-    us.close_price AS nifty_close_price,
-    os.last_price AS option_price,
-    os.volume,
-    os.open_interest,
-    osc.implied_volatility,
-    osc.delta,
-    osc.gamma,
-    osc.theta,
-    osc.vega
-FROM dbo.OptionInstrument oi
-JOIN dbo.OptionSnapshot os
-    ON os.option_instrument_id = oi.id
-LEFT JOIN dbo.OptionSnapshotCalc osc
-    ON osc.option_snapshot_id = os.id
-LEFT JOIN dbo.UnderlyingSnapshot us
-    ON us.underlying = oi.underlying
-   AND us.trade_date = CAST(os.snapshot_time AS DATE)
-WHERE oi.instrument_token = ?
-  AND oi.underlying = ?
-  AND (
-      LOWER(COALESCE(os.snapshot_label, '')) = LOWER(?)
-      OR (LOWER(?) = 'close' AND UPPER(COALESCE(os.snapshot_label, '')) = 'CLOSE_1515')
-      OR (os.snapshot_label IS NULL AND CAST(os.snapshot_time AS TIME) = '15:15:00')
-  )
-  AND os.snapshot_time >= ?
-  AND os.snapshot_time < DATEADD(DAY, 1, ?)
-ORDER BY os.snapshot_time;
+    option_snapshot_id,
+    option_instrument_id,
+    instrument_token,
+    underlying,
+    tradingsymbol,
+    strike,
+    expiry,
+    instrument_type,
+    snapshot_time,
+    snapshot_label,
+    trade_date,
+    data_source,
+    nifty_close_price,
+    option_price,
+    bid_price,
+    ask_price,
+    volume,
+    open_interest,
+    implied_volatility,
+    delta,
+    gamma,
+    theta,
+    vega
+FROM ranked_snapshots
+WHERE source_rank = 1
+ORDER BY trade_date, snapshot_label, expiry, strike, instrument_type, tradingsymbol;
 """
 
 
@@ -130,15 +204,15 @@ def sheet_name_for(symbol: str, used: set[str]) -> str:
 
 
 def export_option_snapshots(
-    tokens_csv: Path,
+    tokens_csv: Path | None,
     output_xlsx: Path,
     start_date: date,
     end_date: date,
     underlying: str = "NIFTY",
-    snapshot_label: str = "close",
+    snapshot_label: str = "all",
 ) -> dict[str, object]:
-    tokens = read_tokens(tokens_csv)
-    if not tokens:
+    tokens = read_tokens(tokens_csv) if tokens_csv else []
+    if tokens_csv and not tokens:
         raise ValueError(f"No tokens found in {tokens_csv}")
 
     output_xlsx.parent.mkdir(parents=True, exist_ok=True)
@@ -150,45 +224,77 @@ def export_option_snapshots(
     try:
         with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
             used_sheet_names: set[str] = set()
-            for instrument_token, tradingsymbol in tokens:
+            if not tokens:
                 df = pd.read_sql_query(
-                    QUERY,
+                    POSTGRES_QUERY,
                     db.conn,
-                    params=[instrument_token, underlying, snapshot_label, snapshot_label, start_date, end_date],
+                    params={
+                        "instrument_token": None,
+                        "underlying": underlying,
+                        "snapshot_label": snapshot_label.lower(),
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    },
                 )
                 if df.empty:
                     df = pd.DataFrame(columns=DEFAULT_COLUMNS)
-                sheet_name = sheet_name_for(tradingsymbol, used_sheet_names)
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                sheet_counts[tradingsymbol] = len(df)
-                print(f"{tradingsymbol}: {len(df)} rows")
+                df.to_excel(writer, sheet_name="NIFTY", index=False)
+                sheet_counts["NIFTY"] = len(df)
+                print(f"NIFTY: {len(df)} rows")
+            else:
+                for instrument_token, tradingsymbol in tokens:
+                    df = pd.read_sql_query(
+                        POSTGRES_QUERY,
+                        db.conn,
+                        params={
+                            "instrument_token": instrument_token,
+                            "underlying": underlying,
+                            "snapshot_label": snapshot_label.lower(),
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        },
+                    )
+                    if df.empty:
+                        df = pd.DataFrame(columns=DEFAULT_COLUMNS)
+                    sheet_name = sheet_name_for(tradingsymbol, used_sheet_names)
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    sheet_counts[tradingsymbol] = len(df)
+                    print(f"{tradingsymbol}: {len(df)} rows")
     finally:
         db.close()
 
     return {
-        "tokens_csv": str(tokens_csv),
+        "tokens_csv": str(tokens_csv) if tokens_csv else None,
         "output_xlsx": str(output_xlsx),
         "underlying": underlying,
         "snapshot_label": snapshot_label,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "tabs": len(tokens),
+        "tabs": len(tokens) if tokens else 1,
         "rows_by_tradingsymbol": sheet_counts,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export NIFTY option snapshots for token CSV to Excel.")
-    parser.add_argument("--tokens-csv", required=True, help="CSV with instrument_token,tradingsymbol rows")
+    parser.add_argument(
+        "--tokens-csv",
+        default=None,
+        help="Optional CSV with instrument_token,tradingsymbol rows. If omitted, exports all matching rows.",
+    )
     parser.add_argument("--output", required=True, help="Output .xlsx path")
     parser.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     parser.add_argument("--underlying", default="NIFTY", help="Underlying filter, default NIFTY")
-    parser.add_argument("--snapshot-label", default="close", help="Snapshot label to export, default close")
+    parser.add_argument(
+        "--snapshot-label",
+        default="all",
+        help="Snapshot label to export: all, close, open, or an exact label. Default: all",
+    )
     args = parser.parse_args()
 
     result = export_option_snapshots(
-        tokens_csv=Path(args.tokens_csv),
+        tokens_csv=Path(args.tokens_csv) if args.tokens_csv else None,
         output_xlsx=Path(args.output),
         start_date=date.fromisoformat(args.start),
         end_date=date.fromisoformat(args.end),
