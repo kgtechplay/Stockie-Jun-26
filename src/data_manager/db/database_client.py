@@ -542,10 +542,13 @@ class DatabaseClient:
         """
         Store OptionData rows into dbo.OptionSnapshot.
 
-        Strategy (all-batch, no row-by-row):
-          1. executemany INSERT into OptionSnapshot (fast)
+        Uses UPDATE-then-INSERT upsert keyed on (option_instrument_id, trade_date,
+        snapshot_label) to match the unique constraint added in migration 002.
 
-        OptionSnapshotCalc is intentionally calculated by
+        trade_date is derived from snapshot_time. snapshot_label defaults to
+        CLOSE_1515 and data_source to KITE_QUOTE_LIVE for this legacy write path.
+
+        OptionSnapshotCalc is calculated separately by
         scripts/calculate_option_snapshot_calc.py.
         """
         data_list = list(data_rows)
@@ -553,33 +556,56 @@ class DatabaseClient:
             return
 
         cursor = self.conn.cursor()
-        cursor.fast_executemany = True
+
+        upsert_sql = """
+            UPDATE dbo.OptionSnapshot
+            SET snapshot_time   = ?,
+                underlying_price = ?,
+                last_price       = ?,
+                bid_price        = ?,
+                bid_qty          = ?,
+                ask_price        = ?,
+                ask_qty          = ?,
+                volume           = ?,
+                open_interest    = ?,
+                data_source      = ?
+            WHERE option_instrument_id = ?
+              AND trade_date           = ?
+              AND snapshot_label       = ?;
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                INSERT INTO dbo.OptionSnapshot (
+                    option_instrument_id, snapshot_time,
+                    underlying_price, last_price,
+                    bid_price, bid_qty, ask_price, ask_qty,
+                    volume, open_interest,
+                    trade_date, snapshot_label, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            END
+        """
 
         try:
             for batch_start in range(0, len(data_list), batch_size):
                 batch = data_list[batch_start:batch_start + batch_size]
-
-                # Step 1: batch-insert OptionSnapshot
-                cursor.executemany(
-                    """
-                    INSERT INTO dbo.OptionSnapshot (
-                        option_instrument_id, snapshot_time,
-                        underlying_price, last_price,
-                        bid_price, bid_qty, ask_price, ask_qty,
-                        volume, open_interest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            d.option_instrument_id, d.snapshot_time,
-                            d.underlying_price, d.last_price,
-                            d.bid_price, d.bid_qty, d.ask_price, d.ask_qty,
-                            d.volume, d.open_interest,
-                        )
-                        for d in batch
-                    ],
-                )
-
+                for d in batch:
+                    trade_date = d.snapshot_time.date()
+                    snapshot_label = "CLOSE_1515"
+                    data_source = "KITE_QUOTE_LIVE"
+                    update_params = [
+                        d.snapshot_time, d.underlying_price, d.last_price,
+                        d.bid_price, d.bid_qty, d.ask_price, d.ask_qty,
+                        d.volume, d.open_interest, data_source,
+                        d.option_instrument_id, trade_date, snapshot_label,
+                    ]
+                    insert_params = [
+                        d.option_instrument_id, d.snapshot_time,
+                        d.underlying_price, d.last_price,
+                        d.bid_price, d.bid_qty, d.ask_price, d.ask_qty,
+                        d.volume, d.open_interest,
+                        trade_date, snapshot_label, data_source,
+                    ]
+                    cursor.execute(upsert_sql, update_params + insert_params)
                 self.conn.commit()
 
         except Exception as e:
@@ -588,6 +614,116 @@ class DatabaseClient:
             raise
         finally:
             cursor.close()
+
+    def upsert_underlying_prediction_daily(self, rows: list[dict]) -> int:
+        """
+        Persist UnderlyingView rows to dbo.UnderlyingPredictionDaily.
+
+        Each dict must have at minimum: symbol, trade_date, raw_signal, direction.
+        All other fields are optional and default to None.
+        Upsert key: (symbol, trade_date).
+        """
+        if not rows:
+            return 0
+
+        import json
+
+        cursor = self.conn.cursor()
+        sql = """
+            MERGE dbo.UnderlyingPredictionDaily AS tgt
+            USING (SELECT ? AS symbol, ? AS trade_date) AS src
+                ON tgt.symbol = src.symbol AND tgt.trade_date = src.trade_date
+            WHEN MATCHED THEN UPDATE SET
+                raw_signal                    = ?,
+                direction                     = ?,
+                stock_regime                  = ?,
+                sector_regime                 = ?,
+                benchmark_regime              = ?,
+                primary_strategy              = ?,
+                setup_type                    = ?,
+                strength_score                = ?,
+                confidence                    = ?,
+                expected_move_pct             = ?,
+                expected_move_abs             = ?,
+                expected_holding_days         = ?,
+                atr14                         = ?,
+                volatility_20d                = ?,
+                volume_ratio                  = ?,
+                relative_strength_vs_sector   = ?,
+                relative_strength_vs_benchmark = ?,
+                stock_technical_score         = ?,
+                sector_confirmation_score     = ?,
+                benchmark_confirmation_score  = ?,
+                relative_strength_score       = ?,
+                volume_confirmation_score     = ?,
+                risk_quality_score            = ?,
+                regime_quality_score          = ?,
+                option_bias                   = ?,
+                is_option_eligible            = ?,
+                reasons_json                  = ?,
+                warnings_json                 = ?,
+                strategy_signals_json         = ?,
+                ruleset_version               = ?
+            WHEN NOT MATCHED THEN INSERT (
+                symbol, trade_date,
+                raw_signal, direction,
+                stock_regime, sector_regime, benchmark_regime,
+                primary_strategy, setup_type,
+                strength_score, confidence,
+                expected_move_pct, expected_move_abs, expected_holding_days,
+                atr14, volatility_20d, volume_ratio,
+                relative_strength_vs_sector, relative_strength_vs_benchmark,
+                stock_technical_score, sector_confirmation_score,
+                benchmark_confirmation_score, relative_strength_score,
+                volume_confirmation_score, risk_quality_score, regime_quality_score,
+                option_bias, is_option_eligible,
+                reasons_json, warnings_json, strategy_signals_json, ruleset_version
+            ) VALUES (
+                ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?, ?, ?
+            );
+        """
+        try:
+            for r in rows:
+                symbol = r["symbol"]
+                trade_date = r["trade_date"]
+                common = [
+                    r.get("raw_signal"), r.get("direction"),
+                    r.get("stock_regime"), r.get("sector_regime"), r.get("benchmark_regime"),
+                    r.get("primary_strategy"), r.get("setup_type"),
+                    r.get("strength_score"), r.get("confidence"),
+                    r.get("expected_move_pct"), r.get("expected_move_abs"), r.get("expected_holding_days"),
+                    r.get("atr14"), r.get("volatility_20d"), r.get("volume_ratio"),
+                    r.get("relative_strength_vs_sector"), r.get("relative_strength_vs_benchmark"),
+                    r.get("stock_technical_score"), r.get("sector_confirmation_score"),
+                    r.get("benchmark_confirmation_score"), r.get("relative_strength_score"),
+                    r.get("volume_confirmation_score"), r.get("risk_quality_score"), r.get("regime_quality_score"),
+                    r.get("option_bias"), 1 if r.get("is_option_eligible") else 0,
+                    json.dumps(r["reasons"]) if r.get("reasons") is not None else None,
+                    json.dumps(r["warnings"]) if r.get("warnings") is not None else None,
+                    json.dumps(r["strategy_signals"]) if r.get("strategy_signals") is not None else None,
+                    r.get("ruleset_version"),
+                ]
+                cursor.execute(sql, [symbol, trade_date] + common + [symbol, trade_date] + common)
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"upsert_underlying_prediction_daily failed: {e}")
+            self.conn.rollback()
+            raise
+        finally:
+            cursor.close()
+        return len(rows)
 
     def fetch_option_data(
         self,

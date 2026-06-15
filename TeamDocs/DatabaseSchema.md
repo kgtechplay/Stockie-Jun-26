@@ -27,6 +27,7 @@ Main migration: `src/data_manager/db/migrations/001_create_trading_system_tables
 | Instrument reference | `StockDB`, `WatchedInstrument`, `OptionInstrument` | Stores the universe of stocks, indices, and option contracts that the system can track. |
 | Market data | `UnderlyingSnapshot`, `UnderlyingCandle5m`, `OptionSnapshot`, `OptionSnapshotCalc`, `OptionCandle5m`, `MarketActivityDaily` | Stores daily/intraday prices, option-chain snapshots, Greeks, IV, volume, and OI context. |
 | Calendar | `TradingCalendar` | Stores exchange trading days, holidays, and expiry markers. |
+| Prediction output | `UnderlyingViewDaily` | Stores the daily per-symbol underlying prediction view (direction, score, regime, expected move, option bias). |
 | Signal engine | `SignalFeatureDaily`, `SignalPrediction`, `SignalBacktestLabel`, `ModelRun` | Stores features, predictions, labels, and model run metadata. |
 | News / macro / events | `MacroFactorDaily`, `NewsEvent`, `CorporateEventCalendar` | Stores external context used by InstrumentWatcher and prediction features. |
 | Option trade selection | `OptionTradePlan`, `OptionPaperTradeResult` | Stores selected option trades and paper-trade outcomes. |
@@ -55,8 +56,9 @@ Main migration: `src/data_manager/db/migrations/001_create_trading_system_tables
 | `OptionInstrument` | Active | Option contract reference data. | Maps Kite option tokens to underlying/expiry/strike/type. |
 | `UnderlyingSnapshot` | Active | Daily OHLCV per watched underlying. | Daily price snapshots/features. |
 | `UnderlyingCandle5m` | Active | 5-minute OHLCV per watched underlying. | Intraday features, labels, backtests. |
-| `OptionSnapshot` | Active | Raw option quote snapshots. | Option chain state, price, OI, bid/ask, volume. |
-| `OptionSnapshotCalc` | Active | IV and Greeks per option snapshot. | Option selection and analytics. |
+| `OptionSnapshot` | Active | Raw option quote snapshots with `snapshot_label`, `trade_date`, `data_source`. | Option chain state, price, OI, bid/ask, volume per slot. |
+| `OptionSnapshotCalc` | Active | IV, Greeks, and enriched calc fields per option snapshot. | Option selection and analytics. |
+| `UnderlyingViewDaily` | Active | Daily underlying prediction view per symbol. | Stores `UnderlyingView` outputs (direction, score, regime, option bias). |
 | `MarketActivityDaily` | Active | Near-month futures/OI/volume proxy data. | Derivative activity and volume/OI features. |
 | `TradingCalendar` | Active | Trading day and expiry calendar. | Trading-day aware refresh/backtest scheduling. |
 | `KiteAccessToken` | Active | Latest Kite access token. | Kite API authentication. |
@@ -202,13 +204,13 @@ Purpose: intraday technical analysis, label creation, stop/target testing, and r
 
 ### `dbo.OptionSnapshot`
 
-Raw option market snapshot table.
+Raw option market snapshot table. Schema was expanded in migration `002_revamp_option_snapshot_tables.sql`.
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `INT/BIGINT IDENTITY PK` | Internal snapshot id. |
 | `option_instrument_id` | `INT/BIGINT FK` | Reference to `OptionInstrument.id`. |
-| `snapshot_time` | `DATETIME2` | Snapshot timestamp. |
+| `snapshot_time` | `DATETIME2` | Exact timestamp of the quote capture. |
 | `underlying_price` | `FLOAT` | Underlying price at snapshot time. |
 | `last_price` | `FLOAT` | Option last traded price. |
 | `bid_price` | `FLOAT` | Best bid price. |
@@ -217,23 +219,49 @@ Raw option market snapshot table.
 | `ask_qty` | `INT` | Best ask quantity. |
 | `volume` | `BIGINT/INT` | Option volume. |
 | `open_interest` | `BIGINT/INT` | Option open interest. |
+| `trade_date` | `DATE` | Trading date for the snapshot (derived from `snapshot_time`). |
+| `snapshot_label` | `VARCHAR(20)` | Canonical slot label: `OPEN_0915`, `CLOSE_1515`, or ad-hoc `LIVE_HHMM`. |
+| `exchange_timestamp` | `DATETIME2` | Exchange-reported timestamp from Kite quote. |
+| `last_trade_time` | `DATETIME2` | Last trade time from Kite quote. |
+| `last_quantity` | `INT` | Last traded quantity. |
+| `average_price` | `FLOAT` | Average traded price. |
+| `buy_quantity` | `BIGINT` | Total pending buy quantity. |
+| `sell_quantity` | `BIGINT` | Total pending sell quantity. |
+| `oi_day_high` | `BIGINT` | Day-high open interest. |
+| `oi_day_low` | `BIGINT` | Day-low open interest. |
+| `bid_orders` | `INT` | Number of bid orders at best bid. |
+| `ask_orders` | `INT` | Number of ask orders at best ask. |
+| `data_source` | `VARCHAR(40/50)` | Source of the data: `KITE_QUOTE_LIVE` or `KITE_HISTORICAL_5M_CLOSE_PROXY`. |
 
-Purpose: option-chain state at selected times. Current scripts target two snapshots per day, around `09:15` and `15:15`.
+Unique constraint: `(option_instrument_id, trade_date, snapshot_label)`.
+
+Purpose: option-chain state at two scheduled slots per trading day (`OPEN_0915` at 09:15 and `CLOSE_1515` at 15:15). Live Kite quotes (`KITE_QUOTE_LIVE`) are preferred over historical 5-minute close proxies (`KITE_HISTORICAL_5M_CLOSE_PROXY`) when both sources are present for the same slot.
 
 ### `dbo.OptionSnapshotCalc`
 
-Calculated analytics for each option snapshot.
+Calculated analytics for each option snapshot. Schema was expanded in migration `002_revamp_option_snapshot_tables.sql`.
 
 | Column | Type | Description |
 |---|---|---|
-| `option_snapshot_id` | `INT/BIGINT FK` | Reference to `OptionSnapshot.id`. |
-| `implied_volatility` | `FLOAT` | Calculated IV. |
+| `option_snapshot_id` | `INT/BIGINT FK PK` | Reference to `OptionSnapshot.id`. |
+| `implied_volatility` | `FLOAT` | Calculated IV (Black-Scholes). |
 | `delta` | `FLOAT` | Option delta. |
 | `gamma` | `FLOAT` | Option gamma. |
 | `theta` | `FLOAT` | Option theta. |
 | `vega` | `FLOAT` | Option vega. |
+| `valuation_price` | `FLOAT` | Model-derived theoretical option price. |
+| `intrinsic_value` | `FLOAT` | Intrinsic value (max(S-K, 0) for CE; max(K-S, 0) for PE). |
+| `time_value` | `FLOAT` | Time value (price minus intrinsic value). |
+| `mid_price` | `FLOAT` | Mid-price from bid/ask. |
+| `spread_width` | `FLOAT` | Absolute bid-ask spread. |
+| `spread_width_pct` | `FLOAT` | Spread as a percentage of mid-price. |
+| `days_to_expiry` | `FLOAT` | Calendar days to expiry at snapshot time. |
+| `risk_free_rate` | `FLOAT` | Risk-free rate used for calculation. |
+| `calculation_status` | `VARCHAR(30)` | `OK`, `NON_OK`, or error code. |
+| `calculation_error` | `VARCHAR(500)` | Error message if calculation failed. |
+| `created_at` | `DATETIME2` | Calculation timestamp. |
 
-Purpose: option selection, strategy scoring, and volatility analysis.
+Purpose: option selection, strategy scoring, and volatility analysis. Written by `scripts/daily/calculate_option_snapshot_calc.py` after each snapshot capture.
 
 ### `dbo.OptionCandle5m`
 
@@ -537,6 +565,53 @@ Paper-trade outcome for an option trade plan.
 | `return_pct` | `FLOAT` | Return percentage. |
 | `created_at` | `DATETIME2` | Creation timestamp. |
 
+## Underlying Prediction Output Table
+
+### `dbo.UnderlyingViewDaily`
+
+Daily per-symbol underlying prediction view. Created by migration `003_create_underlying_view_daily.sql`.
+
+| Column | Type | Description |
+|---|---|---|
+| `view_id` | `BIGINT IDENTITY PK` | Internal row id. |
+| `symbol` | `VARCHAR(50)` | Symbol (e.g. `NIFTY`, `BANKNIFTY`, `RELIANCE`). |
+| `trade_date` | `DATE` | Trading date for this view. |
+| `raw_signal` | `VARCHAR(30)` | `CALL`, `PUT`, or `NO_POSITION`. |
+| `direction` | `VARCHAR(30)` | `BULLISH`, `BEARISH`, or `NEUTRAL`. |
+| `stock_regime` | `VARCHAR(30)` | Detected stock regime: `TREND_UP`, `TREND_DOWN`, `RANGE`, `CHOPPY`, `UNKNOWN`. |
+| `sector_regime` | `VARCHAR(30)` | Detected sector regime, if available. |
+| `benchmark_regime` | `VARCHAR(30)` | Detected benchmark (e.g. NIFTY 50) regime, if available. |
+| `primary_strategy` | `VARCHAR(100)` | Name of the highest-scoring aligned strategy. |
+| `setup_type` | `VARCHAR(100)` | Setup classification: `TREND_UP_PULLBACK_LONG`, `TREND_UP_BREAKOUT_LONG`, `TREND_DOWN_RALLY_SHORT`, `TREND_DOWN_BREAKDOWN_SHORT`, `RANGE_LOWER_BAND_LONG`, `RANGE_UPPER_BAND_SHORT`, `NO_SETUP`. |
+| `strength_score` | `DECIMAL(10,4)` | Composite score 0–100. |
+| `confidence` | `VARCHAR(20)` | `HIGH` (≥80), `MEDIUM` (65–79), or `LOW` (<65). |
+| `expected_move_pct` | `DECIMAL(10,6)` | Estimated expected move as a percentage of spot. |
+| `expected_move_abs` | `DECIMAL(18,4)` | Estimated expected move in absolute price terms. |
+| `expected_holding_days` | `INT` | Intended trade holding period in days. |
+| `atr14` | `DECIMAL(18,4)` | 14-day ATR at signal date. |
+| `volatility_20d` | `DECIMAL(10,6)` | 20-day realized volatility. |
+| `volume_ratio` | `DECIMAL(10,4)` | Day volume divided by 20-day average volume. |
+| `relative_strength_vs_sector` | `DECIMAL(10,6)` | Stock return minus sector return over 20 days. |
+| `relative_strength_vs_benchmark` | `DECIMAL(10,6)` | Stock return minus benchmark return over 20 days. |
+| `stock_technical_score` | `DECIMAL(10,4)` | Score component: MA/RSI technical structure (max 25). |
+| `sector_confirmation_score` | `DECIMAL(10,4)` | Score component: sector regime alignment (max 15). |
+| `benchmark_confirmation_score` | `DECIMAL(10,4)` | Score component: benchmark regime alignment (max 10). |
+| `relative_strength_score` | `DECIMAL(10,4)` | Score component: outperformance vs sector/benchmark (max 15). |
+| `volume_confirmation_score` | `DECIMAL(10,4)` | Score component: volume participation (max 10). |
+| `risk_quality_score` | `DECIMAL(10,4)` | Score component: ATR/reward-risk quality (max 10). |
+| `regime_quality_score` | `DECIMAL(10,4)` | Score component: regime alignment quality (max 15). |
+| `option_bias` | `VARCHAR(50)` | `BULLISH_STRONG`, `BULLISH_MODERATE`, `BEARISH_STRONG`, `BEARISH_MODERATE`, or `NEUTRAL`. |
+| `is_option_eligible` | `BIT` | Whether the view meets the minimum bar for option trade selection. |
+| `reasons_json` | `NVARCHAR(MAX)` | JSON array of human-readable explanation strings. |
+| `warnings_json` | `NVARCHAR(MAX)` | JSON array of warning strings. |
+| `strategy_signals_json` | `NVARCHAR(MAX)` | JSON array of per-strategy signal objects for auditability. |
+| `ruleset_version` | `VARCHAR(50)` | Scoring ruleset version (e.g. `v1`). |
+| `created_at` | `DATETIME2` | Row creation timestamp. |
+
+Unique constraint: `(symbol, trade_date)`.
+
+Written by: `db.upsert_underlying_view_daily()` after `build_underlying_view()` produces an `UnderlyingView` object.
+
 ## Live Trading Placeholder Tables
 
 ### `dbo.LiveOrder`
@@ -662,6 +737,7 @@ SignalFeatureDaily
 | `OptionSnapshotCalc` | Same as `OptionSnapshot`; calculated during option data ingestion. |
 | `MarketActivityDaily` | `scripts/backfill/backfill_nifty_volumeproxy.py`. |
 | `TradingCalendar` | `scripts/build_trading_calendar.py`. |
+| `UnderlyingViewDaily` | `DatabaseClient.upsert_underlying_view_daily()`, `SupabaseDatabaseClient.upsert_underlying_view_daily()`. Written after `build_underlying_view()` produces an `UnderlyingView`. |
 | `KiteAccessToken` | `scripts/daily/daily_get_kite_access_token.py`, `DatabaseClient.save_kite_access_token()`, `SupabaseDatabaseClient.save_kite_access_token()`. |
 
 ## Source Files
@@ -670,6 +746,8 @@ SignalFeatureDaily
 |---|---|
 | `src/data_manager/db/database_client.py` | Main SQL client and active insert/query methods. |
 | `src/data_manager/db/migrations/001_create_trading_system_tables.sql` | Idempotent migration for signal/trading/planned tables and views. |
+| `src/data_manager/db/migrations/002_revamp_option_snapshot_tables.sql` | Adds `trade_date`, `snapshot_label`, `data_source` and enriched calc columns to `OptionSnapshot`/`OptionSnapshotCalc`. Destructive — clears both tables. |
+| `src/data_manager/db/migrations/003_create_underlying_view_daily.sql` | Creates `UnderlyingViewDaily` table (SQL Server). Idempotent. |
 | `src/common/models.py` | Dataclass models for instruments, option data, signals, and trade plans. |
 | `src/data_manager/option_history_reader.py` | Reads option, underlying, and market activity history for analysis. |
 | `src/data_manager/underlying_history_reader.py` | Reads underlying daily and 5-minute history. |

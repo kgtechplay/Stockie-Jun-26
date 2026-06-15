@@ -473,6 +473,17 @@ def run_backfill_underlying_data(
         print("UnderlyingCandle5m upsert complete.")
 
     db.close()
+
+    feature_summary: dict = {}
+    if include_daily and snapshot_summary.get("inserted", 0) + snapshot_summary.get("updated", 0) > 0:
+        from scripts.daily.calculate_underlying_features import run_calculate_underlying_features
+        print("\nComputing underlying features for newly ingested snapshots...")
+        feature_summary = run_calculate_underlying_features(
+            start_date=start_date,
+            end_date=end_date,
+            underlyings=target_underlyings,
+        )
+
     print(f"{instrument_type} underlying backfill done.")
     return {
         "underlyings": target_underlyings,
@@ -480,6 +491,7 @@ def run_backfill_underlying_data(
         "end_date": end_date.isoformat(),
         "daily": snapshot_summary,
         "candles_5m": candle_summary,
+        "signal_features": feature_summary,
     }
 
 

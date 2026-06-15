@@ -139,12 +139,20 @@ def run_supabase_daily_market_refresh(
     finally:
         db.close()
 
+    from scripts.daily.calculate_underlying_features import run_calculate_underlying_features
+    feature_summary = run_calculate_underlying_features(
+        start_date=start_date,
+        end_date=end_date,
+        underlyings=["NIFTY"],
+    )
+
     return {
         "provider": "supabase",
         "underlyings": ["NIFTY"],
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "underlying_snapshot": summary,
+        "signal_features": feature_summary,
     }
 
 

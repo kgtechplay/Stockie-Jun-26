@@ -322,6 +322,245 @@ class SupabaseDatabaseClient:
                 )
         self.conn.commit()
 
+    def bulk_insert_option_snapshots(
+        self,
+        rows: list[dict],
+        batch_size: int = 500,
+    ) -> int:
+        """
+        Upsert option snapshot rows into Supabase "OptionSnapshot".
+
+        Each dict must have: option_instrument_id, snapshot_time, trade_date,
+        snapshot_label. All other fields are optional.
+        Upsert key: (option_instrument_id, trade_date, snapshot_label).
+        """
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        with self.conn.cursor() as cur:
+            for batch_start in range(0, len(rows), batch_size):
+                batch = rows[batch_start : batch_start + batch_size]
+                values = [
+                    (
+                        r["option_instrument_id"],
+                        r["snapshot_time"],
+                        r.get("underlying_price"),
+                        r.get("last_price"),
+                        r.get("bid_price"),
+                        r.get("bid_qty"),
+                        r.get("ask_price"),
+                        r.get("ask_qty"),
+                        r.get("volume"),
+                        r.get("open_interest"),
+                        r["trade_date"],
+                        r["snapshot_label"],
+                        r.get("exchange_timestamp"),
+                        r.get("last_trade_time"),
+                        r.get("last_quantity"),
+                        r.get("average_price"),
+                        r.get("buy_quantity"),
+                        r.get("sell_quantity"),
+                        r.get("oi_day_high"),
+                        r.get("oi_day_low"),
+                        r.get("bid_orders"),
+                        r.get("ask_orders"),
+                        r.get("data_source"),
+                    )
+                    for r in batch
+                ]
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO "OptionSnapshot" (
+                        option_instrument_id, snapshot_time,
+                        underlying_price, last_price,
+                        bid_price, bid_qty, ask_price, ask_qty,
+                        volume, open_interest,
+                        trade_date, snapshot_label,
+                        exchange_timestamp, last_trade_time, last_quantity,
+                        average_price, buy_quantity, sell_quantity,
+                        oi_day_high, oi_day_low, bid_orders, ask_orders,
+                        data_source
+                    )
+                    VALUES %s
+                    ON CONFLICT (option_instrument_id, trade_date, snapshot_label)
+                    DO UPDATE SET
+                        snapshot_time    = EXCLUDED.snapshot_time,
+                        underlying_price = EXCLUDED.underlying_price,
+                        last_price       = EXCLUDED.last_price,
+                        bid_price        = EXCLUDED.bid_price,
+                        bid_qty          = EXCLUDED.bid_qty,
+                        ask_price        = EXCLUDED.ask_price,
+                        ask_qty          = EXCLUDED.ask_qty,
+                        volume           = EXCLUDED.volume,
+                        open_interest    = EXCLUDED.open_interest,
+                        exchange_timestamp = EXCLUDED.exchange_timestamp,
+                        last_trade_time  = EXCLUDED.last_trade_time,
+                        last_quantity    = EXCLUDED.last_quantity,
+                        average_price    = EXCLUDED.average_price,
+                        buy_quantity     = EXCLUDED.buy_quantity,
+                        sell_quantity    = EXCLUDED.sell_quantity,
+                        oi_day_high      = EXCLUDED.oi_day_high,
+                        oi_day_low       = EXCLUDED.oi_day_low,
+                        bid_orders       = EXCLUDED.bid_orders,
+                        ask_orders       = EXCLUDED.ask_orders,
+                        data_source      = EXCLUDED.data_source
+                    """,
+                    values,
+                )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_underlying_prediction_daily(self, rows: list[dict]) -> int:
+        """
+        Persist UnderlyingView rows to Supabase "UnderlyingPredictionDaily".
+
+        Each dict must have at minimum: symbol, trade_date, raw_signal, direction.
+        Upsert key: (symbol, trade_date).
+        """
+        if not rows:
+            return 0
+        import json
+        from psycopg2.extras import execute_values
+
+        with self.conn.cursor() as cur:
+            values = [
+                (
+                    r["symbol"],
+                    r["trade_date"],
+                    r.get("raw_signal"),
+                    r.get("direction"),
+                    r.get("stock_regime"),
+                    r.get("sector_regime"),
+                    r.get("benchmark_regime"),
+                    r.get("primary_strategy"),
+                    r.get("setup_type"),
+                    r.get("strength_score"),
+                    r.get("confidence"),
+                    r.get("expected_move_pct"),
+                    r.get("expected_move_abs"),
+                    r.get("expected_holding_days"),
+                    r.get("atr14"),
+                    r.get("volatility_20d"),
+                    r.get("volume_ratio"),
+                    r.get("relative_strength_vs_sector"),
+                    r.get("relative_strength_vs_benchmark"),
+                    r.get("stock_technical_score"),
+                    r.get("sector_confirmation_score"),
+                    r.get("benchmark_confirmation_score"),
+                    r.get("relative_strength_score"),
+                    r.get("volume_confirmation_score"),
+                    r.get("risk_quality_score"),
+                    r.get("regime_quality_score"),
+                    r.get("option_bias"),
+                    bool(r.get("is_option_eligible", False)),
+                    json.dumps(r["reasons"]) if r.get("reasons") is not None else None,
+                    json.dumps(r["warnings"]) if r.get("warnings") is not None else None,
+                    json.dumps(r["strategy_signals"]) if r.get("strategy_signals") is not None else None,
+                    r.get("ruleset_version"),
+                )
+                for r in rows
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO "UnderlyingPredictionDaily" (
+                    symbol, trade_date,
+                    raw_signal, direction,
+                    stock_regime, sector_regime, benchmark_regime,
+                    primary_strategy, setup_type,
+                    strength_score, confidence,
+                    expected_move_pct, expected_move_abs, expected_holding_days,
+                    atr14, volatility_20d, volume_ratio,
+                    relative_strength_vs_sector, relative_strength_vs_benchmark,
+                    stock_technical_score, sector_confirmation_score,
+                    benchmark_confirmation_score, relative_strength_score,
+                    volume_confirmation_score, risk_quality_score, regime_quality_score,
+                    option_bias, is_option_eligible,
+                    reasons_json, warnings_json, strategy_signals_json, ruleset_version
+                )
+                VALUES %s
+                ON CONFLICT ON CONSTRAINT uq_underlying_prediction_daily DO UPDATE SET
+                    raw_signal                     = EXCLUDED.raw_signal,
+                    direction                      = EXCLUDED.direction,
+                    stock_regime                   = EXCLUDED.stock_regime,
+                    sector_regime                  = EXCLUDED.sector_regime,
+                    benchmark_regime               = EXCLUDED.benchmark_regime,
+                    primary_strategy               = EXCLUDED.primary_strategy,
+                    setup_type                     = EXCLUDED.setup_type,
+                    strength_score                 = EXCLUDED.strength_score,
+                    confidence                     = EXCLUDED.confidence,
+                    expected_move_pct              = EXCLUDED.expected_move_pct,
+                    expected_move_abs              = EXCLUDED.expected_move_abs,
+                    expected_holding_days          = EXCLUDED.expected_holding_days,
+                    atr14                          = EXCLUDED.atr14,
+                    volatility_20d                 = EXCLUDED.volatility_20d,
+                    volume_ratio                   = EXCLUDED.volume_ratio,
+                    relative_strength_vs_sector    = EXCLUDED.relative_strength_vs_sector,
+                    relative_strength_vs_benchmark = EXCLUDED.relative_strength_vs_benchmark,
+                    stock_technical_score          = EXCLUDED.stock_technical_score,
+                    sector_confirmation_score      = EXCLUDED.sector_confirmation_score,
+                    benchmark_confirmation_score   = EXCLUDED.benchmark_confirmation_score,
+                    relative_strength_score        = EXCLUDED.relative_strength_score,
+                    volume_confirmation_score      = EXCLUDED.volume_confirmation_score,
+                    risk_quality_score             = EXCLUDED.risk_quality_score,
+                    regime_quality_score           = EXCLUDED.regime_quality_score,
+                    option_bias                    = EXCLUDED.option_bias,
+                    is_option_eligible             = EXCLUDED.is_option_eligible,
+                    reasons_json                   = EXCLUDED.reasons_json,
+                    warnings_json                  = EXCLUDED.warnings_json,
+                    strategy_signals_json          = EXCLUDED.strategy_signals_json,
+                    ruleset_version                = EXCLUDED.ruleset_version
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_signal_features(self, rows: list[dict]) -> int:
+        """
+        Persist feature rows to "SignalFeatureDaily".
+
+        Each dict must have: signal_date, symbol. All feature columns are optional.
+        Upsert key: (signal_date, symbol, feature_version).
+        """
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "signal_date", "symbol", "feature_version",
+            "close_1515", "open_915", "high_day", "low_day", "volume_day",
+            "ma10", "ma20", "ma50", "ma90",
+            "rsi14", "atr14",
+            "bb_upper", "bb_middle", "bb_lower", "bb_width",
+            "ret_5d", "ret_20d", "ret_60d",
+            "volatility_20d", "volume_ratio", "trend_efficiency_60d",
+            "relative_strength_vs_sector",
+            "ma20_slope", "ma50_slope", "ma20_50_crossovers_20d",
+            "recent_high_20d", "recent_low_20d", "range_position_20d",
+            "regime",
+        ]
+        update_cols = [c for c in cols if c not in ("signal_date", "symbol", "feature_version")]
+        set_clause = ",\n                        ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+        with self.conn.cursor() as cur:
+            values = [tuple(r.get(c, "v1" if c == "feature_version" else None) for c in cols) for r in rows]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "SignalFeatureDaily" ({", ".join(cols)}, updated_at)
+                VALUES %s
+                ON CONFLICT ON CONSTRAINT uq_signal_feature_daily DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                [v + (None,) for v in values],
+            )
+        self.conn.commit()
+        return len(rows)
+
     def get_kite_access_token(self) -> str | None:
         with self.conn.cursor() as cur:
             try:
@@ -444,4 +683,91 @@ CREATE TABLE IF NOT EXISTS "OptionSnapshotCalc" (
     calculation_error varchar(500),
     created_at timestamp NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS "SignalFeatureDaily" (
+    feature_id bigserial PRIMARY KEY,
+    signal_date date NOT NULL,
+    symbol varchar(50) NOT NULL,
+    feature_version varchar(50) NOT NULL DEFAULT 'v1',
+    close_1515 double precision,
+    open_915 double precision,
+    high_day double precision,
+    low_day double precision,
+    volume_day bigint,
+    ma10 double precision,
+    ma20 double precision,
+    ma50 double precision,
+    ma90 double precision,
+    rsi14 double precision,
+    atr14 double precision,
+    bb_upper double precision,
+    bb_middle double precision,
+    bb_lower double precision,
+    bb_width double precision,
+    ret_5d double precision,
+    ret_20d double precision,
+    ret_60d double precision,
+    volatility_20d double precision,
+    volume_ratio double precision,
+    trend_efficiency_60d double precision,
+    relative_strength_vs_sector double precision,
+    ma20_slope double precision,
+    ma50_slope double precision,
+    ma20_50_crossovers_20d integer,
+    recent_high_20d double precision,
+    recent_low_20d double precision,
+    range_position_20d double precision,
+    regime varchar(30),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz,
+    CONSTRAINT uq_signal_feature_daily UNIQUE (signal_date, symbol, feature_version)
+);
+
+CREATE INDEX IF NOT EXISTS ix_signal_feature_daily_symbol_date
+    ON "SignalFeatureDaily" (symbol, signal_date);
+CREATE INDEX IF NOT EXISTS ix_signal_feature_daily_regime
+    ON "SignalFeatureDaily" (signal_date, regime);
+
+CREATE TABLE IF NOT EXISTS "UnderlyingPredictionDaily" (
+    prediction_id bigserial PRIMARY KEY,
+    symbol varchar(50) NOT NULL,
+    trade_date date NOT NULL,
+    raw_signal varchar(30) NOT NULL,
+    direction varchar(30) NOT NULL,
+    stock_regime varchar(30),
+    sector_regime varchar(30),
+    benchmark_regime varchar(30),
+    primary_strategy varchar(100),
+    setup_type varchar(100),
+    strength_score numeric(10,4),
+    confidence varchar(20),
+    expected_move_pct numeric(10,6),
+    expected_move_abs numeric(18,4),
+    expected_holding_days integer,
+    atr14 numeric(18,4),
+    volatility_20d numeric(10,6),
+    volume_ratio numeric(10,4),
+    relative_strength_vs_sector numeric(10,6),
+    relative_strength_vs_benchmark numeric(10,6),
+    stock_technical_score numeric(10,4),
+    sector_confirmation_score numeric(10,4),
+    benchmark_confirmation_score numeric(10,4),
+    relative_strength_score numeric(10,4),
+    volume_confirmation_score numeric(10,4),
+    risk_quality_score numeric(10,4),
+    regime_quality_score numeric(10,4),
+    option_bias varchar(50),
+    is_option_eligible boolean NOT NULL DEFAULT false,
+    reasons_json text,
+    warnings_json text,
+    strategy_signals_json text,
+    ruleset_version varchar(50),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT uq_underlying_prediction_daily UNIQUE (symbol, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS ix_underlying_prediction_daily_trade_date
+    ON "UnderlyingPredictionDaily" (trade_date, is_option_eligible, symbol);
+CREATE INDEX IF NOT EXISTS ix_underlying_prediction_daily_symbol_date
+    ON "UnderlyingPredictionDaily" (symbol, trade_date);
 """

@@ -1,13 +1,22 @@
 -- ============================================================
--- Migration 003: UnderlyingViewDaily
+-- Migration 003: UnderlyingPredictionDaily + SignalFeatureDaily
 -- Target: Azure SQL Server (dbo schema)
 -- Safe to run multiple times.
 -- ============================================================
 
-IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'UnderlyingViewDaily' AND schema_id = SCHEMA_ID('dbo'))
+-- Rename old table if it was created under the previous name
+IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'UnderlyingViewDaily' AND schema_id = SCHEMA_ID('dbo'))
+    AND NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'UnderlyingPredictionDaily' AND schema_id = SCHEMA_ID('dbo'))
 BEGIN
-    CREATE TABLE dbo.UnderlyingViewDaily (
-        view_id BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EXEC sp_rename 'dbo.UnderlyingViewDaily', 'UnderlyingPredictionDaily';
+END
+
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'UnderlyingPredictionDaily' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+    CREATE TABLE dbo.UnderlyingPredictionDaily (
+        prediction_id BIGINT IDENTITY(1,1) PRIMARY KEY,
         symbol VARCHAR(50) NOT NULL,
         trade_date DATE NOT NULL,
 
@@ -52,21 +61,21 @@ BEGIN
 
         created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
 
-        CONSTRAINT UQ_UnderlyingViewDaily UNIQUE (symbol, trade_date)
+        CONSTRAINT UQ_UnderlyingPredictionDaily UNIQUE (symbol, trade_date)
     );
 END
 
 GO
 
-IF COL_LENGTH('dbo.UnderlyingViewDaily', 'ruleset_version') IS NULL
-    ALTER TABLE dbo.UnderlyingViewDaily ADD ruleset_version VARCHAR(50) NULL;
+IF COL_LENGTH('dbo.UnderlyingPredictionDaily', 'ruleset_version') IS NULL
+    ALTER TABLE dbo.UnderlyingPredictionDaily ADD ruleset_version VARCHAR(50) NULL;
 
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_underlying_view_daily_trade_date' AND object_id = OBJECT_ID('dbo.UnderlyingViewDaily'))
-    CREATE INDEX ix_underlying_view_daily_trade_date
-    ON dbo.UnderlyingViewDaily (trade_date, is_option_eligible, symbol);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_underlying_prediction_daily_trade_date' AND object_id = OBJECT_ID('dbo.UnderlyingPredictionDaily'))
+    CREATE INDEX ix_underlying_prediction_daily_trade_date
+    ON dbo.UnderlyingPredictionDaily (trade_date, is_option_eligible, symbol);
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_underlying_view_daily_symbol_date' AND object_id = OBJECT_ID('dbo.UnderlyingViewDaily'))
-    CREATE INDEX ix_underlying_view_daily_symbol_date
-    ON dbo.UnderlyingViewDaily (symbol, trade_date);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_underlying_prediction_daily_symbol_date' AND object_id = OBJECT_ID('dbo.UnderlyingPredictionDaily'))
+    CREATE INDEX ix_underlying_prediction_daily_symbol_date
+    ON dbo.UnderlyingPredictionDaily (symbol, trade_date);
