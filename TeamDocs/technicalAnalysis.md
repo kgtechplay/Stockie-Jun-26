@@ -1,384 +1,155 @@
 # Technical Analysis
 
-## Gist
+Current scope: NIFTY underlying prediction and NIFTY option selection.
 
-Technical analysis is separate from the news-analysis signal journal.
-
-Use it when you want to:
-
-- add or test an underlying direction strategy
-- run one-date predictions for one watched stock/index
-- generate historical prediction CSVs for one underlying
-- backtest strategy columns and `aggregate_decision`
-- select option contracts after an underlying `CALL` or `PUT`
-
-Main outputs:
+## Workflow
 
 ```text
-output/<underlying>_prediction_<reference-date>.csv
-output/historical/<underlying>_prediction.csv
+daily/backfill underlying OHLC
+  -> UnderlyingSnapshot
+  -> calculate_underlying_features.py
+  -> SignalFeatureDaily
+
+daily/backfill option snapshots
+  -> OptionInstrument
+  -> OptionSnapshot
+  -> calculate_option_snapshot_calc.py
+  -> OptionSnapshotCalc
 ```
 
-Backtest details live in `TeamDocs/backtestStrategy.md`.
-
-Code location: `src/technical_analysis`
-
-The Flask Technical Analysis tab loads its stock/index dropdown from active rows in `dbo.WatchedInstrument`, so users only run predictions against instruments where the project is expected to have historical data.
-
-## Folder Layout
-
-```text
-src/technical_analysis/
-  prediction/
-    features.py
-    regime.py
-    strategies.py
-    underlying_prediction_common.py
-    underlying_prediction_*.py    # optional custom/plugin strategies only
-    underlying_registry.py
-
-  selection/
-    option_selection_common.py
-    option_selection_*.py
-    option_registry.py
-
-  aggregator/
-    underlying_aggregator.py
-    option_aggregator.py
-```
-
-Removed/obsolete files:
-
-```text
-src/technical_analysis/underlying_prediction_common.py
-src/technical_analysis/option_selection_common.py
-src/technical_analysis/prediction/underlying_strategy_registry.py
-src/technical_analysis/selection/option_strategy_registry.py
-```
-
-If your IDE still shows these files in open tabs, those tabs are stale.
-
-## Data Prerequisites
-
-Technical prediction reads daily OHLCV data from `dbo.UnderlyingSnapshot`.
-
-The active universe comes from `dbo.WatchedInstrument`.
-
-Relevant ingestion/backfill entrypoints:
-
-```text
-scripts/daily_fetch_stocks_universe.py      # builds stock universe CSVs
-scripts/populate_watched_instruments.py     # seeds base index watched rows
-scripts/backfill_nifty200_watched.py        # upserts Nifty 200 watched rows and batch backfills
-scripts/daily_optionInstrument_refresh.py   # refreshes OptionInstrument rows
-scripts/daily_market_refresh.py             # daily backfill entrypoint for active watched instruments
-src/services/backfill_service.py            # INDEX/STOCK backfill orchestrator
-```
-
-`daily_market_refresh.py` calls `BackfillService`, which classifies active `WatchedInstrument` rows into `INDEX` and `STOCK`, then runs the matching underlying and option backfill jobs.
-
-## Option Snapshot Date Boundary
-
-Live daily option-chain snapshots should be treated as starting from:
-
-```text
-2026-05-15
-```
-
-From this date onward, `scripts/daily_NIFTYoption_snapshot.py` is the daily/live quote capture path for NIFTY option instruments. It captures all active, non-expired NIFTY option instruments into `dbo.OptionSnapshot` using `data_source = KITE_QUOTE_LIVE`, and then calculates `dbo.OptionSnapshotCalc`.
-
-Dates earlier than `2026-05-15` should be populated through historical backfill, not live snapshot capture:
-
-```text
-scripts/backfill/backfill_NIFTYoptions_from_historical.py
-```
-
-Historical backfill writes proxy rows using Kite historical 5-minute candles and `data_source = KITE_HISTORICAL_5M_CLOSE_PROXY`. It only inserts rows when Kite has the exact historical candle needed for the configured snapshot label.
-
-Snapshot labels:
-
-```text
-OPEN_0920  -> historical candle at 09:15, stored as snapshot_time 09:20
-CLOSE_1515 -> historical candle at 15:10, stored as snapshot_time 15:15
-```
-
-This boundary avoids mixing historical proxy data and live quote data for the same date range.
-
-## Underlying Features
-
-Location: `src/technical_analysis/prediction/features.py`
-
-`compute_underlying_features(window)` appends the feature columns used by prediction CSVs:
-
-```text
-ma10, ma20, ma50, ma90,
-rsi14, atr14,
-bb_upper, bb_middle, bb_lower, bb_width,
-ret_5d, ret_20d, ret_60d,
-volatility_20d,
-volume_ratio,
-trend_efficiency_60d,
-relative_strength_vs_sector,
-ma20_slope, ma50_slope, ma20_50_crossovers_20d,
-recent_high_20d, recent_low_20d, range_position_20d
-```
-
-Relative strength is optional; it is `None` unless a sector/index comparison window is supplied.
+Predictions and option selection are computed in-memory from `SignalFeatureDaily` + `OptionSnapshotCalc`. They are not persisted — strategy logic is still being finalised. Use `tests/` to exercise the pipeline.
 
 ## Regime Detection
 
-Location: `src/technical_analysis/prediction/regime.py`
+Computed by `detect_regime()` (`src/technical_analysis/prediction/regime.py`) from a rolling OHLCV window (90 days). Detection is ordered — first match wins.
+
+| Regime | Conditions |
+|---|---|
+| `UNKNOWN` | Fewer than 10 closes in window — insufficient data |
+| `TREND_UP` | close > MA20 > MA50 · both slopes > 0 · ret_60d > 2% · trend_efficiency_60d > 0.25 |
+| `TREND_DOWN` | close < MA20 < MA50 · both slopes < 0 · ret_60d < −2% · trend_efficiency_60d > 0.25 |
+| `CHOPPY` | \|ret_60d\| ≤ 4% **and** trend_efficiency_60d ≤ 0.25 **and** volatility_20d ≥ 2.5% **and** ≥ 2 MA20/MA50 crossovers in last 20d |
+| `RANGE` | \|ret_60d\| ≤ 4% **and** \|MA20 slope\| ≤ 0.01 **and** \|MA50 slope\| ≤ 0.01 **and** range_position_20d ∈ [15%, 85%] **and** volatility_20d ≤ 3% |
+| `RANGE` | \|ret_60d\| ≤ 4% (partial — price moved little even if not oscillating cleanly) |
+| `CHOPPY` | trend_efficiency_60d ≤ 0.25 **and** volatility_20d ≥ 2.5% |
+| `RANGE` | default fallback — anything else |
+
+**Key indicators:**
+- `ret_60d` — 60-day price return (decimal)
+- `trend_efficiency_60d` — directional efficiency: net move ÷ total path length (0–1; higher = cleaner trend)
+- `range_position_20d` — where today's close sits within the 20-day high/low range (0 = at low, 1 = at high)
+- `ma20_50_crossovers_20d` — number of times MA20 crossed MA50 in the last 20 trading days
+
+The regime is pre-computed and stored in `SignalFeatureDaily.regime` by `calculate_underlying_features.py`. The prediction pipeline reads it from there; it only re-detects live from the window if the stored value is `UNKNOWN`.
 
-`detect_regime(window)` returns:
+---
 
-```text
-TREND_UP, TREND_DOWN, RANGE, CHOPPY, UNKNOWN
-```
+## Direction Prediction
 
-The current rule set uses MA alignment/slopes, 60-day return, trend efficiency, volatility, range position, and MA crossover count.
+### Regime-to-strategy routing
+
+Only the strategies matched to the detected regime run. Others are left blank in the output.
+
+| Regime | Active strategies |
+|---|---|
+| `TREND_UP` | `MaTrend_001`, `trendUpRangeBreakout`, `BollingerMeanReversion` |
+| `TREND_DOWN` | `MaTrend_001`, `trendDownRangeBreakout`, `BollingerMeanReversion` |
+| `RANGE` | `rangeBollingerMeanReversion`, `rangeRsiMeanReversion_6535` |
+| `CHOPPY` / `UNKNOWN` | (none — no trade) |
 
-## Underlying Strategies
+### Strategy signal logic
 
-Location: `src/technical_analysis/prediction/strategies.py`
+| Strategy | Signal rule |
+|---|---|
+| `MaTrend_001` | CALL if (MA10 − MA20) / MA20 > 0.1%; PUT if spread < −0.1%; else NO_POSITION |
+| `trendUpRangeBreakout` | CALL if today's close > 20-day high (breakout); other outcomes → NO_POSITION |
+| `trendDownRangeBreakout` | PUT if today's close < 20-day low (breakdown); other outcomes → NO_POSITION |
+| `BollingerMeanReversion` | CALL if close < lower BB (MA20 − 2σ); PUT if close > upper BB (MA20 + 2σ) |
+| `rangeBollingerMeanReversion` | Same as above; restricted to RANGE regime |
+| `rangeRsiMeanReversion_6535` | CALL if RSI14 < 40; PUT if RSI14 > 60; else NO_POSITION *(thresholds relaxed from 35/65 to fire in moderate range conditions)* |
 
-Built-in strategies are registered in `BUILTIN_UNDERLYING_STRATEGIES`. Each entry is an `UnderlyingStrategyDefinition` with a stable strategy name and a `predict(window)` function.
+### Aggregation into `raw_signal`
 
-Built-in strategy names:
+Each strategy signal is scored individually (0–100). The pipeline then aggregates:
 
-```text
-BollingerMeanReversion
-MaTrend_001
-RsiMeanReversion_6535
-rangeBollingerMeanReversion
-rangeRsiMeanReversion_6535
-trendDownRangeBreakout
-trendUpRangeBreakout
-choppy
-unknown
-```
+1. **Eligible** — only signals with score ≥ 30 and raw_signal ∈ {CALL, PUT} count
+2. **Direction** — BULLISH if Σ(bullish scores) ≥ Σ(bearish scores) × 1.25 and Σ(bullish) ≥ 30; BEARISH if reverse; else NEUTRAL
+3. **Conflict** — if both Σ(bullish) ≥ 40 and Σ(bearish) ≥ 40 → override to NEUTRAL
+4. `raw_signal` = CALL / PUT from direction; NO_POSITION if NEUTRAL or no eligible signals
 
-Strategy outputs are always:
+`is_option_eligible = True` only when `strength_score ≥ 65`. RANGE mean-reversion signals typically score 30–50 (the setup contradicts trend-based metrics) and are therefore backtest-only.
 
-```text
-CALL, PUT, NO_POSITION
-```
+### Score components (`strength_score`)
 
-`prediction/underlying_prediction_common.py` exists as a convenience import surface for prediction helpers and built-in strategy functions.
+| Component | Max pts | What drives it |
+|---|---|---|
+| `stock_technical_score` | 20 | **TREND:** MA alignment (close vs MA20/50), slope direction, RSI in [45, 70]. **RANGE:** RSI ≤ 40/30 (+10/+5) and close ≤ lower BB (+5); mirrored for PUT. |
+| `volume_confirmation_score` | 10 | vol_ratio ≥ 1.5× → 10; ≥ 1.1× → 7; ≥ 0.8× → 4; else 0 |
+| `risk_quality_score` | 10 | ATR/close ≤ 4% → +4; volatility_20d ≤ 3.5% → +3; reward/risk undefined → +3 |
+| `regime_quality_score` | 15 | TREND with matching sector → +15; TREND alone → +8; RANGE + matching setup type → +10; CHOPPY → −15 |
+| `sector_confirmation_score` | 15 | *Always 0 for NIFTY — no external sector regime in pipeline* |
+| `benchmark_confirmation_score` | 7 | *Always 0 for NIFTY* |
+| `relative_strength_score` | 15 | *Always 0 for NIFTY (no RS vs sector/benchmark)* |
+| `penalty_score` | −20 max | −5 per missing critical feature: close, MA20, MA50, RSI14, ATR14, volatility_20d |
 
-## Underlying Registry
+---
 
-Location: `src/technical_analysis/prediction/underlying_registry.py`
+## Scripts
 
-This is the single public registry module for underlying prediction.
+| Script | Purpose |
+|---|---|
+| `scripts/daily_NIFTY/daily_market_refresh.py` | Fetch current daily NIFTY OHLC and chain feature calculation. |
+| `scripts/backfill_NIFTY/backfill_underlying.py` | Backfill NIFTY OHLC and chain feature calculation. |
+| `scripts/daily_NIFTY/daily_optionInstrument_refresh.py` | Refresh active NIFTY option contracts from Kite. |
+| `scripts/daily_NIFTY/daily_NIFTYoption_snapshot.py` | Capture live NIFTY option quotes and chain option calc. |
+| `scripts/backfill_NIFTY/backfill_NIFTYoptions_from_historical.py` | Backfill option snapshots from historical Kite candles and chain option calc. |
+| `scripts/Common/calculate_underlying_features.py` | Build `SignalFeatureDaily` from `UnderlyingSnapshot`. |
+| `scripts/Common/calculate_option_snapshot_calc.py` | Build `OptionSnapshotCalc` from `OptionSnapshot`. |
 
-It:
+## Editing Strategies and Backtesting
 
-- loads all built-ins from `strategies.py`
-- optionally discovers custom files named `underlying_prediction_*.py`
-- exposes `load_underlying_prediction_strategies()`
-- exposes `PREDICTION_STRATEGIES`
-- re-exports `DEFAULT_LOOKBACK_DAYS` and `detect_regime`
+### Where to make changes
 
-`underlying_strategy_registry.py` is no longer maintained.
+**Prediction strategy layer**
 
-## Aggregation
+| What to change | File |
+|---|---|
+| Individual signal functions (MA trend, RSI MR, Bollinger MR, regime-gated variants) | `src/technical_analysis/prediction/strategies.py` |
+| How multiple signals are aggregated into a single CALL / PUT / NO_POSITION | `src/technical_analysis/prediction/aggregator.py` |
+| Strength score, confidence, and `option_bias` derivation | `src/technical_analysis/prediction/scoring.py` |
+| Regime detection (TREND_UP / TREND_DOWN / RANGE / CHOPPY) | `src/technical_analysis/prediction/regime.py` |
 
-Location: `src/technical_analysis/aggregator/underlying_aggregator.py`
+**Option selection layer**
 
-The aggregator:
+| What to change | File |
+|---|---|
+| Which strategy type to run (LONG_CALL, BULL_CALL_SPREAD, etc.) based on bias + IV rank | `src/technical_analysis/optionselection/strategy_rules.py` |
+| Candidate filtering (delta range, liquidity, DTE) | `src/technical_analysis/optionselection/candidate_filter.py` |
+| How candidates are scored | `src/technical_analysis/optionselection/scoring.py` |
 
-- runs selected strategies
-- normalizes invalid outputs to `NO_POSITION`
-- adds feature columns from `compute_underlying_features()`
-- uses `detected_regime` to choose which strategy group votes
-- writes `aggregate_decision`
+### How to run a backtest
 
-Voting rules:
+1. **Prediction backtest** — reads `SignalFeatureDaily` from DB, runs all strategies over a rolling OHLCV window, writes `output/backtest/NIFTY_prediction.csv`:
+   ```
+   python backtest/test_underlying_prediction.py --underlying NIFTY --start 2026-04-01
+   ```
 
-- count `CALL` and `PUT`
-- majority `CALL` returns `CALL`
-- majority `PUT` returns `PUT`
-- tie or no actionable votes returns `NO_POSITION`
+2. **Option selection + P&L backtest** — reads the prediction CSV, runs option selection at EOD chain, calculates next-day P&L and 5-day 2%-profit scan, writes `output/backtest/NIFTY_optionSelection.csv`:
+   ```
+   python backtest/test_optionselection_e2e.py
+   ```
 
-Regime strategy groups:
+Run step 1 first whenever prediction strategies change. Run step 2 whenever option selection logic changes (it consumes step 1's output without re-running the prediction layer).
 
-```text
-TREND_UP    -> trendUpRangeBreakout
-TREND_DOWN  -> trendDownRangeBreakout
-RANGE       -> rangeBollingerMeanReversion, rangeRsiMeanReversion_6535
-CHOPPY      -> choppy
-UNKNOWN     -> unknown
-```
+## Code Packages
 
-## Prediction CSV Schema
+| Package | Purpose |
+|---|---|
+| `src/technical_analysis/prediction/` | Underlying feature schema, regime, strategy signals, scoring, expected move, and final view construction. |
+| `src/technical_analysis/optionselection/` | Current option-selection engine: chain repository, option features, filters, strategy builder, risk, and scoring. |
+| `src/data_manager/` | Kite API wrapper and DB/Kite helpers used by ingestion/backfill jobs. |
+| `src/common/` | Shared settings and dataclass models. |
 
-Consolidated prediction outputs are ordered as:
+## Flask
 
-```text
-date, underlying, today_volume,
-<feature columns>,
-detected_regime,
-aggregate_decision,
-<strategy columns>
-```
-
-`data_as_of_date` is intentionally not written.
-
-Point-in-time prediction output:
-
-```text
-output/<underlying>_prediction_<reference-date>.csv
-```
-
-Historical prediction output:
-
-```text
-output/historical/<underlying>_prediction.csv
-```
-
-## Historical Prediction Service
-
-Location: `src/services/historical_prediction.py`
-
-Typical command:
-
-```powershell
-python src/services/historical_prediction.py --underlying RELIANCE
-```
-
-By default this generates the last 60 calendar days of requested output. Internally, `PredictionService` uses the TA default lookback of 90 rows so MA90, ret60, and trend efficiency can be computed.
-
-Pass `--start`, `--end`, or repeated `--strategy` flags to narrow the run.
-
-## Backtesting
-
-Backtesting details are documented in:
-
-```text
-TeamDocs/backtestStrategy.md
-```
-
-Historical backtests read the prediction CSV, append market outcome columns, append per-strategy result columns, and write back to the same CSV.
-
-Backtest output order:
-
-```text
-underlying, date, today_volume,
-next_date, today_close, next_open, next_close, next_volume,
-max_high_price, min_low_price, actual_move, max_delta_pct,
-<feature columns>,
-detected_regime, aggregate_decision, aggregate_decision_result,
-<strategy>, <strategy_result>, ...
-```
-
-Backtest thresholds:
-
-```text
-historical underlying backtest:  profit target = 1%,  stop loss = 0.5%
-news signal backtest:            profit target = 3%,  stop loss = 2%
-```
-
-Historical backtesting returns a summary dictionary with profit hits, stop hits, hit rates, and recall for `aggregate_decision` plus every individual strategy column.
-
-## Option Selection
-
-Option selectors choose a specific option contract after an underlying direction exists.
-
-Folder:
-
-```text
-src/technical_analysis/selection/
-  option_selection_common.py
-  option_selection_highestDeltaPriceRatio.py
-  option_selection_nearestExpiryATM.py
-  option_selection_nearestExpiryHighOI.py
-  option_registry.py
-```
-
-`option_registry.py` is the single public registry module. It discovers files named `option_selection_*.py`.
-
-Built-in option selectors:
-
-```text
-highestDeltaPriceRatio
-nearestExpiryATM
-nearestExpiryHighOI
-```
-
-Selector contract:
-
-```text
-file name: option_selection_<name>.py
-constant:  STRATEGY_NAME
-function:  select(chain_df, prediction, trade_date)
-returns:   selected option dict or None
-```
-
-Rules:
-
-- return `None` when no valid contract exists
-- use shared helpers from `selection/option_selection_common.py`
-- output standard selected-option fields
-
-## Adding A New Underlying Strategy
-
-Preferred path: add built-in strategies to `prediction/strategies.py` by adding a new `UnderlyingStrategyDefinition`.
-
-For custom/plugin-style strategies, create:
-
-```text
-src/technical_analysis/prediction/underlying_prediction_myStrategy.py
-```
-
-Example:
-
-```python
-from __future__ import annotations
-
-from .underlying_prediction_common import PredictionInput, signal_ma_trend
-
-STRATEGY_NAME = "myStrategy"
-
-
-def predict(window: PredictionInput) -> str:
-    return signal_ma_trend(window, short_window=10, long_window=20, band=0.001)
-```
-
-The registry discovers files automatically when they match `underlying_prediction_*.py`.
-
-## Adding A New Option Selector
-
-Create:
-
-```text
-src/technical_analysis/selection/option_selection_mySelector.py
-```
-
-Example:
-
-```python
-from __future__ import annotations
-
-from typing import Dict, Optional
-
-import pandas as pd
-
-from .option_selection_common import _common_filter, build_selection_output
-
-STRATEGY_NAME = "mySelector"
-
-
-def select(
-    chain_df: pd.DataFrame,
-    prediction: str,
-    trade_date: pd.Timestamp,
-) -> Optional[Dict]:
-    df = _common_filter(chain_df, prediction, trade_date)
-    if df.empty:
-        return None
-
-    row = df.sort_values("open_interest", ascending=False).iloc[0]
-    return build_selection_output(row, prediction, row["_trade_date_norm"])
-```
-
-The registry discovers files automatically when they match `option_selection_*.py`.
+`flask_app.py` is NIFTY-only. It shows NIFTY data/trends from `output/backtest/NIFTY_prediction.csv` and exposes NIFTY Predict/Backtest actions for local inspection.

@@ -5,108 +5,71 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, abort, render_template_string, request, send_file, url_for
 
-from src.backtest.historical_underlying_backtest import (
+from backtest.legacy.historical_underlying_backtest import (
     HistoricalUnderlyingBacktestRequest,
     run_historical_underlying_backtest,
 )
-from src.backtest.news_underlying_backtest import (
-    NewsBacktestRequest,
-    run_news_underlying_backtest,
-)
-from src.data_manager.underlying_history_reader import get_active_underlyings
-from src.services.historical_prediction import (
-    HistoricalPredictionRequest,
-    HistoricalPredictionService,
-)
-from src.services.prediction_service import PredictionService
-
-
 PROJECT_ROOT = Path(__file__).resolve().parent
+NIFTY_SYMBOL = "NIFTY"
 app = Flask(__name__)
-
-
-def load_watched_underlyings() -> list[str]:
-    symbols = get_active_underlyings(instrument_type=None)
-    return sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
 
 
 @app.get("/")
 def index():
-    selected = request.args.get("underlying", "")
+    dashboard = load_nifty_dashboard()
     context = {
         "today": date.today().isoformat(),
-        "selected": selected,
-        "underlyings": [],
+        "selected": NIFTY_SYMBOL,
+        "underlyings": [NIFTY_SYMBOL],
         "load_error": "",
         "result": None,
-        "csv_rows": [],
-        "csv_columns": [],
-        "csv_download_url": "",
-        "active_path": request.args.get("path", "technical"),
+        "csv_rows": dashboard["preview_rows"],
+        "csv_columns": dashboard["preview_columns"],
+        "csv_download_url": dashboard["download_url"],
+        "active_path": "technical",
+        "dashboard": dashboard,
     }
-    try:
-        context["underlyings"] = load_watched_underlyings()
-        if not selected and context["underlyings"]:
-            context["selected"] = context["underlyings"][0]
-    except Exception as exc:
-        context["load_error"] = str(exc)
     return render_template_string(PAGE_TEMPLATE, **context)
 
 
 @app.post("/technical/predict")
 def technical_predict():
-    underlying = request.form.get("underlying", "").strip().upper()
-    if not underlying:
-        return redirect(url_for("index", path="technical"))
+    underlying = NIFTY_SYMBOL
 
-    result: dict[str, Any]
-    csv_path: Path | None = None
-    try:
-        service = PredictionService.from_project_root(PROJECT_ROOT)
-        result = service.run_reference_date_predictions(
-            instrument=underlying,
-            reference_date=date.today(),
-        )
-        output_file = result.get("output_file")
-        csv_path = PROJECT_ROOT / "output" / str(output_file) if output_file else None
-        status = "success"
-    except Exception as exc:
-        result = {"error": str(exc)}
-        status = "error"
+    dashboard = load_nifty_dashboard()
+    result: dict[str, Any] = {
+        "underlying": underlying,
+        "dashboard_file": dashboard["path"],
+        "rows": dashboard["row_count"],
+        "latest": dashboard["latest"],
+        "summary": dashboard["summary"],
+    }
+    csv_path = Path(dashboard["path"]) if dashboard["has_file"] else None
+    status = "success"
 
     return render_result(
         result=result,
         csv_path=csv_path,
         selected=underlying,
         active_path="technical",
-        banner=("Prediction generated." if status == "success" else "Prediction failed."),
+        banner="NIFTY dashboard refreshed.",
         status=status,
     )
 
 
 @app.post("/technical/backtest")
 def technical_backtest():
-    underlying = request.form.get("underlying", "").strip().upper()
-    if not underlying:
-        return redirect(url_for("index", path="technical"))
+    underlying = NIFTY_SYMBOL
 
     result: dict[str, Any]
     csv_path: Path | None = None
     try:
-        historical_service = HistoricalPredictionService.from_project_root(PROJECT_ROOT)
-        prediction_result = historical_service.run(
-            HistoricalPredictionRequest(
-                underlying=underlying,
-                lookback_days=60,
-            )
-        )
         backtest_result = run_historical_underlying_backtest(
             HistoricalUnderlyingBacktestRequest(underlying=underlying)
         )
         result = {
-            "prediction_run": prediction_result,
             "backtest": backtest_result,
         }
         output_file = backtest_result.get("prediction_file")
@@ -126,43 +89,6 @@ def technical_backtest():
     )
 
 
-@app.post("/news/backtest")
-def news_backtest():
-    published_date_raw = request.form.get("published_date", date.today().isoformat())
-    force = request.form.get("force") == "on"
-    try:
-        published_date = date.fromisoformat(published_date_raw)
-    except ValueError:
-        published_date = date.today()
-
-    csv_path: Path | None = None
-    try:
-        result = run_news_underlying_backtest(
-            NewsBacktestRequest(
-                signal_journal_file="trade_signal_journal.csv",
-                output_dir=PROJECT_ROOT / "output",
-                published_date=published_date,
-                force=force,
-            )
-        )
-        output_file = result.get("output_file")
-        csv_path = Path(str(output_file)) if output_file else None
-        status = "success"
-    except Exception as exc:
-        result = {"error": str(exc)}
-        status = "error"
-
-    return render_result(
-        result=result,
-        csv_path=csv_path,
-        selected="",
-        active_path="news",
-        banner=("News signal backtest completed." if status == "success" else "News signal backtest failed."),
-        status=status,
-        published_date=published_date.isoformat(),
-    )
-
-
 def render_result(
     result: dict[str, Any],
     csv_path: Path | None,
@@ -175,22 +101,19 @@ def render_result(
     context = {
         "today": date.today().isoformat(),
         "selected": selected,
-        "underlyings": [],
+        "underlyings": [NIFTY_SYMBOL],
         "load_error": "",
         "result": json_safe(result),
         "headline": extract_headline(result),
         "csv_rows": [],
         "csv_columns": [],
         "csv_download_url": "",
-        "active_path": active_path,
+        "active_path": "technical",
         "banner": banner,
         "status": status,
         "published_date": published_date or date.today().isoformat(),
+        "dashboard": load_nifty_dashboard(),
     }
-    try:
-        context["underlyings"] = load_watched_underlyings()
-    except Exception as exc:
-        context["load_error"] = str(exc)
 
     if csv_path:
         rows, columns = read_csv_preview(csv_path)
@@ -214,6 +137,91 @@ def read_csv_preview(path: Path, limit: int = 50) -> tuple[list[dict[str, Any]],
         return [], []
     df = pd.read_csv(path).head(limit)
     return df.fillna("").to_dict(orient="records"), list(df.columns)
+
+
+def load_nifty_dashboard() -> dict[str, Any]:
+    path = PROJECT_ROOT / "output" / "backtest" / f"{NIFTY_SYMBOL}_prediction.csv"
+    dashboard: dict[str, Any] = {
+        "has_file": path.exists(),
+        "path": str(path),
+        "download_url": "",
+        "row_count": 0,
+        "latest": {},
+        "summary": {},
+        "trend_rows": [],
+        "preview_rows": [],
+        "preview_columns": [],
+    }
+    if not path.exists():
+        return dashboard
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return dashboard
+
+    dashboard["row_count"] = int(len(df))
+    dashboard["download_url"] = build_download_url(path)
+    preview_rows, preview_columns = read_csv_preview(path)
+    dashboard["preview_rows"] = preview_rows
+    dashboard["preview_columns"] = preview_columns
+
+    date_col = "date" if "date" in df.columns else None
+    if date_col:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.sort_values(date_col)
+
+    latest = df.iloc[-1].to_dict()
+    latest_fields = [
+        "date",
+        "aggregate_decision",
+        "underlying_raw_signal",
+        "underlying_direction",
+        "underlying_strength_score",
+        "underlying_confidence",
+        "detected_regime",
+        "actual_move",
+        "aggregate_decision_result",
+    ]
+    dashboard["latest"] = _pick_fields(latest, latest_fields)
+
+    result_cols = [c for c in df.columns if c.endswith("_result")]
+    correct = int((df[result_cols] == "CORRECT").sum().sum()) if result_cols else 0
+    wrong = int((df[result_cols] == "WRONG").sum().sum()) if result_cols else 0
+    total = correct + wrong
+    dashboard["summary"] = {
+        "rows": int(len(df)),
+        "result_columns": len(result_cols),
+        "correct": correct,
+        "wrong": wrong,
+        "accuracy_pct": round((correct / total) * 100, 2) if total else None,
+    }
+
+    trend_fields = [
+        "date",
+        "aggregate_decision",
+        "underlying_raw_signal",
+        "underlying_direction",
+        "underlying_strength_score",
+        "detected_regime",
+        "actual_move",
+        "aggregate_decision_result",
+    ]
+    dashboard["trend_rows"] = [
+        _pick_fields(row, trend_fields)
+        for row in df.tail(10).fillna("").to_dict(orient="records")
+    ]
+    return dashboard
+
+
+def _pick_fields(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for field in fields:
+        if field in row:
+            value = row[field]
+            if hasattr(value, "date"):
+                value = value.date().isoformat()
+            out[field] = json_safe(value)
+    return out
 
 
 def build_download_url(path: Path) -> str:
@@ -272,6 +280,62 @@ def json_safe(value: Any) -> Any:
 
 
 PAGE_TEMPLATE = r"""
+{% macro dashboard_panel(dashboard) -%}
+  <div class="dashboard">
+    <div class="dashboard-head">
+      <div>
+        <strong>NIFTY Data And Trends</strong>
+        <span>
+          {% if dashboard.has_file %}
+            Source: output/backtest/NIFTY_prediction.csv
+          {% else %}
+            No NIFTY historical output found yet.
+          {% endif %}
+        </span>
+      </div>
+      {% if dashboard.download_url %}
+        <a class="download-button" href="{{ dashboard.download_url }}">Download NIFTY CSV</a>
+      {% endif %}
+    </div>
+    {% if dashboard.has_file %}
+      <div class="metric-grid">
+        {% for key, value in dashboard.summary.items() %}
+          <div class="metric"><span>{{ key.replace('_', ' ') }}</span><strong>{{ value if value is not none else 'N/A' }}</strong></div>
+        {% endfor %}
+      </div>
+      {% if dashboard.latest %}
+        <div class="compact-panel">
+          <strong>Latest Signal</strong>
+          <div class="kv-grid">
+            {% for key, value in dashboard.latest.items() %}
+              <span>{{ key.replace('_', ' ') }}</span><b>{{ value }}</b>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+      {% if dashboard.trend_rows %}
+        <div class="compact-panel">
+          <strong>Recent Trend Rows</strong>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr>{% for column in dashboard.trend_rows[0].keys() %}<th>{{ column.replace('_', ' ') }}</th>{% endfor %}</tr>
+              </thead>
+              <tbody>
+                {% for row in dashboard.trend_rows %}
+                  <tr>{% for value in row.values() %}<td>{{ value }}</td>{% endfor %}</tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      {% endif %}
+    {% else %}
+      <div class="notice">Run the NIFTY prediction or backtest to generate the dashboard CSV.</div>
+    {% endif %}
+  </div>
+{%- endmacro %}
+
 {% macro result_panel(headline, csv_rows, csv_columns, result, csv_download_url) -%}
   {% set error_message = result.get('error') if result and result.get('error') else '' %}
   {% if error_message %}
@@ -509,6 +573,49 @@ PAGE_TEMPLATE = r"""
       max-height: 360px;
     }
     .check { display: flex; align-items: center; gap: 8px; color: #334155; font-size: 14px; }
+    .readonly-symbol {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 13px 12px;
+      background: #fff;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    .dashboard {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 18px;
+      background: #fbfcfe;
+    }
+    .dashboard-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+    .dashboard-head strong,
+    .compact-panel strong { display: block; font-size: 15px; margin-bottom: 3px; }
+    .dashboard-head span { color: var(--muted); font-size: 12px; }
+    .compact-panel {
+      border-top: 1px solid #edf0f5;
+      padding-top: 14px;
+      margin-top: 14px;
+    }
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px 16px;
+      font-size: 13px;
+    }
+    .kv-grid span { color: var(--muted); }
+    .kv-grid b { color: var(--text); font-weight: 750; }
+    .table-wrap.compact {
+      max-height: 260px;
+      min-height: 0;
+      margin-top: 10px;
+    }
     .empty-state {
       min-height: calc(100vh - 220px);
       display: grid;
@@ -537,6 +644,7 @@ PAGE_TEMPLATE = r"""
       .result-toolbar { align-items: stretch; flex-direction: column; }
       .download-button { width: 100%; }
       .tabs { flex-wrap: wrap; }
+      .dashboard-head { align-items: stretch; flex-direction: column; }
     }
   </style>
 </head>
@@ -544,17 +652,12 @@ PAGE_TEMPLATE = r"""
   <header>
     <div>
       <h1>Stockie26</h1>
-      <p class="subtitle">Technical predictions and news-signal backtests against watched instruments.</p>
+      <p class="subtitle">NIFTY technical data, trend signals, and backtesting results.</p>
     </div>
     <div class="subtitle">Today: {{ today }}</div>
   </header>
 
   <main>
-    <nav class="tabs">
-      <a class="tab {{ 'active' if active_path == 'technical' else '' }}" href="{{ url_for('index', path='technical', underlying=selected) }}">Technical Analysis</a>
-      <a class="tab {{ 'active' if active_path == 'news' else '' }}" href="{{ url_for('index', path='news') }}">News Signal Backtest</a>
-    </nav>
-
     {% if banner %}
       <div class="notice {{ status }}">{{ banner }}</div>
     {% endif %}
@@ -566,50 +669,19 @@ PAGE_TEMPLATE = r"""
       <div class="path {{ 'active' if active_path == 'technical' else '' }}">
         <div class="grid">
           <form method="post">
-            <h2 class="section-title">Technical Analysis</h2>
-            <p class="hint">Select a watched stock or index. Predict uses latest available history up to yesterday's trading data; Backtest regenerates the last 60 days and evaluates the results.</p>
+            <h2 class="section-title">NIFTY Technical Analysis</h2>
+            <p class="hint">This app is intentionally NIFTY-only. Predict runs the latest signal view; Backtest regenerates the legacy CSV backtest for NIFTY only.</p>
             <div class="field">
-              <label for="underlying">Watched stock / index</label>
-              <select id="underlying" name="underlying" {% if not underlyings %}disabled{% endif %}>
-                {% for item in underlyings %}
-                  <option value="{{ item }}" {% if item == selected %}selected{% endif %}>{{ item }}</option>
-                {% endfor %}
-              </select>
+              <label>Underlying</label>
+              <div class="readonly-symbol">NIFTY</div>
             </div>
             <div class="actions">
-              <button type="submit" formaction="{{ url_for('technical_predict') }}" {% if not underlyings %}disabled{% endif %}>Predict</button>
-              <button type="submit" formaction="{{ url_for('technical_backtest') }}" class="secondary" {% if not underlyings %}disabled{% endif %}>Backtest</button>
+              <button type="submit" formaction="{{ url_for('technical_predict') }}">Predict</button>
+              <button type="submit" formaction="{{ url_for('technical_backtest') }}" class="secondary">Backtest</button>
             </div>
           </form>
           <div class="result-pane">
-            {{ result_panel(headline, csv_rows, csv_columns, result, csv_download_url) }}
-          </div>
-        </div>
-      </div>
-
-      <div class="path {{ 'active' if active_path == 'news' else '' }}">
-        <div class="grid">
-          <form method="post" action="{{ url_for('news_backtest') }}">
-            <h2 class="section-title">News Signal Backtest</h2>
-            <p class="hint">News prediction is disabled for now. Backtest reads existing rows from output/trade_signal_journal.csv for the selected published date.</p>
-            <div class="field">
-              <label for="article">News article</label>
-              <textarea id="article" name="article" placeholder="Paste article text here for the future Predict flow."></textarea>
-            </div>
-            <div class="field">
-              <label for="published_date">Published date</label>
-              <input id="published_date" name="published_date" type="date" value="{{ published_date or today }}">
-            </div>
-            <label class="check">
-              <input type="checkbox" name="force">
-              Force rerun already-backtested rows
-            </label>
-            <div class="actions" style="margin-top:16px;">
-              <button type="button" disabled>Predict</button>
-              <button type="submit" class="secondary">Backtest</button>
-            </div>
-          </form>
-          <div class="result-pane">
+            {{ dashboard_panel(dashboard) }}
             {{ result_panel(headline, csv_rows, csv_columns, result, csv_download_url) }}
           </div>
         </div>

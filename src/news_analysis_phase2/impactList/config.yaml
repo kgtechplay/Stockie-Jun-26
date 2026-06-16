@@ -1,0 +1,82 @@
+agent_name: impactList
+version: 1.0
+
+market_universe:
+  default_country: India
+  exchanges:
+    - NSE
+    - BSE
+
+timeline_buckets:
+  immediate:
+    label: same_day
+    max_days: 1
+  short:
+    label: 1_3_days
+    max_days: 3
+  medium:
+    label: 1_4_weeks
+    max_days: 20
+  long:
+    label: 1_6_months
+    max_days: 120
+
+sensitivity_weights:
+  directness:
+    direct: 1.0
+    indirect: 0.65
+    second_order: 0.35
+  stock_price_sensitivity:
+    very_high: 1.0
+    high: 0.8
+    medium: 0.5
+    low: 0.25
+  timeline:
+    same_day: 1.0
+    1_3_days: 0.85
+    1_4_weeks: 0.55
+    1_6_months: 0.30
+    6_months_plus: 0.15
+    uncertain: 0.10
+  confidence_multiplier: true
+
+sector_mapping_rules:
+  crude_oil_up:
+    beneficiaries:
+      - upstream_oil_gas
+      - oil_exploration
+    harmed:
+      - aviation
+      - paints
+      - tyres
+      - chemicals
+      - plastics
+      - logistics
+      - oil_marketing_if_pass_through_constrained
+  natural_gas_up:
+    beneficiaries:
+      - gas_producers
+    harmed:
+      - fertilisers
+      - city_gas_distribution_if_pass_through_constrained
+      - ceramics
+      - glass
+      - power
+  copper_up:
+    beneficiaries:
+      - copper_miners
+      - metal_traders
+    harmed:
+      - wires_cables
+      - electrical_equipment
+      - consumer_durables
+      - auto_components
+
+output_limits:
+  max_sector_impacts: 25
+  max_companies_per_sector: 5
+
+guardrails:
+  distinguish_stock_reaction_from_fundamental_impact: true
+  include_risks_to_thesis: true
+  avoid_recommending_trade: true

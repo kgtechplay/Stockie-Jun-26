@@ -38,7 +38,7 @@ class KiteClient:
             token_path = _get_token_path(self.settings)
             raise RuntimeError(
                 f"Access token not found in database or file ({token_path}).\n"
-                "Run: python scripts/daily/daily_get_kite_access_token.py"
+                "Run: python scripts/daily_NIFTY/daily_get_kite_access_token.py"
             )
         self.kite.set_access_token(access_token)
 

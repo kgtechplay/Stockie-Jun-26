@@ -80,17 +80,30 @@ def _score_stock_technicals(
 ) -> float:
     score = 0.0
     if direction == "BULLISH":
-        score += _points(f.close is not None and f.ma20 is not None and f.close > f.ma20, 5)
-        score += _points(f.ma20 is not None and f.ma50 is not None and f.ma20 > f.ma50, 5)
-        score += _points(f.ma20_slope is not None and f.ma20_slope > 0, 5)
-        score += _points(f.ma50_slope is not None and f.ma50_slope > 0, 5)
-        score += _points(f.rsi14 is not None and 45 <= f.rsi14 <= 70, 5)
+        if setup_type == "RANGE_LOWER_BAND_LONG":
+            # RANGE reversal: grade the oversold entry conditions, not trend-following alignment.
+            # close < bb_lower is the primary signal; low RSI confirms oversold.
+            score += _points(f.rsi14 is not None and f.rsi14 <= 40, 10)
+            score += _points(f.rsi14 is not None and f.rsi14 <= 30, 5)   # deep oversold bonus
+            score += _points(f.close is not None and f.bb_lower is not None and f.close <= f.bb_lower, 5)
+        else:
+            score += _points(f.close is not None and f.ma20 is not None and f.close > f.ma20, 5)
+            score += _points(f.ma20 is not None and f.ma50 is not None and f.ma20 > f.ma50, 5)
+            score += _points(f.ma20_slope is not None and f.ma20_slope > 0, 5)
+            score += _points(f.ma50_slope is not None and f.ma50_slope > 0, 5)
+            score += _points(f.rsi14 is not None and 45 <= f.rsi14 <= 70, 5)
     elif direction == "BEARISH":
-        score += _points(f.close is not None and f.ma20 is not None and f.close < f.ma20, 5)
-        score += _points(f.ma20 is not None and f.ma50 is not None and f.ma20 < f.ma50, 5)
-        score += _points(f.ma20_slope is not None and f.ma20_slope < 0, 5)
-        score += _points(f.ma50_slope is not None and f.ma50_slope < 0, 5)
-        score += _points(f.rsi14 is not None and 30 <= f.rsi14 <= 55, 5)
+        if setup_type == "RANGE_UPPER_BAND_SHORT":
+            # RANGE reversal from top: grade overbought conditions.
+            score += _points(f.rsi14 is not None and f.rsi14 >= 60, 10)
+            score += _points(f.rsi14 is not None and f.rsi14 >= 70, 5)   # deep overbought bonus
+            score += _points(f.close is not None and f.bb_upper is not None and f.close >= f.bb_upper, 5)
+        else:
+            score += _points(f.close is not None and f.ma20 is not None and f.close < f.ma20, 5)
+            score += _points(f.ma20 is not None and f.ma50 is not None and f.ma20 < f.ma50, 5)
+            score += _points(f.ma20_slope is not None and f.ma20_slope < 0, 5)
+            score += _points(f.ma50_slope is not None and f.ma50_slope < 0, 5)
+            score += _points(f.rsi14 is not None and 30 <= f.rsi14 <= 55, 5)
     if setup_type == "NO_SETUP":
         warnings.append("No concrete setup type was identified")
     return score

@@ -122,9 +122,12 @@ def derive_option_bias(raw_signal: RawSignal, direction: Direction, strength_sco
 
 
 def _raw_signal_from_score(direction: Direction, score: float) -> RawSignal:
-    if score >= 65 and direction == "BULLISH":
+    # raw_signal follows the aggregator direction; strength_score is informational quality.
+    # is_option_eligible() (score >= 65) is the gate for actual option trades.
+    _ = score
+    if direction == "BULLISH":
         return "CALL"
-    if score >= 65 and direction == "BEARISH":
+    if direction == "BEARISH":
         return "PUT"
     return "NO_POSITION"
 

@@ -28,7 +28,6 @@ kite_access_token.json
 # =========================
 # Runtime / generated data
 # =========================
-output/
 .claude/
 
 # =========================

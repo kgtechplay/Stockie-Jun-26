@@ -1,4 +1,4 @@
-# Run Locally
+﻿# Run Locally
 
 ## Prerequisites
 
@@ -10,13 +10,13 @@
 ## 1. Refresh Kite Access Token (once per trading day)
 
 ```powershell
-python scripts/daily/daily_get_kite_access_token.py
+python scripts/daily_NIFTY/daily_get_kite_access_token.py
 ```
 
 If you already have the redirect URL from the Kite login flow:
 
 ```powershell
-python scripts/daily/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
+python scripts/daily_NIFTY/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
 ```
 
 The token helper writes the access token to the configured database table
@@ -33,34 +33,32 @@ Open your browser at `http://127.0.0.1:5000`.
 
 ---
 
-## Predict a Stock (Technical Analysis)
+## NIFTY Technical Dashboard
 
-Use the **Technical Analysis** tab in the app.
+The Flask app is intentionally NIFTY-only. It shows NIFTY data/trends from
+`output/backtest/NIFTY_prediction.csv` and exposes only NIFTY Predict and
+Backtest actions.
 
-1. Select a stock or index from the dropdown (populated from active `WatchedInstrument` rows).
-2. Click **Predict** to run today's direction prediction using all registered strategies.
-3. The result shows per-strategy predictions (`CALL`, `PUT`, `NO_POSITION`) and an `aggregate_decision`.
+Click **Predict** to run today's NIFTY direction prediction using all registered
+strategies. Click **Backtest** to regenerate the legacy NIFTY CSV backtest.
 
 To generate predictions from the CLI directly:
 
 ```powershell
-python src/services/historical_prediction.py --underlying RELIANCE
+python src/services/historical_prediction.py --underlying NIFTY
 ```
 
-This writes `output/historical/RELIANCE_prediction.csv` covering the last 60 days.
+This writes `output/backtest/NIFTY_prediction.csv` covering the last 60 days.
 
 ---
 
-## Backtest a Stock (Technical Analysis)
+## Backtest NIFTY
 
-Use the **Technical Analysis** tab in the app.
-
-1. Select a stock or index.
-2. Click **Backtest**. The app will:
+Click **Backtest**. The app will:
    - Generate 60 days of historical predictions if the file does not exist.
    - Enrich each prediction row with next-day market data (`next_open`, `max_high_price`, `min_low_price`).
    - Classify `actual_move` (CALL / PUT / NO_POSITION) and compute `max_delta_pct`.
-   - Evaluate each strategy column and write results back to `output/historical/<underlying>_prediction.csv`.
+   - Evaluate each strategy column and write results back to `output/backtest/<underlying>_prediction.csv`.
 3. A CSV preview and summary metrics are shown in the browser.
 
 **Output columns:**
@@ -75,37 +73,34 @@ aggregate_decision, aggregate_decision_result, detected_regime,
 **actual_move logic:**
 
 ```text
-CALL        — max_high > next_open × 1.01  AND  min_low > next_open × 0.995
-PUT         — min_low  < next_open × 0.99  AND  max_high < next_open × 1.005
-NO_POSITION — volatile/mixed/flat day
+CALL        â€” max_high > next_open Ã— 1.01  AND  min_low > next_open Ã— 0.995
+PUT         â€” min_low  < next_open Ã— 0.99  AND  max_high < next_open Ã— 1.005
+NO_POSITION â€” volatile/mixed/flat day
 ```
 
 **Profit/stop thresholds (historical backtest):**
 
 ```text
-profit target = 1%   (next_open ± 1%)
-stop loss     = 0.5% (next_open ∓ 0.5%)
+profit target = 1%   (next_open Â± 1%)
+stop loss     = 0.5% (next_open âˆ“ 0.5%)
 ```
 
-To run the historical backtest from the CLI:
+The old CSV backtest runner is parked under `tests/legacy` so it does not look
+like a production package. To run it manually:
 
 ```powershell
-python src/backtest/historical_underlying_backtest.py --underlying RELIANCE
+python tests/legacy/historical_underlying_backtest.py --underlying NIFTY
 ```
 
 ---
 
 ## News Signal Backtest
 
-Use the **News Signal Backtest** tab in the app.
-
-1. Select a published date from the dropdown.
-2. The backtest evaluates rows in `output/trade_signal_journal.csv` against market data for that date.
-
-News prediction pipeline is disabled in the UI. To run the full orchestration pipeline from Python:
+News prediction/backtesting is no longer exposed in the Flask app. To run the
+full news orchestration pipeline from Python:
 
 ```python
-from src.services.orchestration_service import OrchestrationService
+from src.news_analysis_phase2.orchestration_service import OrchestrationService
 
 result = OrchestrationService.default().run()
 ```
@@ -113,7 +108,7 @@ result = OrchestrationService.default().run()
 To run the news backtest standalone:
 
 ```powershell
-python src/backtest/news_underlying_backtest.py --signal-journal-file output/trade_signal_journal.csv
+python src/news_analysis_phase2/backtest/news_underlying_backtest.py --signal-journal-file output/trade_signal_journal.csv
 ```
 
 ---
@@ -129,11 +124,12 @@ python flask_app.py
 ```
 
 **No stocks in the dropdown:**
-Run `python scripts/populate_watched_instruments.py` and ensure `WatchedInstrument` has `is_active = 1` rows.
+Run `python scripts/legacy/populate_watched_instruments.py` and ensure `WatchedInstrument` has `is_active = 1` rows.
 
 **No market data for backtest:**
 Run the daily market refresh to populate `UnderlyingSnapshot` and `UnderlyingCandle5m`:
 
 ```powershell
-python scripts/daily/daily_market_refresh.py --lookback 90 --underlying RELIANCE
+python scripts/daily_NIFTY/daily_market_refresh.py --lookback 90 --underlying RELIANCE
 ```
+

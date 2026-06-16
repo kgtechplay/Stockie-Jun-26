@@ -4,8 +4,8 @@ import pandas as pd
 
 from .features import PredictionInput, compute_underlying_features, get_closes
 
-TREND_RETURN_THRESHOLD = 0.03
-TREND_EFFICIENCY_THRESHOLD = 0.35
+TREND_RETURN_THRESHOLD = 0.02        # was 0.03 — relaxed so moderate trends qualify
+TREND_EFFICIENCY_THRESHOLD = 0.25   # was 0.35 — relaxed so imperfect trends qualify
 RANGE_RETURN_THRESHOLD = 0.04
 FLAT_SLOPE_THRESHOLD = 0.01
 HIGH_VOLATILITY_THRESHOLD = 0.025
@@ -17,7 +17,7 @@ FREQUENT_CROSSOVER_THRESHOLD = 2
 def detect_regime(window: PredictionInput) -> str:
     features = compute_underlying_features(window)
     closes = get_closes(window)
-    if len(closes) < 60:
+    if len(closes) < 10:            # was 60 — only block if truly insufficient data
         return "UNKNOWN"
 
     close = float(closes.iloc[-1])

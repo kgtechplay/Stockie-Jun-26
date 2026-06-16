@@ -94,13 +94,13 @@ def build_strategy_signals(
 
 
 def aggregate_strategy_signals(strategy_signals: list[StrategySignal]) -> tuple[Direction, StrategySignal | None, bool]:
-    eligible = [signal for signal in strategy_signals if signal.score >= 50 and signal.raw_signal in {"CALL", "PUT"}]
+    eligible = [signal for signal in strategy_signals if signal.score >= 30 and signal.raw_signal in {"CALL", "PUT"}]
     bullish_score = sum(signal.score for signal in eligible if signal.raw_signal == "CALL")
     bearish_score = sum(signal.score for signal in eligible if signal.raw_signal == "PUT")
-    conflict = bullish_score >= 65 and bearish_score >= 65
-    if bullish_score >= bearish_score * 1.25 and bullish_score >= 50:
+    conflict = bullish_score >= 40 and bearish_score >= 40
+    if bullish_score >= bearish_score * 1.25 and bullish_score >= 30:
         direction: Direction = "BULLISH"
-    elif bearish_score >= bullish_score * 1.25 and bearish_score >= 50:
+    elif bearish_score >= bullish_score * 1.25 and bearish_score >= 30:
         direction = "BEARISH"
     else:
         direction = "NEUTRAL"
