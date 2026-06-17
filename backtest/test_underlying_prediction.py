@@ -57,6 +57,7 @@ from src.technical_analysis.prediction.view import build_underlying_view
 # ── pipeline-only imports ─────────────────────────────────────────────────────
 from src.common.config import get_settings
 from src.data_manager.db.client_factory import get_database_client
+from src.technical_analysis.prediction.highsight_regime import compute_hindsight_regime
 from src.technical_analysis.prediction.regime import detect_regime as _detect_regime
 from src.technical_analysis.prediction.snapshot import build_regime_snapshot
 from src.technical_analysis.prediction.strategies import (
@@ -183,6 +184,7 @@ class UnderlyingPredictionViewTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY_prediction.csv"
+DEFAULT_REGIME_COMPARISON = Path("output") / "backtest" / "NIFTY_regime_experiment_comparison.csv"
 _EXTRA_OHLCV_DAYS = 120  # rolling window lookback before start_date
 
 
@@ -302,6 +304,22 @@ def _generate_prediction_summary(
     lines.append(_acc("raw_signal"))
     lines.append(_rec("raw_signal"))
 
+    if {"regime", "hindsight_regime", "regime_match"}.issubset(w.columns):
+        comparable = w[w["hindsight_regime"].notna() & (w["hindsight_regime"] != "UNKNOWN")]
+        total_regime = len(comparable)
+        correct_regime = int((comparable["regime_match"] == True).sum())
+        regime_pct = 100.0 * correct_regime / total_regime if total_regime else 0.0
+        lines.append("\n--- REGIME DETECTION ---")
+        lines.append(f"  Comparable hindsight rows: {total_regime}/{n_rows}")
+        if total_regime:
+            lines.append(f"  Accuracy : {correct_regime}/{total_regime} = {regime_pct:.0f}%")
+            mismatch = comparable[comparable["regime_match"] != True]
+            if not mismatch.empty:
+                pairs = mismatch.groupby(["regime", "hindsight_regime"]).size().sort_values(ascending=False)
+                lines.append("  Top mismatches:")
+                for (detected, hindsight), count in pairs.head(5).items():
+                    lines.append(f"    {detected} vs {hindsight}: {int(count)}")
+
     lines.append(f"\n--- PER STRATEGY ---")
     for col in strategy_cols:
         n_active = int(w[col].notna().sum())
@@ -378,11 +396,52 @@ def _sf_row_to_feature_snapshot(row: dict[str, Any], symbol: str) -> UnderlyingF
     )
 
 
+def _load_current_regime_overrides(path: Path | None, underlying: str) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    df = pd.read_csv(path)
+    required = {"date", "current_regime"}
+    if not required.issubset(df.columns):
+        return {}
+    if "underlying" in df.columns:
+        df = df[df["underlying"].astype(str).str.upper() == underlying.upper()]
+
+    overrides: dict[str, str] = {}
+    for _, row in df.iterrows():
+        regime = str(row.get("current_regime") or "").upper()
+        if regime in {"TREND_UP", "TREND_DOWN", "RANGE", "CHOPPY", "UNKNOWN"}:
+            overrides[str(row["date"])[:10]] = regime
+    return overrides
+
+
+def _ensure_regime_comparison(
+    path: Path | None,
+    underlying: str,
+    start_date: date,
+    end_date: date,
+) -> Path | None:
+    if path is None or path.exists():
+        return path
+
+    print(f"Regime comparison missing at {path}; running regime experiments first...")
+    from backtest.test_regime import run_regime_experiments
+
+    result = run_regime_experiments(
+        underlying=underlying.upper(),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=path.parent,
+    )
+    generated = Path(str(result.get("comparison_path") or path))
+    return generated if generated.exists() else path
+
+
 def generate_prediction_csv(
     underlying: str = "NIFTY",
     start_date: date | None = None,
     end_date: date | None = None,
     output_path: Path = DEFAULT_OUTPUT,
+    regime_comparison_path: Path | None = DEFAULT_REGIME_COMPARISON,
 ) -> dict[str, Any]:
     if end_date is None:
         end_date = date.today()
@@ -392,6 +451,12 @@ def generate_prediction_csv(
     strategies = load_underlying_prediction_strategies()
     strategy_names = sorted(strategies.keys())
     lookback_start = start_date - timedelta(days=_EXTRA_OHLCV_DAYS)
+    regime_comparison_path = _ensure_regime_comparison(
+        regime_comparison_path,
+        underlying,
+        start_date,
+        end_date,
+    )
 
     print(f"Fetching data for {underlying} {start_date} to {end_date} ...")
     settings = get_settings()
@@ -406,6 +471,10 @@ def generate_prediction_csv(
     if sf_df.empty:
         print(f"No SignalFeatureDaily rows for {underlying} {start_date}–{end_date}")
         return {"rows": 0, "path": str(output_path)}
+
+    regime_overrides = _load_current_regime_overrides(regime_comparison_path, underlying)
+    if regime_overrides:
+        print(f"Loaded {len(regime_overrides)} current-regime overrides from {regime_comparison_path}")
 
     # Index OHLCV by date for fast rolling window slicing
     ohlcv_df = ohlcv_df.copy()
@@ -435,7 +504,8 @@ def generate_prediction_csv(
     for _, sf_row in sf_df.iterrows():
         signal_ts = pd.to_datetime(sf_row["signal_date"])
         signal_date_str = str(signal_ts)[:10]
-        regime = str(sf_row.get("regime") or "UNKNOWN").upper()
+        db_regime = str(sf_row.get("regime") or "UNKNOWN").upper()
+        regime = regime_overrides.get(signal_date_str, db_regime)
 
         # Build rolling window DataFrame for raw strategy functions
         idx = date_to_ohlcv_idx.get(signal_ts)
@@ -488,7 +558,16 @@ def generate_prediction_csv(
             "volatility_20d": sf_row.get("volatility_20d"),
             "volume_ratio": sf_row.get("volume_ratio"),
             "regime": regime,
+            "regime_source": "regime_experiment_current" if signal_date_str in regime_overrides else "SignalFeatureDaily",
+            "db_regime": db_regime,
         }
+        hindsight = compute_hindsight_regime(ohlcv_df, idx)
+        row.update(hindsight)
+        row["regime_match"] = (
+            regime == hindsight["hindsight_regime"]
+            if hindsight["hindsight_regime"] != "UNKNOWN"
+            else None
+        )
         # per-strategy raw signals (None = strategy not active for this regime)
         for name in strategy_names:
             row[name] = predictions.get(name)
@@ -539,6 +618,14 @@ def main() -> None:
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD. Default: 1 year before end.")
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD. Default: today.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"Output CSV path. Default: {DEFAULT_OUTPUT}")
+    parser.add_argument(
+        "--regime-comparison",
+        default=str(DEFAULT_REGIME_COMPARISON),
+        help=(
+            "Regime experiment comparison CSV. Uses current_regime when present; "
+            f"default: {DEFAULT_REGIME_COMPARISON}"
+        ),
+    )
     args = parser.parse_args()
 
     result = generate_prediction_csv(
@@ -546,6 +633,7 @@ def main() -> None:
         start_date=date.fromisoformat(args.start) if args.start else None,
         end_date=date.fromisoformat(args.end) if args.end else None,
         output_path=Path(args.output),
+        regime_comparison_path=Path(args.regime_comparison) if args.regime_comparison else None,
     )
     print(result)
 

@@ -4,9 +4,9 @@ import pandas as pd
 
 from .features import PredictionInput, compute_underlying_features, get_closes
 
-TREND_RETURN_THRESHOLD = 0.02        # was 0.03 — relaxed so moderate trends qualify
-TREND_EFFICIENCY_THRESHOLD = 0.25   # was 0.35 — relaxed so imperfect trends qualify
-RANGE_RETURN_THRESHOLD = 0.04
+TREND_RETURN_THRESHOLD = 0.02
+TREND_EFFICIENCY_THRESHOLD = 0.25
+RANGE_RETURN_THRESHOLD = 0.012
 FLAT_SLOPE_THRESHOLD = 0.01
 HIGH_VOLATILITY_THRESHOLD = 0.025
 MODERATE_VOLATILITY_MAX = 0.03

@@ -432,10 +432,20 @@ def generate_option_selection_csv(
     underlying: str = "NIFTY",
 ) -> dict[str, Any]:
     if not input_path.exists():
-        raise FileNotFoundError(
-            f"Prediction CSV not found at {input_path}. "
-            "Run backtest/test_underlying_prediction.py first."
+        print(f"Prediction CSV missing at {input_path}; running underlying prediction first...")
+        from backtest.test_underlying_prediction import generate_prediction_csv
+
+        prediction_result = generate_prediction_csv(
+            underlying=underlying.upper(),
+            output_path=input_path,
+            regime_comparison_path=input_path.with_name(
+                f"{underlying.upper()}_regime_experiment_comparison.csv"
+            ),
         )
+        if int(prediction_result.get("rows") or 0) == 0 or not input_path.exists():
+            raise FileNotFoundError(
+                f"Prediction CSV not found at {input_path} and automatic generation produced no rows."
+            )
 
     pred_df = pd.read_csv(input_path)
     if pred_df.empty:
