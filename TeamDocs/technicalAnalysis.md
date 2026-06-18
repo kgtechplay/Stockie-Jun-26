@@ -54,7 +54,7 @@ Only the strategies matched to the detected regime run. Others are left blank in
 |---|---|
 | `TREND_UP` | `MaTrend_001`, `trendUpRangeBreakout`, `BollingerMeanReversion` |
 | `TREND_DOWN` | `MaTrend_001`, `trendDownRangeBreakout`, `BollingerMeanReversion` |
-| `RANGE` | `rangeBollingerMeanReversion`, `rangeRsiMeanReversion_6535` |
+| `RANGE` | `rangeBollingerMeanReversion`, `rangeRsiMeanReversion_6040` |
 | `CHOPPY` / `UNKNOWN` | (none â€” no trade) |
 
 ### Strategy signal logic
@@ -66,7 +66,7 @@ Only the strategies matched to the detected regime run. Others are left blank in
 | `trendDownRangeBreakout` | PUT if today's close < 20-day low (breakdown); other outcomes â†’ NO_POSITION |
 | `BollingerMeanReversion` | CALL if close < lower BB (MA20 âˆ’ 2Ïƒ); PUT if close > upper BB (MA20 + 2Ïƒ) |
 | `rangeBollingerMeanReversion` | Same as above; restricted to RANGE regime |
-| `rangeRsiMeanReversion_6535` | CALL if RSI14 < 40; PUT if RSI14 > 60; else NO_POSITION *(thresholds relaxed from 35/65 to fire in moderate range conditions)* |
+| `rangeRsiMeanReversion_6040` | CALL if RSI14 < 40; PUT if RSI14 > 60; else NO_POSITION |
 
 ### Aggregation into `raw_signal`
 
@@ -129,12 +129,12 @@ Each strategy signal is scored individually (0â€“100). The pipeline then ag
 
 ### How to run a backtest
 
-1. **Prediction backtest** â€” reads `SignalFeatureDaily` from DB, runs all strategies over a rolling OHLCV window, writes `output/backtest/NIFTY_prediction.csv`:
+1. **Prediction backtest** â€” reads `SignalFeatureDaily` from DB, runs all strategies over a rolling OHLCV window, writes `output/backtest/NIFTY/production/NIFTY_prediction.csv`:
    ```
    python backtest/test_underlying_prediction.py --underlying NIFTY --start 2026-04-01
    ```
 
-2. **Option selection + P&L backtest** â€” reads the prediction CSV, runs option selection at EOD chain, calculates next-day P&L and 5-day 2%-profit scan, writes `output/backtest/NIFTY_optionSelection.csv`:
+2. **Option selection + P&L backtest** â€” reads the prediction CSV, runs option selection at EOD chain, calculates next-day P&L and 5-day 2%-profit scan, writes `output/backtest/NIFTY/production/NIFTY_optionSelection.csv`:
    ```
    python backtest/test_optionselection_e2e.py
    ```
@@ -152,4 +152,4 @@ Run step 1 first whenever prediction strategies change. Run step 2 whenever opti
 
 ## Flask
 
-`flask_app.py` is NIFTY-only. It shows NIFTY data/trends from `output/backtest/NIFTY_prediction.csv` and exposes NIFTY Predict/Backtest actions for local inspection.
+`flask_app.py` is NIFTY-only. It shows NIFTY data/trends from `output/backtest/NIFTY/production/NIFTY_prediction.csv` and exposes NIFTY Predict/Backtest actions for local inspection.

@@ -140,7 +140,7 @@ def read_csv_preview(path: Path, limit: int = 50) -> tuple[list[dict[str, Any]],
 
 
 def load_nifty_dashboard() -> dict[str, Any]:
-    path = PROJECT_ROOT / "output" / "backtest" / f"{NIFTY_SYMBOL}_prediction.csv"
+    path = PROJECT_ROOT / "output" / "backtest" / NIFTY_SYMBOL / "production" / f"{NIFTY_SYMBOL}_prediction.csv"
     dashboard: dict[str, Any] = {
         "has_file": path.exists(),
         "path": str(path),
@@ -287,7 +287,7 @@ PAGE_TEMPLATE = r"""
         <strong>NIFTY Data And Trends</strong>
         <span>
           {% if dashboard.has_file %}
-            Source: output/backtest/NIFTY_prediction.csv
+            Source: output/backtest/NIFTY/production/NIFTY_prediction.csv
           {% else %}
             No NIFTY historical output found yet.
           {% endif %}

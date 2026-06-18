@@ -6,8 +6,8 @@ Script mode:
     python backtest/test_regime.py --underlying NIFTY --start 2025-01-01 --end 2026-06-17
 
 Outputs:
-    output/backtest/NIFTY_regime_experiment_comparison.csv
-    output/backtest/NIFTY_regime_experiment_summary.csv
+    output/backtest/NIFTY/regime/NIFTY_regime_experiment_comparison.csv
+    output/backtest/NIFTY/regime/NIFTY_regime_experiment_summary.csv
 """
 from __future__ import annotations
 

@@ -4,10 +4,10 @@ NIFTY underlying prediction — unit tests + prediction CSV generator.
 Unittest mode (pytest):
     pytest backtest/test_underlying_prediction.py
 
-Script mode — build output/backtest/NIFTY_prediction.csv from SignalFeatureDaily:
+Script mode — build output/backtest/NIFTY/production/NIFTY_prediction.csv from SignalFeatureDaily:
     python backtest/test_underlying_prediction.py
     python backtest/test_underlying_prediction.py --underlying NIFTY --start 2026-04-01 --end 2026-06-17
-    python backtest/test_underlying_prediction.py --output output/backtest/NIFTY_prediction.csv
+    python backtest/test_underlying_prediction.py --output output/backtest/NIFTY/production/NIFTY_prediction.csv
 
 CSV produced (one row per SignalFeatureDaily date):
     date, underlying, close, MA/RSI/ATR/BB/return features, regime,
@@ -19,7 +19,7 @@ CSV produced (one row per SignalFeatureDaily date):
 Regime-to-strategy routing (strategies outside the active set are marked NO_POSITION):
     TREND_UP   → MaTrend_001, trendUpRangeBreakout, BollingerMeanReversion
     TREND_DOWN → MaTrend_001, trendDownRangeBreakout, BollingerMeanReversion
-    RANGE      → rangeBollingerMeanReversion, rangeRsiMeanReversion_6535
+    RANGE      → rangeBollingerMeanReversion, rangeRsiMeanReversion_6040
     CHOPPY     → (none — veto, always NO_POSITION)
     UNKNOWN    → (none — insufficient data)
 """
@@ -183,8 +183,12 @@ class UnderlyingPredictionViewTests(unittest.TestCase):
 # Prediction CSV pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "prediction" / "NIFTY_prediction.csv"
-DEFAULT_RESEARCH_OUTPUT = Path("output") / "backtest" / "NIFTY" / "prediction" / "NIFTY_prediction_research.csv"
+DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "production" / "NIFTY_prediction.csv"
+DEFAULT_RESEARCH_OUTPUT = Path("output") / "backtest" / "NIFTY" / "experiment" / "base.csv"
+DEFAULT_EXPECTED_TREND_RESEARCH_OUTPUT = (
+    Path("output") / "backtest" / "NIFTY" / "experiment" / "expectedRegime_Trend.csv"
+)
+DEFAULT_EXPERIMENT_LOGGER_OUTPUT = Path("output") / "backtest" / "NIFTY" / "experiment" / "logger.txt"
 DEFAULT_REGIME_COMPARISON = Path("output") / "backtest" / "NIFTY" / "regime" / "NIFTY_regime_experiment_comparison.csv"
 _EXTRA_OHLCV_DAYS = 120  # rolling window lookback before start_date
 
@@ -206,7 +210,7 @@ def _put_only(fn: Any) -> Any:
 
 # Per-regime callable map — bypasses internal detect_regime() inside range-gated wrappers
 # so the DB-computed regime (from SignalFeatureDaily) is always authoritative.
-# RANGE RSI thresholds relaxed to 60/40 (were 65/35) to fire in moderate RANGE conditions.
+# RANGE RSI uses 60/40 so moderate mean-reversion setups can fire.
 _REGIME_DIRECT_CALLS: dict[str, dict[str, Any]] = {
     "TREND_UP": {
         "MaTrend_001":           signal_ma_trend,
@@ -220,23 +224,16 @@ _REGIME_DIRECT_CALLS: dict[str, dict[str, Any]] = {
     },
     "RANGE": {
         "rangeBollingerMeanReversion":  signal_bollinger_mean_reversion,
-        "rangeRsiMeanReversion_6535":   partial(signal_rsi_mean_reversion, overbought=60.0, oversold=40.0),
+        "rangeRsiMeanReversion_6040":   partial(signal_rsi_mean_reversion, overbought=60.0, oversold=40.0),
     },
     "CHOPPY":  {},
     "UNKNOWN": {},
 }
 
-_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
+_BASE_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
     "BollingerMeanReversion": signal_bollinger_mean_reversion,
     "MaTrend_001": signal_ma_trend,
-    "RsiMeanReversion_6535": partial(
-        signal_rsi_mean_reversion,
-        rsi_period=14,
-        overbought=65.0,
-        oversold=35.0,
-    ),
-    "rangeBollingerMeanReversion": signal_bollinger_mean_reversion,
-    "rangeRsiMeanReversion_6535": partial(
+    "RsiMeanReversion_6040": partial(
         signal_rsi_mean_reversion,
         rsi_period=14,
         overbought=60.0,
@@ -247,6 +244,329 @@ _RESEARCH_DIRECT_CALLS: dict[str, Any] = {
     "choppy": lambda _window: "NO_POSITION",
     "unknown": lambda _window: "NO_POSITION",
 }
+
+_EXPECTED_TREND_RESEARCH_CALLS: dict[str, Any] = {
+    "expectedTrendUp_DipStabilizing_Call": lambda window: _signal_expected_trend_up_dip_stabilizing_call(window),
+    "expectedTrendUp_RangeRecovery_Call": lambda window: _signal_expected_trend_up_range_recovery_call(window),
+    "expectedTrendUp_RSIRecovery_Call": lambda window: _signal_expected_trend_up_rsi_recovery_call(window),
+    "expectedTrendDown_RallyFailing_Put": lambda window: _signal_expected_trend_down_rally_failing_put(window),
+    "expectedTrendDown_RangeReject_Put": lambda window: _signal_expected_trend_down_range_reject_put(window),
+    "expectedTrendDown_HighVolBreak_Put": lambda window: _signal_expected_trend_down_high_vol_break_put(window),
+    "expectedTrendDown_RSIWeakness_Put": lambda window: _signal_expected_trend_down_rsi_weakness_put(window),
+}
+
+_EXPECTED_TREND_BASE_STRATEGIES = {
+    "MaTrend_001",
+    "RsiMeanReversion_6040",
+    "trendUpRangeBreakout",
+}
+
+_EXPERIMENT_LOGGER_REGISTRY: dict[str, dict[str, Any]] = {
+    "MaTrend_Constrained_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 8,
+        "precision_pct": 25.00,
+        "recall_pct": 1.68,
+        "remove_reason": "Too restrictive: only 8 signals, and it filtered out most correct CALL candidates.",
+    },
+    "MaTrend_Constrained_Put": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 61,
+        "precision_pct": 18.03,
+        "recall_pct": 9.24,
+        "remove_reason": "Worse than base MA Trend on precision and recall; retained too many stale mid/high-range PUTs.",
+    },
+    "MA_Rebound_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 35,
+        "precision_pct": 25.71,
+        "recall_pct": 7.56,
+        "remove_reason": "Dominated by MA_Rebound_Call_v2 and later superseded by expected-regime CALL experiments.",
+    },
+    "MA_Rebound_Call_v2": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 19,
+        "precision_pct": 36.84,
+        "recall_pct": 5.88,
+        "remove_reason": "Useful but superseded by expectedTrendUp_DipStabilizing_Call and expectedTrendUp_RangeRecovery_Call.",
+    },
+    "MA_Momentum_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 39,
+        "precision_pct": 20.51,
+        "recall_pct": 6.72,
+        "remove_reason": "Lower precision than base MA Trend CALL and weaker than the v2 momentum filter.",
+    },
+    "MA_Momentum_Call_v2": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 23,
+        "precision_pct": 26.09,
+        "recall_pct": 5.04,
+        "remove_reason": "Improved over MA_Momentum_Call but was superseded by expected-regime trend-up strategies.",
+    },
+    "MA_Revised_PUT": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 64,
+        "precision_pct": 31.25,
+        "recall_pct": 16.81,
+        "remove_reason": "Improved raw MA PUT precision but superseded by expected-regime TREND_DOWN strategies.",
+    },
+    "expectedTrendUp_OversoldBounce_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 8,
+        "precision_pct": 87.50,
+        "recall_pct": 17.07,
+        "remove_reason": "Dominated by expectedTrendUp_DipStabilizing_Call and expectedTrendUp_RangeRecovery_Call.",
+    },
+    "expectedTrendUp_BreakoutContinuation_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 5,
+        "precision_pct": 60.00,
+        "recall_pct": 7.32,
+        "remove_reason": "Dominated by stronger expected TREND_UP CALL candidates.",
+    },
+    "expectedTrendUp_LowVolPullback_Call": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 1,
+        "precision_pct": 0.00,
+        "recall_pct": 0.00,
+        "remove_reason": "Only 1 signal and 0 correct in the expected-trend sample.",
+    },
+    "expectedTrendDown_BreakdownContinuation_Put": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 6,
+        "precision_pct": 66.67,
+        "recall_pct": 9.76,
+        "remove_reason": "Dominated by expectedTrendDown_RSIWeakness_Put and expectedTrendDown_HighVolBreak_Put.",
+    },
+    "expectedTrendDown_OverboughtFade_Put": {
+        "dataset": "expectedRegime_Trend",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 0,
+        "precision_pct": None,
+        "recall_pct": 0.00,
+        "remove_reason": "No signals fired in the expected-trend sample.",
+    },
+}
+
+_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
+    **_BASE_RESEARCH_DIRECT_CALLS,
+    **_EXPECTED_TREND_RESEARCH_CALLS,
+}
+
+_RESEARCH_EXCLUDED_STRATEGIES = {
+    "rangeBollingerMeanReversion",
+    "rangeRsiMeanReversion_6040",
+    "unknown",
+}
+
+
+def _latest_float(window: Any, column: str) -> float | None:
+    try:
+        if column not in window or window.empty:
+            return None
+        value = window[column].iloc[-1]
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _latest_str(window: Any, column: str) -> str | None:
+    try:
+        if column not in window or window.empty:
+            return None
+        value = window[column].iloc[-1]
+        if pd.isna(value):
+            return None
+        return str(value).strip().upper()
+    except Exception:
+        return None
+
+
+def _expected_regime(window: Any) -> str | None:
+    return _latest_str(window, "expected_regime_lag2")
+
+
+def _signal_expected_trend_up_dip_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or range_position_10d is None or ret_10d is None:
+        return "NO_POSITION"
+    if rsi14 < 55 and range_position_10d < 0.65 and ret_10d < 0:
+        return "CALL"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_up_ma5_turn_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ma5d_slope = _latest_float(window, "ma5d_slope")
+    ma10d_slope = _latest_float(window, "ma10d_slope")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or ma5d_slope is None or ma10d_slope is None or ret_10d is None:
+        return "NO_POSITION"
+    if rsi14 < 60 and ma5d_slope > 0 and (ma10d_slope < 0 or ret_10d < 0):
+        return "CALL"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_up_momentum_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_5d = _latest_float(window, "ret_5d")
+    trend_efficiency_10d = _latest_float(window, "trend_efficiency_10d")
+    if rsi14 is None or range_position_10d is None or ret_5d is None or trend_efficiency_10d is None:
+        return "NO_POSITION"
+    if rsi14 <= 70 and range_position_10d > 0.7 and ret_5d > 0 and trend_efficiency_10d > 0.3:
+        return "CALL"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_down_rally_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or range_position_10d is None or ret_10d is None:
+        return "NO_POSITION"
+    if rsi14 > 45 and range_position_10d > 0.35 and ret_10d > 0:
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_down_ma5_turn_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ma5d_slope = _latest_float(window, "ma5d_slope")
+    ma10d_slope = _latest_float(window, "ma10d_slope")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or ma5d_slope is None or ma10d_slope is None or ret_10d is None:
+        return "NO_POSITION"
+    if rsi14 > 40 and ma5d_slope < 0 and (ma10d_slope > 0 or ret_10d > 0):
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_down_breakdown_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_5d = _latest_float(window, "ret_5d")
+    trend_efficiency_10d = _latest_float(window, "trend_efficiency_10d")
+    if range_position_10d is None or ret_5d is None or trend_efficiency_10d is None:
+        return "NO_POSITION"
+    if range_position_10d < 0.5 and ret_5d < 0 and trend_efficiency_10d > 0.3:
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _signal_expected_trend_up_dip_stabilizing_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ret_5d = _latest_float(window, "ret_5d")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or ret_5d is None or ret_10d is None:
+        return "NO_POSITION"
+    return "CALL" if rsi14 < 55 and ret_10d < 0 and ret_5d > (ret_10d / 2.0) else "NO_POSITION"
+
+
+def _signal_expected_trend_up_range_recovery_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    range_position_5d = _latest_float(window, "range_position_5d")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    if range_position_5d is None or range_position_10d is None:
+        return "NO_POSITION"
+    return "CALL" if range_position_5d > range_position_10d and range_position_10d < 0.6 else "NO_POSITION"
+
+
+def _signal_expected_trend_up_rsi_recovery_call(window: Any) -> str:
+    if _expected_regime(window) != "TREND_UP":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ret_5d = _latest_float(window, "ret_5d")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    if rsi14 is None or ret_5d is None or range_position_10d is None:
+        return "NO_POSITION"
+    return "CALL" if 45 <= rsi14 <= 60 and ret_5d > 0 and range_position_10d < 0.7 else "NO_POSITION"
+
+
+def _signal_expected_trend_down_rally_failing_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ret_5d = _latest_float(window, "ret_5d")
+    ret_10d = _latest_float(window, "ret_10d")
+    if rsi14 is None or ret_5d is None or ret_10d is None:
+        return "NO_POSITION"
+    return "PUT" if rsi14 > 45 and ret_10d > 0 and ret_5d < (ret_10d / 2.0) else "NO_POSITION"
+
+
+def _signal_expected_trend_down_range_reject_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_5d = _latest_float(window, "ret_5d")
+    if range_position_10d is None or ret_5d is None:
+        return "NO_POSITION"
+    return "PUT" if range_position_10d > 0.7 and ret_5d <= 0 else "NO_POSITION"
+
+
+def _signal_expected_trend_down_high_vol_break_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    range_position_10d = _latest_float(window, "range_position_10d")
+    ret_5d = _latest_float(window, "ret_5d")
+    volatility_10d = _latest_float(window, "volatility_10d")
+    volatility_20d = _latest_float(window, "volatility_20d")
+    if range_position_10d is None or ret_5d is None or volatility_10d is None or volatility_20d is None:
+        return "NO_POSITION"
+    return "PUT" if ret_5d < 0 and volatility_10d > volatility_20d and range_position_10d < 0.5 else "NO_POSITION"
+
+
+def _signal_expected_trend_down_rsi_weakness_put(window: Any) -> str:
+    if _expected_regime(window) != "TREND_DOWN":
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ret_5d = _latest_float(window, "ret_5d")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    if rsi14 is None or ret_5d is None or range_position_10d is None:
+        return "NO_POSITION"
+    return "PUT" if 40 <= rsi14 <= 55 and ret_5d < 0 and range_position_10d < 0.6 else "NO_POSITION"
 
 
 _SIGNIFICANCE_PCT = 0.5   # |intraday_chg_pct| >= this = "significant move" for recall
@@ -465,6 +785,7 @@ def generate_prediction_csv(
     end_date: date | None = None,
     output_path: Path = DEFAULT_OUTPUT,
     research_output_path: Path | None = DEFAULT_RESEARCH_OUTPUT,
+    expected_trend_research_output_path: Path | None = DEFAULT_EXPECTED_TREND_RESEARCH_OUTPUT,
     regime_comparison_path: Path | None = DEFAULT_REGIME_COMPARISON,
 ) -> dict[str, Any]:
     if end_date is None:
@@ -474,6 +795,12 @@ def generate_prediction_csv(
 
     strategies = load_underlying_prediction_strategies()
     strategy_names = sorted(strategies.keys())
+    base_research_strategy_names = sorted(
+        set(strategy_names).union(_BASE_RESEARCH_DIRECT_CALLS.keys()) - _RESEARCH_EXCLUDED_STRATEGIES
+    )
+    expected_trend_research_strategy_names = sorted(
+        _EXPECTED_TREND_BASE_STRATEGIES.union(_EXPECTED_TREND_RESEARCH_CALLS.keys())
+    )
     lookback_start = start_date - timedelta(days=_EXTRA_OHLCV_DAYS)
     regime_comparison_path = _ensure_regime_comparison(
         regime_comparison_path,
@@ -533,6 +860,8 @@ def generate_prediction_csv(
 
     output_rows: list[dict[str, Any]] = []
     research_rows: list[dict[str, Any]] = []
+    expected_trend_research_rows: list[dict[str, Any]] = []
+    hindsight_regime_history: list[str] = []
 
     for _, sf_row in sf_df.iterrows():
         signal_ts = pd.to_datetime(sf_row["signal_date"])
@@ -552,6 +881,13 @@ def generate_prediction_csv(
         if regime == "UNKNOWN" and not window.empty:
             regime = _detect_regime(window).upper()
 
+        hindsight = compute_hindsight_regime(ohlcv_df, idx)
+        expected_regime_lag2 = (
+            hindsight_regime_history[-2]
+            if len(hindsight_regime_history) >= 2
+            else None
+        )
+
         # Call the raw signal functions directly (bypasses internal detect_regime wrappers).
         # Inactive strategies → None (blank in CSV, not NO_POSITION, to avoid confusion).
         direct_fns = _REGIME_DIRECT_CALLS.get(regime, {})
@@ -567,16 +903,46 @@ def generate_prediction_csv(
                     predictions[name] = None
 
         research_predictions: dict[str, str] = {}
-        for name in strategy_names:
-            strategy = _RESEARCH_DIRECT_CALLS.get(name) or strategies.get(name)
-            if strategy is None or window.empty:
-                research_predictions[name] = "NO_POSITION"
-                continue
-            try:
-                raw = str(strategy(window)).strip().upper()
-                research_predictions[name] = raw if raw in {"CALL", "PUT", "NO_POSITION"} else "NO_POSITION"
-            except Exception:
-                research_predictions[name] = "NO_POSITION"
+        research_window = window.copy()
+        if not research_window.empty:
+            latest_idx = research_window.index[-1]
+            for feature_col in (
+                "rsi14",
+                "range_position_5d",
+                "range_position_10d",
+                "ret_5d",
+                "ret_10d",
+                "ma5d_slope",
+                "ma10d_slope",
+                "trend_efficiency_5d",
+                "trend_efficiency_10d",
+                "volatility_10d",
+                "volatility_20d",
+            ):
+                research_window.loc[latest_idx, feature_col] = sf_row.get(feature_col)
+            research_window.loc[latest_idx, "expected_regime_lag2"] = expected_regime_lag2
+
+        def _run_research_predictions(names: list[str], call_map: dict[str, Any]) -> dict[str, str]:
+            predictions_out: dict[str, str] = {}
+            for strategy_name in names:
+                strategy = call_map.get(strategy_name) or strategies.get(strategy_name)
+                if strategy is None or research_window.empty:
+                    predictions_out[strategy_name] = "NO_POSITION"
+                    continue
+                try:
+                    raw_value = str(strategy(research_window)).strip().upper()
+                    predictions_out[strategy_name] = (
+                        raw_value if raw_value in {"CALL", "PUT", "NO_POSITION"} else "NO_POSITION"
+                    )
+                except Exception:
+                    predictions_out[strategy_name] = "NO_POSITION"
+            return predictions_out
+
+        research_predictions = _run_research_predictions(base_research_strategy_names, _BASE_RESEARCH_DIRECT_CALLS)
+        expected_trend_research_predictions = _run_research_predictions(
+            expected_trend_research_strategy_names,
+            _RESEARCH_DIRECT_CALLS,
+        )
 
         # Build feature snapshot from pre-computed SignalFeatureDaily values
         features = _sf_row_to_feature_snapshot(sf_row.to_dict(), underlying)
@@ -610,8 +976,8 @@ def generate_prediction_csv(
             "regime": regime,
             "regime_source": "regime_experiment_current" if signal_date_str in regime_overrides else "SignalFeatureDaily",
             "db_regime": db_regime,
+            "expected_regime_lag2": expected_regime_lag2,
         }
-        hindsight = compute_hindsight_regime(ohlcv_df, idx)
         row.update(hindsight)
         row["regime_match"] = (
             regime == hindsight["hindsight_regime"]
@@ -662,11 +1028,30 @@ def generate_prediction_csv(
                 next_date=next_date_val,
                 next_ohlcv=next_ohlcv,
                 research_predictions=research_predictions,
-                strategy_names=strategy_names,
+                strategy_names=base_research_strategy_names,
                 strategy_signals_by_name=research_strategy_signals_by_name,
                 view=view,
             )
             research_rows.append(research_row)
+        if expected_trend_research_output_path is not None:
+            expected_trend_research_row = _build_research_row(
+                base_row=row,
+                sf_row=sf_row.to_dict(),
+                signal_date=signal_date_obj,
+                current_ohlcv=_ohlcv_by_date.get(signal_date_obj),
+                next_date=next_date_val,
+                next_ohlcv=next_ohlcv,
+                research_predictions=expected_trend_research_predictions,
+                strategy_names=expected_trend_research_strategy_names,
+                strategy_signals_by_name={},
+                view=view,
+            )
+            if (
+                expected_trend_research_row.get("expected_regime_lag2") in {"TREND_UP", "TREND_DOWN"}
+                and expected_trend_research_row.get("actual_trade_label") in {"CALL", "PUT"}
+            ):
+                expected_trend_research_rows.append(expected_trend_research_row)
+        hindsight_regime_history.append(str(hindsight.get("hindsight_regime") or "UNKNOWN").upper())
 
     out_df = pd.DataFrame(output_rows)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,14 +1062,39 @@ def generate_prediction_csv(
     _generate_prediction_summary(out_df, summary_path)
 
     research_path: str | None = None
+    research_df: pd.DataFrame | None = None
     if research_output_path is not None:
         research_df = pd.DataFrame(research_rows)
         research_output_path.parent.mkdir(parents=True, exist_ok=True)
         research_df.to_csv(research_output_path, index=False)
+        _generate_research_summary(research_df, research_output_path.with_name(research_output_path.stem + "_summary.txt"))
         research_path = str(research_output_path)
         print(f"Wrote {len(research_df)} research rows to {research_output_path}")
+    expected_trend_research_path: str | None = None
+    expected_trend_research_df: pd.DataFrame | None = None
+    if expected_trend_research_output_path is not None:
+        expected_trend_research_df = pd.DataFrame(expected_trend_research_rows)
+        expected_trend_research_output_path.parent.mkdir(parents=True, exist_ok=True)
+        expected_trend_research_df.to_csv(expected_trend_research_output_path, index=False)
+        _generate_research_summary(
+            expected_trend_research_df,
+            expected_trend_research_output_path.with_name(expected_trend_research_output_path.stem + "_summary.txt"),
+        )
+        expected_trend_research_path = str(expected_trend_research_output_path)
+        print(f"Wrote {len(expected_trend_research_df)} expected-trend research rows to {expected_trend_research_output_path}")
+    if research_df is not None or expected_trend_research_df is not None:
+        _generate_experiment_logger(
+            base_df=research_df,
+            expected_trend_df=expected_trend_research_df,
+            output_path=DEFAULT_EXPERIMENT_LOGGER_OUTPUT,
+        )
 
-    return {"rows": len(out_df), "path": str(output_path), "research_path": research_path}
+    return {
+        "rows": len(out_df),
+        "path": str(output_path),
+        "research_path": research_path,
+        "expected_trend_research_path": expected_trend_research_path,
+    }
 
 
 def _build_research_row(
@@ -752,6 +1162,7 @@ def _build_research_row(
         "range_position_10d": sf_row.get("range_position_10d"),
         "selected_regime": base_row.get("regime"),
         "hindsight_regime": base_row.get("hindsight_regime"),
+        "expected_regime_lag2": base_row.get("expected_regime_lag2"),
     }
 
     for name in strategy_names:
@@ -781,6 +1192,207 @@ def _actual_trade_label(next_return_pct: float | None) -> str | None:
     return "NO_POSITION"
 
 
+_RESEARCH_STRATEGY_DEFINITIONS: dict[str, str] = {
+    "BollingerMeanReversion": "Mean reversion: CALL below lower Bollinger band, PUT above upper Bollinger band.",
+    "expectedTrendDown_HighVolBreak_Put": "Research-only PUT: expected TREND_DOWN, ret_5d < 0, volatility_10d > volatility_20d, and range_position_10d < 0.5.",
+    "expectedTrendDown_RallyFailing_Put": "Research-only PUT: expected TREND_DOWN, ret_10d > 0, ret_5d < half of ret_10d, and RSI14 > 45.",
+    "expectedTrendDown_RSIWeakness_Put": "Research-only PUT: expected TREND_DOWN, 40 <= RSI14 <= 55, ret_5d < 0, and range_position_10d < 0.6.",
+    "expectedTrendDown_RangeReject_Put": "Research-only PUT: expected TREND_DOWN, range_position_10d > 0.7, and ret_5d <= 0.",
+    "expectedTrendUp_DipStabilizing_Call": "Research-only CALL: expected TREND_UP, RSI14 < 55, ret_10d < 0, and ret_5d is improving versus ret_10d.",
+    "expectedTrendUp_RSIRecovery_Call": "Research-only CALL: expected TREND_UP, RSI14 is 45-60, ret_5d > 0, and range_position_10d < 0.7.",
+    "expectedTrendUp_RangeRecovery_Call": "Research-only CALL: expected TREND_UP, range_position_5d > range_position_10d, and range_position_10d < 0.6.",
+    "MaTrend_001": "MA trend: CALL when MA10 is more than 0.1% above MA20; PUT when more than 0.1% below.",
+    "RsiMeanReversion_6040": "RSI14 mean reversion with 60/40 thresholds: CALL at RSI <= 40, PUT at RSI >= 60.",
+    "choppy": "Baseline no-trade strategy used for CHOPPY regime.",
+    "trendDownRangeBreakout": "PUT-only trend continuation: PUT when close breaks below the prior 20-day low.",
+    "trendUpRangeBreakout": "CALL-only trend continuation: CALL when close breaks above the prior 20-day high.",
+}
+
+
+def _generate_research_summary(df: pd.DataFrame, output_path: Path) -> None:
+    strategy_cols = [c for c in df.columns if c.startswith("strategy_") and c.endswith("_signal")]
+    rows: list[dict[str, Any]] = []
+    actual = df.get("actual_trade_label")
+    if actual is None:
+        return
+
+    actual_trade = actual.isin(["CALL", "PUT"])
+    total_actual_trades = int(actual_trade.sum())
+    for col in strategy_cols:
+        name = col.removeprefix("strategy_").removesuffix("_signal")
+        signal = df[col]
+        trade_signal = signal.isin(["CALL", "PUT"])
+        correct = trade_signal & (signal == actual)
+        call_signal = signal == "CALL"
+        put_signal = signal == "PUT"
+        rows.append({
+            "strategy": name,
+            "signals": int(trade_signal.sum()),
+            "call_signals": int(call_signal.sum()),
+            "put_signals": int(put_signal.sum()),
+            "correct": int(correct.sum()),
+            "precision_pct": round(100.0 * int(correct.sum()) / int(trade_signal.sum()), 2) if int(trade_signal.sum()) else None,
+            "recall_pct": round(100.0 * int(correct.sum()) / total_actual_trades, 2) if total_actual_trades else None,
+            "call_precision_pct": _precision(signal, actual, "CALL"),
+            "put_precision_pct": _precision(signal, actual, "PUT"),
+            "definition": _RESEARCH_STRATEGY_DEFINITIONS.get(name, "Research strategy definition not documented yet."),
+        })
+
+    summary = pd.DataFrame(rows).sort_values(
+        ["precision_pct", "recall_pct", "signals"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+
+    lines: list[str] = []
+    lines.append("NIFTY prediction research summary")
+    lines.append("")
+    lines.append(f"Rows: {len(df)}")
+    lines.append(f"Actual trade labels: {total_actual_trades} CALL/PUT rows, {int((actual == 'NO_POSITION').sum())} NO_POSITION rows")
+    lines.append("")
+    lines.append("Strategy ranking")
+    lines.append("strategy | signals | correct | precision_pct | recall_pct | call_precision_pct | put_precision_pct")
+    lines.append("--- | ---: | ---: | ---: | ---: | ---: | ---:")
+    for _, row in summary.iterrows():
+        lines.append(
+            f"{row['strategy']} | {row['signals']} | {row['correct']} | "
+            f"{_fmt(row['precision_pct'])} | {_fmt(row['recall_pct'])} | "
+            f"{_fmt(row['call_precision_pct'])} | {_fmt(row['put_precision_pct'])}"
+        )
+
+    lines.append("")
+    lines.append("Key observations")
+    if not summary.empty:
+        best_precision = summary[summary["signals"] > 0].head(1)
+        if not best_precision.empty:
+            row = best_precision.iloc[0]
+            lines.append(
+                f"- Best precision among firing strategies: {row['strategy']} at {_fmt(row['precision_pct'])}% "
+                f"on {int(row['signals'])} signals."
+            )
+        best_recall = summary.sort_values(["recall_pct", "precision_pct"], ascending=[False, False], na_position="last").head(1)
+        if not best_recall.empty:
+            row = best_recall.iloc[0]
+            lines.append(
+                f"- Best recall: {row['strategy']} caught {_fmt(row['recall_pct'])}% of CALL/PUT actual labels."
+            )
+    lines.append("- Precision is usually the better first filter here; recall can be increased by firing many noisy signals.")
+    lines.append("- This flat research summary ignores regime routing, so it is useful for rule discovery rather than production selection.")
+
+    lines.append("")
+    lines.append("Strategy definitions")
+    for _, row in summary.sort_values("strategy").iterrows():
+        lines.append(f"- {row['strategy']}: {row['definition']}")
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Research summary written to {output_path}")
+
+
+def _strategy_metrics(df: pd.DataFrame | None, strategy: str) -> dict[str, Any] | None:
+    if df is None or df.empty or "actual_trade_label" not in df.columns:
+        return None
+    col = f"strategy_{strategy}_signal"
+    if col not in df.columns:
+        return None
+    signal = df[col]
+    actual = df["actual_trade_label"]
+    trade_signal = signal.isin(["CALL", "PUT"])
+    correct = trade_signal & (signal == actual)
+    total_signals = int(trade_signal.sum())
+    total_actual = int(actual.isin(["CALL", "PUT"]).sum())
+    return {
+        "signals": total_signals,
+        "correct": int(correct.sum()),
+        "precision_pct": round(100.0 * int(correct.sum()) / total_signals, 2) if total_signals else None,
+        "recall_pct": round(100.0 * int(correct.sum()) / total_actual, 2) if total_actual else None,
+    }
+
+
+def _generate_experiment_logger(
+    base_df: pd.DataFrame | None,
+    expected_trend_df: pd.DataFrame | None,
+    output_path: Path,
+) -> None:
+    datasets = {
+        "base": base_df,
+        "expectedRegime_Trend": expected_trend_df,
+    }
+    current_strategies: dict[str, str] = {}
+    for dataset_name, df in datasets.items():
+        if df is None or df.empty:
+            continue
+        for col in df.columns:
+            if col.startswith("strategy_") and col.endswith("_signal"):
+                strategy = col.removeprefix("strategy_").removesuffix("_signal")
+                if strategy in {"MaTrend_001", "RsiMeanReversion_6040", "BollingerMeanReversion", "trendUpRangeBreakout", "trendDownRangeBreakout", "choppy"}:
+                    continue
+                current_strategies[strategy] = dataset_name
+
+    registry: dict[str, dict[str, Any]] = {
+        **_EXPERIMENT_LOGGER_REGISTRY,
+        **{
+            strategy: {
+                "dataset": dataset,
+                "base": "MaTrend_001" if "Trend" in strategy or strategy.startswith("MA_") else "RsiMeanReversion_6040",
+                "status": "active",
+                "remove_reason": "Active candidate; keep for further comparison.",
+            }
+            for strategy, dataset in current_strategies.items()
+        },
+    }
+
+    lines: list[str] = [
+        "NIFTY Experiment Strategy Logger",
+        "",
+        "Purpose: track every research-only strategy tweak, its precision/recall versus the declared base strategy, and why removed strategies were dropped.",
+        "Update rule: add a registry entry when creating a strategy; when removing it, change status to removed and fill remove_reason.",
+        "",
+    ]
+
+    for strategy in sorted(registry):
+        meta = registry[strategy]
+        dataset_name = str(meta.get("dataset") or "base")
+        df = datasets.get(dataset_name)
+        metrics = _strategy_metrics(df, strategy)
+        base_strategy = str(meta.get("base") or "")
+        base_metrics = _strategy_metrics(df, base_strategy)
+        precision = metrics.get("precision_pct") if metrics else meta.get("precision_pct")
+        recall = metrics.get("recall_pct") if metrics else meta.get("recall_pct")
+        signals = metrics.get("signals") if metrics else meta.get("signals")
+        base_precision = (base_metrics or {}).get("precision_pct")
+        base_recall = (base_metrics or {}).get("recall_pct")
+        status = str(meta.get("status") or ("active" if metrics else "removed"))
+        reason = str(meta.get("remove_reason") or "Active candidate; keep for further comparison.")
+
+        lines.extend([
+            f"## {strategy}",
+            f"- Dataset: {dataset_name}",
+            f"- Status: {status}",
+            f"- Precision/recall: {_fmt(precision)}% / {_fmt(recall)}% ({signals if signals is not None else 'n/a'} signals)",
+            f"- Base comparison: {base_strategy or 'n/a'} precision/recall {_fmt(base_precision)}% / {_fmt(base_recall)}%",
+            f"- Removal decision: {reason}",
+            "",
+        ])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Experiment logger written to {output_path}")
+
+
+def _precision(signal: pd.Series, actual: pd.Series, label: str) -> float | None:
+    mask = signal == label
+    total = int(mask.sum())
+    if total == 0:
+        return None
+    return round(100.0 * int((mask & (actual == label)).sum()) / total, 2)
+
+
+def _fmt(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
+    return f"{float(value):.2f}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate NIFTY prediction CSV from SignalFeatureDaily.")
     parser.add_argument("--underlying", default="NIFTY", help="Underlying symbol. Default: NIFTY")
@@ -791,6 +1403,14 @@ def main() -> None:
         "--research-output",
         default=str(DEFAULT_RESEARCH_OUTPUT),
         help=f"Flat research CSV path. Default: {DEFAULT_RESEARCH_OUTPUT}. Use empty string to skip.",
+    )
+    parser.add_argument(
+        "--expected-trend-research-output",
+        default=str(DEFAULT_EXPECTED_TREND_RESEARCH_OUTPUT),
+        help=(
+            "Expected-trend research CSV path. Default: "
+            f"{DEFAULT_EXPECTED_TREND_RESEARCH_OUTPUT}. Use empty string to skip."
+        ),
     )
     parser.add_argument(
         "--regime-comparison",
@@ -808,6 +1428,10 @@ def main() -> None:
         end_date=date.fromisoformat(args.end) if args.end else None,
         output_path=Path(args.output),
         research_output_path=Path(args.research_output) if args.research_output else None,
+        expected_trend_research_output_path=(
+            Path(args.expected_trend_research_output)
+            if args.expected_trend_research_output else None
+        ),
         regime_comparison_path=Path(args.regime_comparison) if args.regime_comparison else None,
     )
     print(result)

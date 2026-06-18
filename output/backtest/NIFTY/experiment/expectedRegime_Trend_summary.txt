@@ -1,0 +1,36 @@
+NIFTY prediction research summary
+
+Rows: 40
+Actual trade labels: 40 CALL/PUT rows, 0 NO_POSITION rows
+
+Strategy ranking
+strategy | signals | correct | precision_pct | recall_pct | call_precision_pct | put_precision_pct
+--- | ---: | ---: | ---: | ---: | ---: | ---:
+expectedTrendUp_DipStabilizing_Call | 8 | 8 | 100.00 | 20.00 | 100.00 | n/a
+expectedTrendUp_RSIRecovery_Call | 3 | 3 | 100.00 | 7.50 | 100.00 | n/a
+expectedTrendDown_RallyFailing_Put | 2 | 2 | 100.00 | 5.00 | n/a | 100.00
+expectedTrendDown_RangeReject_Put | 1 | 1 | 100.00 | 2.50 | n/a | 100.00
+trendUpRangeBreakout | 1 | 1 | 100.00 | 2.50 | 100.00 | n/a
+expectedTrendUp_RangeRecovery_Call | 10 | 9 | 90.00 | 22.50 | 90.00 | n/a
+expectedTrendDown_RSIWeakness_Put | 7 | 6 | 85.71 | 15.00 | n/a | 85.71
+expectedTrendDown_HighVolBreak_Put | 8 | 6 | 75.00 | 15.00 | n/a | 75.00
+RsiMeanReversion_6040 | 15 | 8 | 53.33 | 20.00 | 61.54 | 0.00
+MaTrend_001 | 39 | 19 | 48.72 | 47.50 | 54.55 | 46.43
+
+Key observations
+- Best precision among firing strategies: expectedTrendUp_DipStabilizing_Call at 100.00% on 8 signals.
+- Best recall: MaTrend_001 caught 47.50% of CALL/PUT actual labels.
+- Precision is usually the better first filter here; recall can be increased by firing many noisy signals.
+- This flat research summary ignores regime routing, so it is useful for rule discovery rather than production selection.
+
+Strategy definitions
+- MaTrend_001: MA trend: CALL when MA10 is more than 0.1% above MA20; PUT when more than 0.1% below.
+- RsiMeanReversion_6040: RSI14 mean reversion with 60/40 thresholds: CALL at RSI <= 40, PUT at RSI >= 60.
+- expectedTrendDown_HighVolBreak_Put: Research-only PUT: expected TREND_DOWN, ret_5d < 0, volatility_10d > volatility_20d, and range_position_10d < 0.5.
+- expectedTrendDown_RSIWeakness_Put: Research-only PUT: expected TREND_DOWN, 40 <= RSI14 <= 55, ret_5d < 0, and range_position_10d < 0.6.
+- expectedTrendDown_RallyFailing_Put: Research-only PUT: expected TREND_DOWN, ret_10d > 0, ret_5d < half of ret_10d, and RSI14 > 45.
+- expectedTrendDown_RangeReject_Put: Research-only PUT: expected TREND_DOWN, range_position_10d > 0.7, and ret_5d <= 0.
+- expectedTrendUp_DipStabilizing_Call: Research-only CALL: expected TREND_UP, RSI14 < 55, ret_10d < 0, and ret_5d is improving versus ret_10d.
+- expectedTrendUp_RSIRecovery_Call: Research-only CALL: expected TREND_UP, RSI14 is 45-60, ret_5d > 0, and range_position_10d < 0.7.
+- expectedTrendUp_RangeRecovery_Call: Research-only CALL: expected TREND_UP, range_position_5d > range_position_10d, and range_position_10d < 0.6.
+- trendUpRangeBreakout: CALL-only trend continuation: CALL when close breaks above the prior 20-day high.

@@ -130,23 +130,23 @@ BUILTIN_UNDERLYING_STRATEGIES: dict[str, UnderlyingStrategyDefinition] = {
         predict=partial(signal_ma_trend, short_window=10, long_window=20, band=0.001),
         description="MA trend using 10/20 day moving averages and a 0.1% band.",
     ),
-    "RsiMeanReversion_6535": UnderlyingStrategyDefinition(
-        name="RsiMeanReversion_6535",
-        predict=partial(signal_rsi_mean_reversion, rsi_period=14, overbought=65.0, oversold=35.0),
-        description="RSI14 mean reversion using 65/35 thresholds.",
+    "RsiMeanReversion_6040": UnderlyingStrategyDefinition(
+        name="RsiMeanReversion_6040",
+        predict=partial(signal_rsi_mean_reversion, rsi_period=14, overbought=60.0, oversold=40.0),
+        description="RSI14 mean reversion using 60/40 thresholds.",
     ),
     "rangeBollingerMeanReversion": UnderlyingStrategyDefinition(
         name="rangeBollingerMeanReversion",
         predict=partial(range_gated_signal, signal_fn=signal_bollinger_mean_reversion),
         description="Bollinger mean reversion enabled only in RANGE regime.",
     ),
-    "rangeRsiMeanReversion_6535": UnderlyingStrategyDefinition(
-        name="rangeRsiMeanReversion_6535",
+    "rangeRsiMeanReversion_6040": UnderlyingStrategyDefinition(
+        name="rangeRsiMeanReversion_6040",
         predict=partial(
             range_gated_signal,
-            signal_fn=partial(signal_rsi_mean_reversion, rsi_period=14, overbought=65.0, oversold=35.0),
+            signal_fn=partial(signal_rsi_mean_reversion, rsi_period=14, overbought=60.0, oversold=40.0),
         ),
-        description="RSI14 mean reversion enabled only in RANGE regime.",
+        description="RSI14 mean reversion using 60/40 thresholds enabled only in RANGE regime.",
     ),
     "trendDownRangeBreakout": UnderlyingStrategyDefinition(
         name="trendDownRangeBreakout",

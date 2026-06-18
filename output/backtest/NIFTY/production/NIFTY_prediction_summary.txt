@@ -2,19 +2,19 @@
 ==============================================================
   NIFTY Prediction Summary
 ==============================================================
-  Rows: 246   Significance threshold: |close chg| >= 0.5%
+  Rows: 245   Significance threshold: |close chg| >= 0.5%
 
 --- OVERALL (aggregate raw_signal) ---
-  Signals : CALL 43  PUT 42  NO_POSITION 161
-  Sig moves next day: 118/246
+  Signals : CALL 43  PUT 43  NO_POSITION 159
+  Sig moves next day: 119/245
     Accuracy : 41/85 = 48%  (CALL 23/43 correct, PUT 18/42 correct, 44 wrong)
-    Recall   : caught 44/118 sig moves = 37%  (missed 74 where strategy said NO_POSITION)
+    Recall   : caught 44/119 sig moves = 37%  (missed 75 where strategy said NO_POSITION)
 
 --- REGIME DETECTION ---
-  Comparable hindsight rows: 241/246
-  Accuracy : 136/241 = 56%
+  Comparable hindsight rows: 240/245
+  Accuracy : 136/240 = 57%
   Top mismatches:
-    RANGE vs TREND_UP: 35
+    RANGE vs TREND_UP: 34
     RANGE vs TREND_DOWN: 31
     RANGE vs CHOPPY: 24
     TREND_UP vs RANGE: 7
@@ -22,26 +22,26 @@
 
 --- PER STRATEGY ---
 
-  [BollingerMeanReversion]  active 15/246  signals 1  NO_POSITION 14
+  [BollingerMeanReversion]  active 15/245  signals 1  NO_POSITION 14
     Accuracy : 1/1 = 100%  (CALL 1/1 correct, PUT 0/0 correct, 0 wrong)
     Recall   : caught 1/6 sig moves = 17%  (missed 5 where strategy said NO_POSITION)
 
-  [MaTrend_001]  active 15/246  signals 15  NO_POSITION 0
+  [MaTrend_001]  active 15/245  signals 15  NO_POSITION 0
     Accuracy : 3/15 = 20%  (CALL 2/7 correct, PUT 1/8 correct, 12 wrong)
     Recall   : caught 6/6 sig moves = 100%  (missed 0 where strategy said NO_POSITION)
 
-  [rangeBollingerMeanReversion]  active 231/246  signals 21  NO_POSITION 210
+  [rangeBollingerMeanReversion]  active 230/245  signals 21  NO_POSITION 209
     Accuracy : 12/21 = 57%  (CALL 9/15 correct, PUT 3/6 correct, 9 wrong)
-    Recall   : caught 13/112 sig moves = 12%  (missed 99 where strategy said NO_POSITION)
+    Recall   : caught 13/113 sig moves = 12%  (missed 100 where strategy said NO_POSITION)
 
-  [rangeRsiMeanReversion_6535]  active 231/246  signals 70  NO_POSITION 161
+  [rangeRsiMeanReversion_6040]  active 230/245  signals 71  NO_POSITION 159
     Accuracy : 38/70 = 54%  (CALL 21/36 correct, PUT 17/34 correct, 32 wrong)
-    Recall   : caught 38/112 sig moves = 34%  (missed 74 where strategy said NO_POSITION)
+    Recall   : caught 38/113 sig moves = 34%  (missed 75 where strategy said NO_POSITION)
 
-  [trendDownRangeBreakout]  active 8/246  signals 3  NO_POSITION 5
+  [trendDownRangeBreakout]  active 8/245  signals 3  NO_POSITION 5
     Accuracy : 0/3 = 0%  (CALL 0/0 correct, PUT 0/3 correct, 3 wrong)
     Recall   : caught 3/6 sig moves = 50%  (missed 3 where strategy said NO_POSITION)
 
-  [trendUpRangeBreakout]  active 7/246  signals 0  NO_POSITION 7
+  [trendUpRangeBreakout]  active 7/245  signals 0  NO_POSITION 7
     Accuracy: no signals
     Recall   : no significant moves (>=0.5%) in active window

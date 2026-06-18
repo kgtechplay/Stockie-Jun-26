@@ -1,0 +1,28 @@
+NIFTY prediction research summary
+
+Rows: 245
+Actual trade labels: 119 CALL/PUT rows, 125 NO_POSITION rows
+
+Strategy ranking
+strategy | signals | correct | precision_pct | recall_pct | call_precision_pct | put_precision_pct
+--- | ---: | ---: | ---: | ---: | ---: | ---:
+BollingerMeanReversion | 22 | 8 | 36.36 | 6.72 | 50.00 | 0.00
+RsiMeanReversion_6040 | 86 | 26 | 30.23 | 21.85 | 50.00 | 9.52
+MaTrend_001 | 221 | 51 | 23.08 | 42.86 | 20.59 | 25.21
+trendDownRangeBreakout | 15 | 2 | 13.33 | 1.68 | n/a | 13.33
+trendUpRangeBreakout | 13 | 1 | 7.69 | 0.84 | 7.69 | n/a
+choppy | 0 | 0 | n/a | 0.00 | n/a | n/a
+
+Key observations
+- Best precision among firing strategies: BollingerMeanReversion at 36.36% on 22 signals.
+- Best recall: MaTrend_001 caught 42.86% of CALL/PUT actual labels.
+- Precision is usually the better first filter here; recall can be increased by firing many noisy signals.
+- This flat research summary ignores regime routing, so it is useful for rule discovery rather than production selection.
+
+Strategy definitions
+- BollingerMeanReversion: Mean reversion: CALL below lower Bollinger band, PUT above upper Bollinger band.
+- MaTrend_001: MA trend: CALL when MA10 is more than 0.1% above MA20; PUT when more than 0.1% below.
+- RsiMeanReversion_6040: RSI14 mean reversion with 60/40 thresholds: CALL at RSI <= 40, PUT at RSI >= 60.
+- choppy: Baseline no-trade strategy used for CHOPPY regime.
+- trendDownRangeBreakout: PUT-only trend continuation: PUT when close breaks below the prior 20-day low.
+- trendUpRangeBreakout: CALL-only trend continuation: CALL when close breaks above the prior 20-day high.

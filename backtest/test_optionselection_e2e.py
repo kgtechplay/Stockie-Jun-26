@@ -5,11 +5,11 @@ Unittest mode (pytest):
     pytest backtest/test_optionselection_e2e.py
 
 Script mode — read NIFTY_prediction.csv, run option selection + P&L backtest,
-write output/backtest/NIFTY_optionSelection.csv:
+write output/backtest/NIFTY/production/NIFTY_optionSelection.csv:
     python backtest/test_optionselection_e2e.py
-    python backtest/test_optionselection_e2e.py --input output/backtest/NIFTY_prediction.csv
-    python backtest/test_optionselection_e2e.py --input output/backtest/NIFTY_prediction.csv \\
-                                                 --output output/backtest/NIFTY_optionSelection.csv
+    python backtest/test_optionselection_e2e.py --input output/backtest/NIFTY/production/NIFTY_prediction.csv
+    python backtest/test_optionselection_e2e.py --input output/backtest/NIFTY/production/NIFTY_prediction.csv \\
+                                                 --output output/backtest/NIFTY/production/NIFTY_optionSelection.csv
 
 P&L methodology:
     - as_of_time = signal_date 15:15:00 (EOD chain used for option selection)
@@ -207,8 +207,8 @@ class OptionSelectionTests(unittest.TestCase):
 # E2E pipeline helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_INPUT = Path("output") / "backtest" / "NIFTY_prediction.csv"
-DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY_optionSelection.csv"
+DEFAULT_INPUT = Path("output") / "backtest" / "NIFTY" / "production" / "NIFTY_prediction.csv"
+DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "production" / "NIFTY_optionSelection.csv"
 
 _PROFIT_TARGET_PCT = 0.02
 _PNL_SCAN_DAYS = 5
@@ -438,7 +438,8 @@ def generate_option_selection_csv(
         prediction_result = generate_prediction_csv(
             underlying=underlying.upper(),
             output_path=input_path,
-            regime_comparison_path=input_path.with_name(
+            regime_comparison_path=(
+                Path("output") / "backtest" / underlying.upper() / "regime" /
                 f"{underlying.upper()}_regime_experiment_comparison.csv"
             ),
         )

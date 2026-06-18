@@ -36,7 +36,7 @@ Open your browser at `http://127.0.0.1:5000`.
 ## NIFTY Technical Dashboard
 
 The Flask app is intentionally NIFTY-only. It shows NIFTY data/trends from
-`output/backtest/NIFTY_prediction.csv` and exposes only NIFTY Predict and
+`output/backtest/NIFTY/production/NIFTY_prediction.csv` and exposes only NIFTY Predict and
 Backtest actions.
 
 Click **Predict** to run today's NIFTY direction prediction using all registered
@@ -48,7 +48,7 @@ To generate predictions from the CLI directly:
 python src/services/historical_prediction.py --underlying NIFTY
 ```
 
-This writes `output/backtest/NIFTY_prediction.csv` covering the last 60 days.
+This writes `output/backtest/NIFTY/production/NIFTY_prediction.csv` covering the last 60 days.
 
 ---
 
@@ -58,7 +58,7 @@ Click **Backtest**. The app will:
    - Generate 60 days of historical predictions if the file does not exist.
    - Enrich each prediction row with next-day market data (`next_open`, `max_high_price`, `min_low_price`).
    - Classify `actual_move` (CALL / PUT / NO_POSITION) and compute `max_delta_pct`.
-   - Evaluate each strategy column and write results back to `output/backtest/<underlying>_prediction.csv`.
+   - Evaluate each strategy column and write results back to `output/backtest/NIFTY/production/NIFTY_prediction.csv`.
 3. A CSV preview and summary metrics are shown in the browser.
 
 **Output columns:**
@@ -132,4 +132,3 @@ Run the daily market refresh to populate `UnderlyingSnapshot` and `UnderlyingCan
 ```powershell
 python scripts/daily_NIFTY/daily_market_refresh.py --lookback 90 --underlying RELIANCE
 ```
-
