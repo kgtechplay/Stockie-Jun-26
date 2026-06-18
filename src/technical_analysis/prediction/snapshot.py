@@ -39,8 +39,8 @@ def build_feature_snapshot(
     if isinstance(window, pd.DataFrame) and not window.empty:
         close = as_float(window.iloc[-1].get("close_price"))
         volume = as_float(window.iloc[-1].get("volume"))
-        if "volume" in window.columns and len(window) >= 21:
-            volume_avg_20d = as_float(window["volume"].astype(float).iloc[-21:-1].mean())
+        if "volume" in window.columns and len(window) >= 20:
+            volume_avg_20d = as_float(window["volume"].astype(float).tail(20).mean())
     elif isinstance(window, pd.Series) and not window.empty:
         close = as_float(window.iloc[-1])
 
@@ -74,7 +74,7 @@ def build_feature_snapshot(
         ret_60d=as_float(features.get("ret_60d")),
         volatility_20d=as_float(features.get("volatility_20d")),
         volume_avg_20d=volume_avg_20d,
-        volume_ratio=as_float(features.get("volume_ratio")),
+        volume_ratio=None,
         trend_efficiency=as_float(features.get("trend_efficiency_60d")),
         range_position=as_float(features.get("range_position_20d")),
         relative_strength_vs_sector=as_float(features.get("relative_strength_vs_sector")),

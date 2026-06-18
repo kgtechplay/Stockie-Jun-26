@@ -85,7 +85,7 @@ def _bullish_features() -> UnderlyingFeatureSnapshot:
         bb_upper=112, bb_middle=105, bb_lower=98, bb_width=0.12,
         ret_5d=0.03, ret_20d=0.08, ret_60d=0.18,
         volatility_20d=0.018, volume_avg_20d=100000,
-        volume_ratio=1.5, trend_efficiency=0.55, range_position=0.75,
+        volume_ratio=None, trend_efficiency=0.55, range_position=0.75,
         relative_strength_vs_sector=0.03, relative_strength_vs_benchmark=0.04,
     )
 
@@ -100,7 +100,7 @@ def _bearish_features() -> UnderlyingFeatureSnapshot:
         bb_upper=102, bb_middle=95, bb_lower=88, bb_width=0.12,
         ret_5d=-0.03, ret_20d=-0.08, ret_60d=-0.18,
         volatility_20d=0.018, volume_avg_20d=100000,
-        volume_ratio=1.5, trend_efficiency=0.55, range_position=0.25,
+        volume_ratio=None, trend_efficiency=0.55, range_position=0.25,
         relative_strength_vs_sector=-0.03, relative_strength_vs_benchmark=-0.04,
     )
 
@@ -183,8 +183,9 @@ class UnderlyingPredictionViewTests(unittest.TestCase):
 # Prediction CSV pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY_prediction.csv"
-DEFAULT_REGIME_COMPARISON = Path("output") / "backtest" / "NIFTY_regime_experiment_comparison.csv"
+DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "prediction" / "NIFTY_prediction.csv"
+DEFAULT_RESEARCH_OUTPUT = Path("output") / "backtest" / "NIFTY" / "prediction" / "NIFTY_prediction_research.csv"
+DEFAULT_REGIME_COMPARISON = Path("output") / "backtest" / "NIFTY" / "regime" / "NIFTY_regime_experiment_comparison.csv"
 _EXTRA_OHLCV_DAYS = 120  # rolling window lookback before start_date
 
 
@@ -223,6 +224,28 @@ _REGIME_DIRECT_CALLS: dict[str, dict[str, Any]] = {
     },
     "CHOPPY":  {},
     "UNKNOWN": {},
+}
+
+_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
+    "BollingerMeanReversion": signal_bollinger_mean_reversion,
+    "MaTrend_001": signal_ma_trend,
+    "RsiMeanReversion_6535": partial(
+        signal_rsi_mean_reversion,
+        rsi_period=14,
+        overbought=65.0,
+        oversold=35.0,
+    ),
+    "rangeBollingerMeanReversion": signal_bollinger_mean_reversion,
+    "rangeRsiMeanReversion_6535": partial(
+        signal_rsi_mean_reversion,
+        rsi_period=14,
+        overbought=60.0,
+        oversold=40.0,
+    ),
+    "trendDownRangeBreakout": _put_only(signal_range_breakout),
+    "trendUpRangeBreakout": _call_only(signal_range_breakout),
+    "choppy": lambda _window: "NO_POSITION",
+    "unknown": lambda _window: "NO_POSITION",
 }
 
 
@@ -387,8 +410,8 @@ def _sf_row_to_feature_snapshot(row: dict[str, Any], symbol: str) -> UnderlyingF
         ret_5d=_f(row.get("ret_5d")), ret_20d=_f(row.get("ret_20d")),
         ret_60d=_f(row.get("ret_60d")),
         volatility_20d=_f(row.get("volatility_20d")),
-        volume_avg_20d=None,
-        volume_ratio=_f(row.get("volume_ratio")),
+        volume_avg_20d=_f(row.get("volume_20d")),
+        volume_ratio=None,
         trend_efficiency=_f(row.get("trend_efficiency_60d")),
         range_position=_f(row.get("range_position_20d")),
         relative_strength_vs_sector=_f(row.get("relative_strength_vs_sector")),
@@ -441,6 +464,7 @@ def generate_prediction_csv(
     start_date: date | None = None,
     end_date: date | None = None,
     output_path: Path = DEFAULT_OUTPUT,
+    research_output_path: Path | None = DEFAULT_RESEARCH_OUTPUT,
     regime_comparison_path: Path | None = DEFAULT_REGIME_COMPARISON,
 ) -> dict[str, Any]:
     if end_date is None:
@@ -489,17 +513,26 @@ def generate_prediction_csv(
     def _as_date(v: Any) -> date:
         return v.date() if hasattr(v, "date") else v
 
-    _close_by_date: dict[date, float] = {
-        _as_date(r["trade_date"]): float(r["close_price"])
+    _ohlcv_by_date: dict[date, dict[str, Any]] = {
+        _as_date(r["trade_date"]): r.to_dict()
         for _, r in _sorted_ohlcv.iterrows()
     }
+    _close_by_date: dict[date, float] = {
+        d: float(r["close_price"])
+        for d, r in _ohlcv_by_date.items()
+    }
     _sorted_dates = sorted(_close_by_date.keys())
+    _next_date: dict[date, date] = {
+        _sorted_dates[i]: _sorted_dates[i + 1]
+        for i in range(len(_sorted_dates) - 1)
+    }
     _next_day_close: dict[date, float] = {
         _sorted_dates[i]: _close_by_date[_sorted_dates[i + 1]]
         for i in range(len(_sorted_dates) - 1)
     }
 
     output_rows: list[dict[str, Any]] = []
+    research_rows: list[dict[str, Any]] = []
 
     for _, sf_row in sf_df.iterrows():
         signal_ts = pd.to_datetime(sf_row["signal_date"])
@@ -533,12 +566,26 @@ def generate_prediction_csv(
                 except Exception:
                     predictions[name] = None
 
+        research_predictions: dict[str, str] = {}
+        for name in strategy_names:
+            strategy = _RESEARCH_DIRECT_CALLS.get(name) or strategies.get(name)
+            if strategy is None or window.empty:
+                research_predictions[name] = "NO_POSITION"
+                continue
+            try:
+                raw = str(strategy(window)).strip().upper()
+                research_predictions[name] = raw if raw in {"CALL", "PUT", "NO_POSITION"} else "NO_POSITION"
+            except Exception:
+                research_predictions[name] = "NO_POSITION"
+
         # Build feature snapshot from pre-computed SignalFeatureDaily values
         features = _sf_row_to_feature_snapshot(sf_row.to_dict(), underlying)
 
         # Build full view (regime → signals → scoring → view)
         regime_snap = build_regime_snapshot(regime)
         strategy_signals = build_strategy_signals(predictions, features, regime_snap)
+        research_strategy_signals = build_strategy_signals(research_predictions, features, regime_snap)
+        research_strategy_signals_by_name = {signal.strategy_name: signal for signal in research_strategy_signals}
         view = build_underlying_view(
             underlying, signal_date_str, features, regime_snap, strategy_signals
         )
@@ -553,10 +600,13 @@ def generate_prediction_csv(
             "rsi14": sf_row.get("rsi14"), "atr14": sf_row.get("atr14"),
             "bb_upper": sf_row.get("bb_upper"), "bb_lower": sf_row.get("bb_lower"),
             "bb_width": sf_row.get("bb_width"),
-            "ret_5d": sf_row.get("ret_5d"), "ret_20d": sf_row.get("ret_20d"),
+            "ret_5d": sf_row.get("ret_5d"), "ret_10d": sf_row.get("ret_10d"),
+            "ret_20d": sf_row.get("ret_20d"),
             "ret_60d": sf_row.get("ret_60d"),
+            "volatility_10d": sf_row.get("volatility_10d"),
             "volatility_20d": sf_row.get("volatility_20d"),
-            "volume_ratio": sf_row.get("volume_ratio"),
+            "volume_10d": sf_row.get("volume_10d"),
+            "volume_20d": sf_row.get("volume_20d"),
             "regime": regime,
             "regime_source": "regime_experiment_current" if signal_date_str in regime_overrides else "SignalFeatureDaily",
             "db_regime": db_regime,
@@ -578,6 +628,8 @@ def generate_prediction_csv(
         #   relative_strength_score — sector/benchmark RS both None; ret_20d already a raw feature
         signal_date_obj = date.fromisoformat(signal_date_str)
         current_close_val = _close_by_date.get(signal_date_obj)
+        next_date_val = _next_date.get(signal_date_obj)
+        next_ohlcv = _ohlcv_by_date.get(next_date_val) if next_date_val else None
         next_close_val = _next_day_close.get(signal_date_obj)
         next_day_close_chg_pct = (
             round((next_close_val - current_close_val) / current_close_val * 100, 2)
@@ -601,6 +653,21 @@ def generate_prediction_csv(
         })
         output_rows.append(row)
 
+        if research_output_path is not None:
+            research_row = _build_research_row(
+                base_row=row,
+                sf_row=sf_row.to_dict(),
+                signal_date=signal_date_obj,
+                current_ohlcv=_ohlcv_by_date.get(signal_date_obj),
+                next_date=next_date_val,
+                next_ohlcv=next_ohlcv,
+                research_predictions=research_predictions,
+                strategy_names=strategy_names,
+                strategy_signals_by_name=research_strategy_signals_by_name,
+                view=view,
+            )
+            research_rows.append(research_row)
+
     out_df = pd.DataFrame(output_rows)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
@@ -609,7 +676,109 @@ def generate_prediction_csv(
     summary_path = output_path.with_name(output_path.stem + "_summary.txt")
     _generate_prediction_summary(out_df, summary_path)
 
-    return {"rows": len(out_df), "path": str(output_path)}
+    research_path: str | None = None
+    if research_output_path is not None:
+        research_df = pd.DataFrame(research_rows)
+        research_output_path.parent.mkdir(parents=True, exist_ok=True)
+        research_df.to_csv(research_output_path, index=False)
+        research_path = str(research_output_path)
+        print(f"Wrote {len(research_df)} research rows to {research_output_path}")
+
+    return {"rows": len(out_df), "path": str(output_path), "research_path": research_path}
+
+
+def _build_research_row(
+    base_row: dict[str, Any],
+    sf_row: dict[str, Any],
+    signal_date: date,
+    current_ohlcv: dict[str, Any] | None,
+    next_date: date | None,
+    next_ohlcv: dict[str, Any] | None,
+    research_predictions: dict[str, str],
+    strategy_names: list[str],
+    strategy_signals_by_name: dict[str, StrategySignal],
+    view: Any,
+) -> dict[str, Any]:
+    current_close = _f((current_ohlcv or {}).get("close_price")) or _f(sf_row.get("close_1515"))
+    next_open = _f((next_ohlcv or {}).get("open_price"))
+    next_high = _f((next_ohlcv or {}).get("high_price"))
+    next_low = _f((next_ohlcv or {}).get("low_price"))
+    next_close = _f((next_ohlcv or {}).get("close_price"))
+    next_return_pct = (
+        round((next_close - current_close) / current_close * 100, 4)
+        if current_close and next_close is not None else None
+    )
+
+    research: dict[str, Any] = {
+        "trade_date": signal_date.isoformat(),
+        "next_trade_date": next_date.isoformat() if next_date else None,
+        "open_915": sf_row.get("open_915"),
+        "high_day": sf_row.get("high_day"),
+        "low_day": sf_row.get("low_day"),
+        "close_1515": sf_row.get("close_1515"),
+        "volume_day": sf_row.get("volume_day"),
+        "ma10": sf_row.get("ma10"),
+        "ma20": sf_row.get("ma20"),
+        "ma50": sf_row.get("ma50"),
+        "ma90": sf_row.get("ma90"),
+        "ma5d_slope": sf_row.get("ma5d_slope"),
+        "ma10d_slope": sf_row.get("ma10d_slope"),
+        "ma20_slope": sf_row.get("ma20_slope"),
+        "ma50_slope": sf_row.get("ma50_slope"),
+        "rsi14": sf_row.get("rsi14"),
+        "atr14": sf_row.get("atr14"),
+        "bb_upper": sf_row.get("bb_upper"),
+        "bb_middle": sf_row.get("bb_middle"),
+        "bb_lower": sf_row.get("bb_lower"),
+        "bb_width": sf_row.get("bb_width"),
+        "ret_5d": sf_row.get("ret_5d"),
+        "ret_10d": sf_row.get("ret_10d"),
+        "ret_20d": sf_row.get("ret_20d"),
+        "ret_60d": sf_row.get("ret_60d"),
+        "volatility_10d": sf_row.get("volatility_10d"),
+        "volatility_20d": sf_row.get("volatility_20d"),
+        "volume_10d": sf_row.get("volume_10d"),
+        "volume_20d": sf_row.get("volume_20d"),
+        "trend_efficiency_5d": sf_row.get("trend_efficiency_5d"),
+        "trend_efficiency_10d": sf_row.get("trend_efficiency_10d"),
+        "trend_efficiency_20d": sf_row.get("trend_efficiency_20d"),
+        "recent_high_5d": sf_row.get("recent_high_5d"),
+        "recent_low_5d": sf_row.get("recent_low_5d"),
+        "recent_high_10d": sf_row.get("recent_high_10d"),
+        "recent_low_10d": sf_row.get("recent_low_10d"),
+        "recent_high_20d": sf_row.get("recent_high_20d"),
+        "recent_low_20d": sf_row.get("recent_low_20d"),
+        "range_position_5d": sf_row.get("range_position_5d"),
+        "range_position_10d": sf_row.get("range_position_10d"),
+        "selected_regime": base_row.get("regime"),
+        "hindsight_regime": base_row.get("hindsight_regime"),
+    }
+
+    for name in strategy_names:
+        if name == "unknown":
+            continue
+        research[f"strategy_{name}_signal"] = research_predictions.get(name, "NO_POSITION")
+
+    research.update({
+        "final_raw_signal": view.raw_signal,
+        "next_open": next_open,
+        "next_high": next_high,
+        "next_low": next_low,
+        "next_close": next_close,
+        "next_return_pct": next_return_pct,
+        "actual_trade_label": _actual_trade_label(next_return_pct),
+    })
+    return research
+
+
+def _actual_trade_label(next_return_pct: float | None) -> str | None:
+    if next_return_pct is None:
+        return None
+    if next_return_pct >= _SIGNIFICANCE_PCT:
+        return "CALL"
+    if next_return_pct <= -_SIGNIFICANCE_PCT:
+        return "PUT"
+    return "NO_POSITION"
 
 
 def main() -> None:
@@ -618,6 +787,11 @@ def main() -> None:
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD. Default: 1 year before end.")
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD. Default: today.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"Output CSV path. Default: {DEFAULT_OUTPUT}")
+    parser.add_argument(
+        "--research-output",
+        default=str(DEFAULT_RESEARCH_OUTPUT),
+        help=f"Flat research CSV path. Default: {DEFAULT_RESEARCH_OUTPUT}. Use empty string to skip.",
+    )
     parser.add_argument(
         "--regime-comparison",
         default=str(DEFAULT_REGIME_COMPARISON),
@@ -633,6 +807,7 @@ def main() -> None:
         start_date=date.fromisoformat(args.start) if args.start else None,
         end_date=date.fromisoformat(args.end) if args.end else None,
         output_path=Path(args.output),
+        research_output_path=Path(args.research_output) if args.research_output else None,
         regime_comparison_path=Path(args.regime_comparison) if args.regime_comparison else None,
     )
     print(result)

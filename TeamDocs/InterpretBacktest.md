@@ -121,7 +121,7 @@ These are pre-computed technical features stored in the DB. `NaN` for early rows
 | `hindsight_regime_realized_range` | Forward realized range used by the hindsight label. |
 | `regime_match` | Same-day comparison of `regime` vs `hindsight_regime`; `null` when hindsight is `UNKNOWN`. |
 
-Note: `volume_ratio` uses NIFTY near-month futures volume sourced from NSE FO bhavcopy (not the index itself, which has no traded volume). Populated by `scripts/backfill_NIFTY/backfill_nifty_volume.py`.
+Note: volume fields use NIFTY near-month futures volume sourced from NSE FO bhavcopy, not the index itself, which has no traded volume. They are populated by `scripts/backfill_NIFTY/backfill_nifty_volume.py`.
 
 ### Per-strategy raw signals
 

@@ -1,17 +1,16 @@
-"""
+﻿"""
 backfill_nifty_volume.py
 
 Downloads NSE FO daily bhavcopy (UDiFF format), extracts NIFTY near-month
 futures volume (TtlTradgVol), and writes it to Supabase:
 
   1. UPDATE UnderlyingSnapshot.volume  for each trade_date
-  2. Recompute rolling-20d volume average → UPDATE SignalFeatureDaily.volume_day
-     and volume_ratio
+  2. Recompute rolling volume averages and update SignalFeatureDaily.volume_day,`r`n     volume_10d, and volume_20d
 
 Run:
     python scripts/backfill_NIFTY/backfill_nifty_volume.py --start 2026-01-01 --end 2026-06-17
 
-After this script completes, re-run the prediction backtest to pick up volume_ratio:
+After this script completes, re-run the prediction backtest to pick up volume windows:
     python backtest/test_underlying_prediction.py
 """
 
@@ -58,7 +57,7 @@ def _trading_days(start: date, end: date) -> list[date]:
     days = []
     d = start
     while d <= end:
-        if d.weekday() < 5:  # Mon–Fri; holidays handled by missing bhavcopy files
+        if d.weekday() < 5:  # Monâ€“Fri; holidays handled by missing bhavcopy files
             days.append(d)
         d += timedelta(days=1)
     return days
@@ -144,25 +143,27 @@ def _fetch_all_ohlcv(conn) -> pd.DataFrame:
     return df
 
 
-def _compute_and_write_volume_ratios(conn, ohlcv_df: pd.DataFrame) -> int:
-    """Compute rolling-20d volume avg, write volume_day + volume_ratio to SignalFeatureDaily."""
+def _compute_and_write_volume_windows(conn, ohlcv_df: pd.DataFrame) -> int:
+    """Compute rolling volume averages, write volume_day + volume_10d/20d."""
     df = ohlcv_df.copy().sort_values("trade_date").reset_index(drop=True)
-    df["vol_20d_avg"] = df["volume"].rolling(window=20, min_periods=20).mean()
-    df["volume_ratio"] = (df["volume"] / df["vol_20d_avg"]).where(df["vol_20d_avg"] > 0)
+    df["volume_10d"] = df["volume"].rolling(window=10, min_periods=10).mean()
+    df["volume_20d"] = df["volume"].rolling(window=20, min_periods=20).mean()
 
     updated = 0
     sql = """
         UPDATE "SignalFeatureDaily"
         SET volume_day  = %s,
-            volume_ratio = %s,
+            volume_10d  = %s,
+            volume_20d  = %s,
             updated_at  = NOW()
         WHERE symbol = %s AND signal_date = %s AND feature_version = 'v1'
     """
     with conn.cursor() as cur:
         for _, row in df.iterrows():
-            vol_ratio = None if pd.isna(row["volume_ratio"]) else round(float(row["volume_ratio"]), 6)
+            volume_10d = None if pd.isna(row["volume_10d"]) else round(float(row["volume_10d"]), 4)
+            volume_20d = None if pd.isna(row["volume_20d"]) else round(float(row["volume_20d"]), 4)
             vol_day = int(row["volume"]) if row["volume"] > 0 else None
-            cur.execute(sql, (vol_day, vol_ratio, _UNDERLYING, row["trade_date"]))
+            cur.execute(sql, (vol_day, volume_10d, volume_20d, _UNDERLYING, row["trade_date"]))
             if cur.rowcount:
                 updated += 1
     conn.commit()
@@ -193,10 +194,10 @@ def run_volume_backfill(start_date: date, end_date: date) -> dict[str, Any]:
         print(f"  {d}: volume = {vol:,}")
 
     print(f"\nUpdated {len(volume_found)} UnderlyingSnapshot rows.")
-    print("Recomputing volume_ratio in SignalFeatureDaily ...")
+    print("Recomputing volume windows in SignalFeatureDaily ...")
     ohlcv_df = _fetch_all_ohlcv(db.conn)
-    updated = _compute_and_write_volume_ratios(db.conn, ohlcv_df)
-    print(f"Updated {updated} SignalFeatureDaily rows with volume_day / volume_ratio.")
+    updated = _compute_and_write_volume_windows(db.conn, ohlcv_df)
+    print(f"Updated {updated} SignalFeatureDaily rows with volume_day / volume_10d / volume_20d.")
 
     db.close()
     return {
@@ -219,3 +220,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

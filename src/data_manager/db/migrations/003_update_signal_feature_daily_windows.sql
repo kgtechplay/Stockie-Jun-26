@@ -1,0 +1,15 @@
+ALTER TABLE "SignalFeatureDaily"
+    ADD COLUMN IF NOT EXISTS ret_10d double precision,
+    ADD COLUMN IF NOT EXISTS volatility_10d double precision,
+    ADD COLUMN IF NOT EXISTS trend_efficiency_5d double precision,
+    ADD COLUMN IF NOT EXISTS trend_efficiency_10d double precision,
+    ADD COLUMN IF NOT EXISTS trend_efficiency_20d double precision,
+    ADD COLUMN IF NOT EXISTS ma5d_slope double precision,
+    ADD COLUMN IF NOT EXISTS ma10d_slope double precision,
+    ADD COLUMN IF NOT EXISTS recent_high_5d double precision,
+    ADD COLUMN IF NOT EXISTS recent_low_5d double precision,
+    ADD COLUMN IF NOT EXISTS recent_high_10d double precision,
+    ADD COLUMN IF NOT EXISTS recent_low_10d double precision,
+    ADD COLUMN IF NOT EXISTS range_position_5d double precision,
+    ADD COLUMN IF NOT EXISTS range_position_10d double precision,
+    DROP COLUMN IF EXISTS ma20_50_crossovers_20d;

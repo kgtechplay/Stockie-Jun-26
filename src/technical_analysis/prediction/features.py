@@ -18,17 +18,30 @@ FEATURE_COLUMNS = [
     "bb_lower",
     "bb_width",
     "ret_5d",
+    "ret_10d",
     "ret_20d",
     "ret_60d",
+    "volatility_10d",
     "volatility_20d",
-    "volume_ratio",
+    "volume_10d",
+    "volume_20d",
+    "trend_efficiency_5d",
+    "trend_efficiency_10d",
+    "trend_efficiency_20d",
     "trend_efficiency_60d",
     "relative_strength_vs_sector",
+    "ma5d_slope",
+    "ma10d_slope",
     "ma20_slope",
     "ma50_slope",
-    "ma20_50_crossovers_20d",
+    "recent_high_5d",
+    "recent_low_5d",
+    "recent_high_10d",
+    "recent_low_10d",
     "recent_high_20d",
     "recent_low_20d",
+    "range_position_5d",
+    "range_position_10d",
     "range_position_20d",
 ]
 
@@ -102,14 +115,11 @@ def compute_return(closes: pd.Series, days: int) -> float | None:
     return float(closes.iloc[-1]) / start - 1.0
 
 
-def compute_volume_ratio(window: PredictionInput, lookback: int = 20) -> float | None:
+def compute_average_volume(window: PredictionInput, lookback: int) -> float | None:
     volumes = get_column(window, "volume")
-    if volumes is None or len(volumes) < lookback + 1:
+    if volumes is None or len(volumes) < lookback:
         return None
-    avg_volume = float(volumes.iloc[-(lookback + 1):-1].mean())
-    if avg_volume == 0:
-        return None
-    return float(volumes.iloc[-1]) / avg_volume
+    return float(volumes.tail(lookback).mean())
 
 
 def compute_trend_efficiency(closes: pd.Series, days: int = 60) -> float | None:
@@ -121,22 +131,6 @@ def compute_trend_efficiency(closes: pd.Series, days: int = 60) -> float | None:
     if path_move == 0:
         return None
     return net_move / path_move
-
-
-def count_ma_crossovers(
-    closes: pd.Series,
-    short_window: int = 20,
-    long_window: int = 50,
-    lookback: int = 20,
-) -> int | None:
-    if len(closes) < long_window + lookback:
-        return None
-    short_ma = closes.rolling(short_window).mean()
-    long_ma = closes.rolling(long_window).mean()
-    spread_sign = (short_ma - long_ma).dropna().tail(lookback + 1).apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
-    if len(spread_sign) < 2:
-        return None
-    return int((spread_sign.diff().abs() > 0).sum())
 
 
 def compute_relative_strength_vs_sector(
@@ -169,20 +163,29 @@ def compute_underlying_features(
         "ma90": round_feature(closes.tail(90).mean()) if len(closes) >= 90 else None,
         "rsi14": round_feature(compute_rsi(closes, 14).iloc[-1]) if len(closes) >= 16 else None,
         "ret_5d": round_feature(compute_return(closes, 5), 6),
+        "ret_10d": round_feature(compute_return(closes, 10), 6),
         "ret_20d": round_feature(compute_return(closes, 20), 6),
         "ret_60d": round_feature(compute_return(closes, 60), 6),
+        "volatility_10d": round_feature(closes.pct_change().dropna().tail(10).std(), 6)
+        if len(closes) >= 11
+        else None,
         "volatility_20d": round_feature(closes.pct_change().dropna().tail(20).std(), 6)
         if len(closes) >= 21
         else None,
-        "volume_ratio": round_feature(compute_volume_ratio(window), 6),
+        "volume_10d": round_feature(compute_average_volume(window, 10), 4),
+        "volume_20d": round_feature(compute_average_volume(window, 20), 4),
+        "trend_efficiency_5d": round_feature(compute_trend_efficiency(closes, 5), 6),
+        "trend_efficiency_10d": round_feature(compute_trend_efficiency(closes, 10), 6),
+        "trend_efficiency_20d": round_feature(compute_trend_efficiency(closes, 20), 6),
         "trend_efficiency_60d": round_feature(compute_trend_efficiency(closes, 60), 6),
         "relative_strength_vs_sector": round_feature(
             compute_relative_strength_vs_sector(window, sector_window, 20),
             6,
         ),
+        "ma5d_slope": round_feature(_ma_slope(closes, 5), 6),
+        "ma10d_slope": round_feature(_ma_slope(closes, 10), 6),
         "ma20_slope": round_feature(_ma_slope(closes, 20), 6),
         "ma50_slope": round_feature(_ma_slope(closes, 50), 6),
-        "ma20_50_crossovers_20d": count_ma_crossovers(closes),
     }
 
     if isinstance(window, pd.DataFrame):
@@ -206,23 +209,27 @@ def compute_underlying_features(
         features["bb_lower"] = None
         features["bb_width"] = None
 
-    if highs is not None and lows is not None and len(closes) >= 2:
-        prior_highs = highs.iloc[:-1].tail(20)
-        prior_lows = lows.iloc[:-1].tail(20)
-        features["recent_high_20d"] = round_feature(prior_highs.max())
-        features["recent_low_20d"] = round_feature(prior_lows.min())
-        if current_close is not None and features["recent_high_20d"] and features["recent_low_20d"]:
-            range_width = float(features["recent_high_20d"]) - float(features["recent_low_20d"])
-            features["range_position_20d"] = round_feature(
-                (current_close - float(features["recent_low_20d"])) / range_width,
-                6,
-            ) if range_width else None
+    for lookback in (5, 10, 20):
+        high_key = f"recent_high_{lookback}d"
+        low_key = f"recent_low_{lookback}d"
+        position_key = f"range_position_{lookback}d"
+        if highs is not None and lows is not None and len(closes) >= 2:
+            prior_highs = highs.iloc[:-1].tail(lookback)
+            prior_lows = lows.iloc[:-1].tail(lookback)
+            features[high_key] = round_feature(prior_highs.max()) if not prior_highs.empty else None
+            features[low_key] = round_feature(prior_lows.min()) if not prior_lows.empty else None
+            if current_close is not None and features[high_key] is not None and features[low_key] is not None:
+                range_width = float(features[high_key]) - float(features[low_key])
+                features[position_key] = round_feature(
+                    (current_close - float(features[low_key])) / range_width,
+                    6,
+                ) if range_width else None
+            else:
+                features[position_key] = None
         else:
-            features["range_position_20d"] = None
-    else:
-        features["recent_high_20d"] = None
-        features["recent_low_20d"] = None
-        features["range_position_20d"] = None
+            features[high_key] = None
+            features[low_key] = None
+            features[position_key] = None
 
     return {column: features.get(column) for column in FEATURE_COLUMNS}
 

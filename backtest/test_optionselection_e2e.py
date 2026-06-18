@@ -241,7 +241,7 @@ def _reconstruct_view(row: dict[str, Any]) -> UnderlyingView:
         expected_holding_days=int(row.get("expected_holding_days") or 1),
         atr14=_f(row.get("atr14")),
         volatility_20d=_f(row.get("volatility_20d")),
-        volume_ratio=_f(row.get("volume_ratio")),
+        volume_ratio=None,
         relative_strength_vs_sector=_f(row.get("relative_strength_vs_sector")),
         relative_strength_vs_benchmark=None,
         stock_technical_score=float(row.get("stock_technical_score") or 0),

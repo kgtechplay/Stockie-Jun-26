@@ -11,7 +11,6 @@ FLAT_SLOPE_THRESHOLD = 0.01
 HIGH_VOLATILITY_THRESHOLD = 0.025
 MODERATE_VOLATILITY_MAX = 0.03
 LOW_TREND_EFFICIENCY_THRESHOLD = 0.25
-FREQUENT_CROSSOVER_THRESHOLD = 2
 
 
 def detect_regime(window: PredictionInput) -> str:
@@ -29,7 +28,6 @@ def detect_regime(window: PredictionInput) -> str:
     trend_efficiency = _feature_float(features.get("trend_efficiency_60d"))
     volatility_20d = _feature_float(features.get("volatility_20d"))
     range_position = _feature_float(features.get("range_position_20d"))
-    crossover_count = features.get("ma20_50_crossovers_20d")
 
     if None not in (ma20, ma50, ma20_slope, ma50_slope, ret_60d, trend_efficiency):
         if (
@@ -60,9 +58,8 @@ def detect_regime(window: PredictionInput) -> str:
     volatility_moderate = volatility_20d is not None and volatility_20d <= MODERATE_VOLATILITY_MAX
     trend_efficiency_low = trend_efficiency is not None and trend_efficiency <= LOW_TREND_EFFICIENCY_THRESHOLD
     volatility_high = volatility_20d is not None and volatility_20d >= HIGH_VOLATILITY_THRESHOLD
-    frequent_crossovers = isinstance(crossover_count, int) and crossover_count >= FREQUENT_CROSSOVER_THRESHOLD
 
-    if ret_is_small and trend_efficiency_low and volatility_high and frequent_crossovers:
+    if ret_is_small and trend_efficiency_low and volatility_high:
         return "CHOPPY"
     if ret_is_small and slopes_flat and oscillating_in_range and volatility_moderate:
         return "RANGE"
