@@ -1,0 +1,60 @@
+NIFTY direction-prediction — strategy comparison
+================================================
+rows: 245   THRESHOLD = 0.500%
+base CALL precision (random): 0.314   base PUT precision (random): 0.384
+
+strategy                                    side     n    prec  recall      f1    cov
+-------------------------------------------------------------------------------------------
+OversoldBounceCall_HighPrecision            CALL    27   0.741   0.260   0.385  0.110
+OversoldBounceCall_MoreTrades               CALL    37   0.703   0.338   0.456  0.151
+DownMomentumPut_HighPrecision                PUT    17   0.824   0.149   0.252  0.069
+DownMomentumPut_MoreTrades                   PUT    32   0.781   0.266   0.397  0.131
+MomentumDirectional                         BOTH   106   0.632   0.432   0.513  0.433
+MAAlignmentRoom                             BOTH    71   0.479   0.219   0.301  0.290
+MAAlignmentRoom_PutGuarded                  BOTH    43   0.465   0.129   0.202  0.176
+MAAlignmentRoom_ReboundCall                 CALL    33   0.576   0.247   0.345  0.135
+MaTrend_001                                 BOTH   221   0.330   0.471   0.388  0.902
+BollingerMeanReversion                      BOTH    22   0.591   0.084   0.147  0.090
+RsiMeanReversion_6040                       BOTH    87   0.460   0.258   0.331  0.355
+RangeBreakout                               BOTH    26   0.423   0.071   0.122  0.106
+
+Observations
+------------
+1. CALL edge is mean-reversion: NIFTY tends to bounce >=0.5% the day after
+   an oversold/low-in-range close. OversoldBounceCall_HighPrecision is the
+   sharpest CALL (fewest trades, highest precision); _MoreTrades trades more
+   often at slightly lower precision.
+2. PUT edge is momentum continuation: down-trending, high-volume days tend to
+   extend >=0.5% lower next day. DownMomentumPut_HighPrecision adds 'VIX rising'
+   for the highest precision but few trades; _MoreTrades swaps that for a VIX
+   level gate to fire more often.
+3. India VIX is a confirmation/gate, not a standalone trigger. A VIX level gate
+   (>=13) removes dead low-volatility days where 0.5% rarely prints; 'VIX rising'
+   specifically sharpens PUT precision.
+4. MomentumDirectional merges the best-balanced CALL and PUT into one
+   two-sided signal. NOTE the two sides use OPPOSITE logic (CALL =
+   mean-reversion, PUT = momentum-continuation) and overlap on ~60 of the
+   falling/oversold days, so conflicts are common. They are resolved by
+   normalised vote strength (the more strongly confirmed side wins), which
+   gives the best precision/recall balance; dropping conflicts instead
+   collapses the signal. It trades per-trade precision for the highest recall.
+5. Precision and recall trade off: sniper variants sit at ~7-15% coverage with
+   high precision; the balanced directional sits near ~30-40% coverage. Choose
+   by desired trade frequency vs hit-rate.
+
+Legacy strategies (reproduced from the previously-dropped strategy_* columns)
+----------------------------------------------------------------------------
+6. MAAlignmentRoom family (MAAlignmentRoom, _PutGuarded, _ReboundCall) plus
+   MaTrend_001 are MA-alignment / MA-trend rules. They are ungated here (the
+   regime columns are excluded from base.csv).
+7. MeanReversion merges BollingerMeanReversion and RsiMeanReversion_6040 — both
+   are mean-reversion rules, so they share one family file.
+8. RangeBreakout merges trendUpRangeBreakout and trendDownRangeBreakout into one
+   two-sided 20-day breakout (CALL above prior-20d high, PUT below prior-20d low).
+   Originally these were the same breakout gated on TREND_UP vs TREND_DOWN; with
+   regime excluded they collapse to a single signal. In this ~95% RANGE sample,
+   breakouts are rare and tend to be false (mean-reverting tape), so expect low
+   precision relative to the mean-reversion CALL and momentum PUT rules.
+
+Caveat: single year of data (~95% RANGE regime). The CALL mean-reversion bet
+weakens in a sustained downtrend; re-validate as more data accrues.

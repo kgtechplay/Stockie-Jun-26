@@ -1,0 +1,99 @@
+Strategy family: MAAlignmentRoom
+================================
+rows: 245   THRESHOLD = 0.500%
+base CALL precision (random): 0.314   base PUT precision (random): 0.384
+
+Definitions
+-----------
+  MAAlignmentRoom:
+    Two-sided MA alignment (CALL precedence). CALL when ma5>ma10, (ma10-ma20)/ma20>0,
+    rsi14<50, resistance_distance_10d>0.5%. PUT when ma5<ma10, (ma10-ma20)/ma20<-0.05%,
+    rsi14>30, support_distance_10d>0.
+
+  MAAlignmentRoom_PutGuarded:
+    MAAlignmentRoom with the CALL leg unchanged, but a PUT is kept only when ret_5d<0 AND
+    range_position_10d<0.5 AND support_distance_10d<=2%; otherwise NO_POSITION.
+
+  MAAlignmentRoom_ReboundCall:
+    CALL-only rebound setup: rsi14 in [25,45], resistance_distance_10d>2%,
+    support_distance_10d>=0, ret_10d<0, and ret_5d>ret_10d (5-day return improving vs the
+    10-day).
+
+  MaTrend_001:
+    CALL when (ma10-ma20)/ma20 > +0.1%; PUT when < -0.1%; else NO_POSITION. Pure MA10/MA20
+    trend with a 0.1% dead-band.
+
+variant                                    n_call  n_put    prec  recall      f1    cov
+-----------------------------------------------------------------------------------------------
+MAAlignmentRoom                                 6     65   0.479   0.219   0.301  0.290
+MAAlignmentRoom_PutGuarded                      6     37   0.465   0.129   0.202  0.176
+MAAlignmentRoom_ReboundCall                    33      0   0.576   0.247   0.345  0.135
+MaTrend_001                                   102    119   0.330   0.471   0.388  0.902
+
+Miss patterns
+-------------
+Where each variant loses precision (wrong fires) and recall (missed moves):
+
+  MAAlignmentRoom:
+    Precision misses: 37 of 71 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      bb_width                 wrong=0.04414 vs correct=0.06657  (lower on wrong)
+      atr14                    wrong=248.7 vs correct=302  (lower on wrong)
+      resistance_distance_10d  wrong=0.02435 vs correct=0.0333  (lower on wrong)
+      volatility_10d           wrong=0.007012 vs correct=0.009528  (lower on wrong)
+    Recall misses: 121 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      rsi14                    missed=48.51 vs caught=41.71  (higher on missed)
+      ma10d_slope              missed=-0.001375 vs caught=-0.01082  (higher on missed)
+      ret_10d                  missed=-0.00397 vs caught=-0.02051  (higher on missed)
+      ma20_slope               missed=-0.0009143 vs caught=-0.008042  (higher on missed)
+
+  MAAlignmentRoom_PutGuarded:
+    Precision misses: 23 of 43 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      support_distance_10d     wrong=0.007551 vs correct=0.01176  (lower on wrong)
+      bb_width                 wrong=0.04238 vs correct=0.06363  (lower on wrong)
+      atr14                    wrong=247.1 vs correct=298.3  (lower on wrong)
+      resistance_distance_10d  wrong=0.0267 vs correct=0.03577  (lower on wrong)
+    Recall misses: 135 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      rsi14                    missed=47.96 vs caught=40.7  (higher on missed)
+      ret_5d                   missed=-0.003615 vs caught=-0.01467  (higher on missed)
+      range_position_10d       missed=0.3951 vs caught=0.253  (higher on missed)
+      resistance_distance_10d  missed=0.02274 vs caught=0.03577  (lower on missed)
+
+  MAAlignmentRoom_ReboundCall:
+    Precision misses: 14 of 33 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      range_position_10d       wrong=0.2769 vs correct=0.1783  (higher on wrong)
+      resistance_distance_10d  wrong=0.03428 vs correct=0.04681  (lower on wrong)
+      vix_close                wrong=15.12 vs correct=18.65  (lower on wrong)
+      atr14                    wrong=272.8 vs correct=337  (lower on wrong)
+    Recall misses: 58 of 77 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      rsi14                    missed=47.18 vs caught=36.29  (higher on missed)
+      ma10d_slope              missed=-0.001297 vs caught=-0.01824  (higher on missed)
+      ret_10d                  missed=-0.004657 vs caught=-0.03672  (higher on missed)
+      ma20_slope               missed=-0.0006123 vs caught=-0.0151  (higher on missed)
+
+  MaTrend_001:
+    Precision misses: 148 of 221 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      rsi14                    wrong=52.67 vs correct=44.11  (higher on wrong)
+      resistance_distance_10d  wrong=0.01435 vs correct=0.03044  (lower on wrong)
+      vix_close                wrong=13.01 vs correct=16.07  (lower on wrong)
+      ma10d_slope              wrong=0.001302 vs correct=-0.006672  (higher on wrong)
+    Recall misses: 82 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      vix_close                missed=13.62 vs caught=16.07  (lower on missed)
+      resistance_distance_10d  missed=0.01907 vs caught=0.03044  (lower on missed)
+      rsi14                    missed=49.61 vs caught=44.11  (higher on missed)
+      ma10d_slope              missed=-0.0005727 vs caught=-0.006672  (higher on missed)
+
+Notes
+-----
+precision = correct fires / total fires.
+recall    = correct fires / days the threshold move actually occurred.
+f1        = harmonic mean of precision and recall.
+Add tweaked variants as new strategy_<family>_<variant>_signal columns to
+this same CSV to compare against the existing variants here.

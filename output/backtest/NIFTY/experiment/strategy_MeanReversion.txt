@@ -1,0 +1,58 @@
+Strategy family: MeanReversion
+==============================
+rows: 245   THRESHOLD = 0.500%
+base CALL precision (random): 0.314   base PUT precision (random): 0.384
+
+Definitions
+-----------
+  BollingerMeanReversion:
+    CALL when close < lower Bollinger band (20-day mean - 2 sigma); PUT when close > upper
+    band (mean + 2 sigma).
+
+  RsiMeanReversion_6040:
+    CALL when rsi14 <= 40; PUT when rsi14 >= 60; else NO_POSITION.
+
+variant                                    n_call  n_put    prec  recall      f1    cov
+-----------------------------------------------------------------------------------------------
+BollingerMeanReversion                         16      6   0.591   0.084   0.147  0.090
+RsiMeanReversion_6040                          45     42   0.460   0.258   0.331  0.355
+
+Miss patterns
+-------------
+Where each variant loses precision (wrong fires) and recall (missed moves):
+
+  BollingerMeanReversion:
+    Precision misses: 9 of 22 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      range_position_10d       wrong=0.599 vs correct=-0.05596  (higher on wrong)
+      rsi14                    wrong=51.52 vs correct=36.08  (higher on wrong)
+      support_distance_10d     wrong=0.0172 vs correct=-0.0004453  (higher on wrong)
+      ret_5d                   wrong=-0.002156 vs correct=-0.02532  (higher on wrong)
+    Recall misses: 142 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      ret_5d                   missed=-0.003186 vs caught=-0.02532  (higher on missed)
+      range_position_10d       missed=0.4163 vs caught=-0.05596  (higher on missed)
+      trend_efficiency_10d     missed=0.3128 vs caught=0.5008  (lower on missed)
+      rsi14                    missed=48.02 vs caught=36.08  (higher on missed)
+
+  RsiMeanReversion_6040:
+    Precision misses: 47 of 87 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      range_position_10d       wrong=0.6451 vs correct=0.261  (higher on wrong)
+      resistance_distance_10d  wrong=0.0167 vs correct=0.03547  (lower on wrong)
+      ret_5d                   wrong=0.001067 vs correct=-0.01129  (higher on wrong)
+      rsi14                    wrong=53.51 vs correct=43.96  (higher on wrong)
+    Recall misses: 115 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      trend_efficiency_10d     missed=0.2848 vs caught=0.4543  (lower on missed)
+      resistance_distance_10d  missed=0.02058 vs caught=0.03547  (lower on missed)
+      ret_10d                  missed=-0.003475 vs caught=-0.01945  (higher on missed)
+      ma10d_slope              missed=-0.001661 vs caught=-0.008575  (higher on missed)
+
+Notes
+-----
+precision = correct fires / total fires.
+recall    = correct fires / days the threshold move actually occurred.
+f1        = harmonic mean of precision and recall.
+Add tweaked variants as new strategy_<family>_<variant>_signal columns to
+this same CSV to compare against the existing variants here.

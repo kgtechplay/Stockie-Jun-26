@@ -1,0 +1,125 @@
+NIFTY direction-prediction experiment — BASE dataset
+=====================================================
+rows: 245   date range: 2025-06-19 .. 2026-06-18
+
+THRESHOLD = 0.500%  (next-day intraday move from next_open)
+
+actual_trade_label
+------------------
+For each trade_date, the realised next-day intraday move from next_open is checked:
+  CALL  : (next_high - next_open) / next_open >= 0.500%   (and PUT side did not)
+  PUT   : (next_open - next_low ) / next_open >= 0.500%   (and CALL side did not)
+  BOTH  : both the +0.5% and -0.5% moves were touched intraday
+  NO_POSITION : neither move reached the threshold
+label distribution: {'NO_POSITION': 90, 'PUT': 78, 'CALL': 61, 'BOTH': 16}
+base CALL hit-rate (CALL or BOTH): 0.314   base PUT hit-rate (PUT or BOTH): 0.384
+These base rates are the precision a random/always-on signal would achieve.
+
+Feature definitions (canonical features; *_5d/_20d/_50d/_90d are window variants
+of the same feature and follow the same definition)
+--------------------------------------------------------------------------------
+ma10                  : 10-day simple moving average of close.
+ma10d_slope           : slope (per-day rate of change) of the 10-day MA; >0 rising trend.
+rsi14                 : 14-day Relative Strength Index (0-100); <30 oversold, >70 overbought.
+atr14                 : 14-day Average True Range; absolute daily volatility in index points.
+bb_upper / bb_middle / bb_lower
+                      : Bollinger Bands — middle = 20-day MA, upper/lower = middle +/- 2 std.
+bb_width              : (bb_upper - bb_lower) / bb_middle; volatility expansion when high.
+ret_10d               : 10-day price return (decimal).
+volatility_10d        : standard deviation of the last 10 daily close-to-close returns.
+trend_efficiency_10d  : net move / total path length over 10 days (0-1); higher = cleaner trend.
+recent_high_10d       : highest high over the last 10 days.
+recent_low_10d        : lowest low over the last 10 days.
+support_10d           : nearest 10-day support level (recent_low_10d).
+resistance_10d        : nearest 10-day resistance level (recent_high_10d).
+range_position_10d    : where close sits in the 10-day high/low range (0 = low, 1 = high).
+resistance_distance_10d: (resistance_10d - close) / close; headroom to resistance.
+
+India VIX signals (from MacroFactorDaily, point-in-time as of trade_date)
+-------------------------------------------------------------------------
+vix_close             : India VIX close — 30-day forward expected NIFTY volatility (%).
+vix_chg_1d            : 1-day change in India VIX (today - yesterday).
+vix_chg_pct           : 1-day percentage change in India VIX.
+
+Final daily prediction — precision cascade
+------------------------------------------
+One prediction per day, picked as follows:
+  - A variant may cast a CALL vote only if its CALL precision > 70% with >= 5 fires; likewise for PUT.
+  - Each day, the highest-precision eligible CALL vote competes with the
+    highest-precision eligible PUT vote; the higher precision wins.
+  - No eligible vote (or an exact tie) -> NO_POSITION.
+  - Precisions are measured on the eligibility window noted in each block.
+
+  Eligible CALL voters (variant: in-sample CALL precision):
+    BollingerMeanReversion                    0.750
+    OversoldBounceCall_HighPrecision          0.741
+    OversoldBounceCall_MoreTrades             0.703
+  Eligible PUT voters (variant: in-sample PUT precision):
+    DownMomentumPut_HighPrecision             0.824
+    DownMomentumPut_MoreTrades                0.781
+
+In-sample (eligibility + evaluation on full data; optimistic)
+------------------------------------------------------------
+  Full-period cascade:
+    fires: 52 (CALL 19, PUT 33, FLAT 193)  of 245 days
+    directional precision : 0.808   (naive always-PUT = 0.384, lift 2.105x)
+    directional recall    : 0.271
+    wrong-way rate        : 0.154   (took a side, opposite move happened — the only money-losing error)
+    overall accuracy      : 0.531   (correct fires + correct flats / all days)
+  Confusion matrix:
+    pred \ actual      CALL    PUT   BOTH   NONE
+    CALL                 15      3      1      0
+    PUT                   5     14     12      2
+    NONE                 41     61      3     88
+
+Out-of-sample 60/40 time split (eligibility from first 147 days,
+evaluated on the held-out last 98 days)
+------------------------------------------------------------
+  Train-period eligible CALL voters: BollingerMeanReversion
+  Train-period eligible PUT voters : (none)
+  Train slice (in-sample):
+    fires: 5 (CALL 5, PUT 0, FLAT 142)  of 147 days
+    directional precision : 0.800   (naive always-PUT = 0.320, lift 2.502x)
+    directional recall    : 0.051
+    wrong-way rate        : 0.200   (took a side, opposite move happened — the only money-losing error)
+    overall accuracy      : 0.497   (correct fires + correct flats / all days)
+  Test slice (out-of-sample, the honest number):
+    fires: 11 (CALL 11, PUT 0, FLAT 87)  of 98 days
+    directional precision : 0.727   (naive always-PUT = 0.480, lift 1.516x)
+    directional recall    : 0.104
+    wrong-way rate        : 0.273   (took a side, opposite move happened — the only money-losing error)
+    overall accuracy      : 0.296   (correct fires + correct flats / all days)
+  Test confusion matrix:
+    pred \ actual      CALL    PUT   BOTH   NONE
+    CALL                  4      3      4      0
+    PUT                   0      0      0      0
+    NONE                 26     31      9     21
+
+Walk-forward (rolling 120-day trailing eligibility, >=4 fires)
+------------------------------------------------------------
+Each predicted day uses only the prior 120 days to decide which variants
+are eligible, then predicts that single day. No future data leaks in.
+  days with >=1 eligible CALL voter: 104 of 125
+  days with >=1 eligible PUT voter : 97 of 125
+  Walk-forward (out-of-sample, the most realistic number):
+    fires: 45 (CALL 17, PUT 28, FLAT 80)  of 125 days
+    directional precision : 0.733   (naive always-PUT = 0.448, lift 1.637x)
+    directional recall    : 0.363
+    wrong-way rate        : 0.244   (took a side, opposite move happened — the only money-losing error)
+    overall accuracy      : 0.528   (correct fires + correct flats / all days)
+  Walk-forward confusion matrix:
+    pred \ actual      CALL    PUT   BOTH   NONE
+    CALL                 10      4      3      0
+    PUT                   7     11      9      1
+    NONE                 18     26      3     33
+
+Caveat: precision floors are fit on the same year they are graded on,
+so the in-sample block is optimistic. The 60/40 split freezes eligibility
+on the first half, which can starve a time-concentrated edge (e.g. the PUT
+momentum leg). The walk-forward re-fits eligibility on a trailing window,
+so a side activates once its recent precision earns it — the most honest
+estimate here, though still thin on a single year of data.
+
+Excluded from this file by design: *_regime columns, strategy_* signal columns,
+and final_raw_signal. The final_prediction column in base.csv is the cascade
+output described above. Strategy signals live in the per-strategy CSVs.
