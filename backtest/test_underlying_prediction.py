@@ -232,6 +232,9 @@ _REGIME_DIRECT_CALLS: dict[str, dict[str, Any]] = {
 
 _BASE_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
     "BollingerMeanReversion": signal_bollinger_mean_reversion,
+    "MAAlignmentRoom": lambda window: _signal_ma_alignment_room(window),
+    "MAAlignmentRoom_PutGuarded": lambda window: _signal_ma_alignment_room_put_guarded(window),
+    "MAAlignmentRoom_ReboundCall": lambda window: _signal_ma_alignment_room_rebound_call(window),
     "MaTrend_001": signal_ma_trend,
     "RsiMeanReversion_6040": partial(
         signal_rsi_mean_reversion,
@@ -262,6 +265,51 @@ _EXPECTED_TREND_BASE_STRATEGIES = {
 }
 
 _EXPERIMENT_LOGGER_REGISTRY: dict[str, dict[str, Any]] = {
+    "MAAlignmentRoom_Strict": {
+        "dataset": "base",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 69,
+        "precision_pct": 20.29,
+        "recall_pct": 11.76,
+        "remove_reason": "Superseded by the looser MAAlignmentRoom rule, which improved precision and recall while preserving the same research idea.",
+    },
+    "MAAlignmentRoom_Loose": {
+        "dataset": "base",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 68,
+        "precision_pct": 22.06,
+        "recall_pct": 12.61,
+        "remove_reason": "Superseded by MAAlignmentRoom_TightSpread, which improved precision and recall with a stronger MA10/MA20 spread filter.",
+    },
+    "MAAlignmentRoom_CallSelective": {
+        "dataset": "base",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 53,
+        "precision_pct": 28.30,
+        "recall_pct": 12.61,
+        "remove_reason": "Merged its stronger CALL leg into the unified MAAlignmentRoom rule.",
+    },
+    "MAAlignmentRoom_PutLoose": {
+        "dataset": "base",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 80,
+        "precision_pct": 26.25,
+        "recall_pct": 17.65,
+        "remove_reason": "Merged its stronger PUT leg into the unified MAAlignmentRoom rule.",
+    },
+    "MAAlignmentRoom_BreakdownPut": {
+        "dataset": "base",
+        "base": "MaTrend_001",
+        "status": "removed",
+        "signals": 67,
+        "precision_pct": 26.87,
+        "recall_pct": 15.13,
+        "remove_reason": "Dropped from active research because it was weaker than the main MAAlignmentRoom PUT leg and the guarded PUT variant.",
+    },
     "MaTrend_Constrained_Call": {
         "dataset": "expectedRegime_Trend",
         "base": "MaTrend_001",
@@ -394,6 +442,102 @@ def _latest_float(window: Any, column: str) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _signal_ma_alignment_room(window: Any) -> str:
+    return _signal_ma_alignment_room_thresholds(
+        window,
+        call_rsi_max=50.0,
+        put_rsi_min=30.0,
+        call_resistance_distance_min=0.005,
+        put_support_distance_min=0.0,
+        call_ma10_20_spread_threshold=0.0,
+        put_ma10_20_spread_threshold=0.0005,
+    )
+
+
+def _signal_ma_alignment_room_rebound_call(window: Any) -> str:
+    if window.empty or "close_price" not in window:
+        return "NO_POSITION"
+    rsi14 = _latest_float(window, "rsi14")
+    ret_5d = _latest_float(window, "ret_5d")
+    ret_10d = _latest_float(window, "ret_10d")
+    resistance_distance_10d = _latest_float(window, "resistance_distance_10d")
+    support_distance_10d = _latest_float(window, "support_distance_10d")
+    if (
+        rsi14 is None
+        or ret_5d is None
+        or ret_10d is None
+        or resistance_distance_10d is None
+        or support_distance_10d is None
+    ):
+        return "NO_POSITION"
+    if (
+        25 <= rsi14 <= 45
+        and resistance_distance_10d > 0.02
+        and support_distance_10d >= 0
+        and ret_10d < 0
+        and ret_5d > ret_10d
+    ):
+        return "CALL"
+    return "NO_POSITION"
+
+
+def _signal_ma_alignment_room_put_guarded(window: Any) -> str:
+    signal = _signal_ma_alignment_room(window)
+    if signal != "PUT":
+        return signal
+    ret_5d = _latest_float(window, "ret_5d")
+    range_position_10d = _latest_float(window, "range_position_10d")
+    support_distance_10d = _latest_float(window, "support_distance_10d")
+    if ret_5d is None or range_position_10d is None or support_distance_10d is None:
+        return "NO_POSITION"
+    if ret_5d < 0 and range_position_10d < 0.5 and support_distance_10d <= 0.02:
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _signal_ma_alignment_room_thresholds(
+    window: Any,
+    *,
+    call_rsi_max: float,
+    put_rsi_min: float,
+    call_resistance_distance_min: float,
+    put_support_distance_min: float,
+    call_ma10_20_spread_threshold: float,
+    put_ma10_20_spread_threshold: float,
+) -> str:
+    if window.empty or "close_price" not in window:
+        return "NO_POSITION"
+    closes = window["close_price"].astype(float)
+    if len(closes) < 20:
+        return "NO_POSITION"
+
+    ma5 = float(closes.rolling(5).mean().iloc[-1])
+    ma10 = float(closes.rolling(10).mean().iloc[-1])
+    ma20 = float(closes.rolling(20).mean().iloc[-1])
+    rsi14 = _latest_float(window, "rsi14")
+    resistance_distance_10d = _latest_float(window, "resistance_distance_10d")
+    support_distance_10d = _latest_float(window, "support_distance_10d")
+    if (
+        pd.isna(ma5)
+        or pd.isna(ma10)
+        or pd.isna(ma20)
+        or ma20 == 0
+        or rsi14 is None
+        or resistance_distance_10d is None
+        or support_distance_10d is None
+    ):
+        return "NO_POSITION"
+
+    ma10_20_spread = (ma10 - ma20) / ma20
+    call_ma_bias = ma5 > ma10 and ma10_20_spread > call_ma10_20_spread_threshold
+    put_ma_bias = ma5 < ma10 and ma10_20_spread < -put_ma10_20_spread_threshold
+    if call_ma_bias and rsi14 < call_rsi_max and resistance_distance_10d > call_resistance_distance_min:
+        return "CALL"
+    if put_ma_bias and rsi14 > put_rsi_min and support_distance_10d > put_support_distance_min:
+        return "PUT"
+    return "NO_POSITION"
 
 
 def _latest_str(window: Any, column: str) -> str | None:
@@ -906,10 +1050,23 @@ def generate_prediction_csv(
         research_window = window.copy()
         if not research_window.empty:
             latest_idx = research_window.index[-1]
+            close_1515 = _f(sf_row.get("close_1515"))
+            support_10d = _f(sf_row.get("recent_low_10d"))
+            resistance_10d = _f(sf_row.get("recent_high_10d"))
+            support_distance_10d = (
+                (close_1515 - support_10d) / close_1515
+                if close_1515 and support_10d is not None else None
+            )
+            resistance_distance_10d = (
+                (resistance_10d - close_1515) / close_1515
+                if close_1515 and resistance_10d is not None else None
+            )
             for feature_col in (
                 "rsi14",
                 "range_position_5d",
                 "range_position_10d",
+                "recent_high_10d",
+                "recent_low_10d",
                 "ret_5d",
                 "ret_10d",
                 "ma5d_slope",
@@ -920,6 +1077,10 @@ def generate_prediction_csv(
                 "volatility_20d",
             ):
                 research_window.loc[latest_idx, feature_col] = sf_row.get(feature_col)
+            research_window.loc[latest_idx, "support_10d"] = support_10d
+            research_window.loc[latest_idx, "resistance_10d"] = resistance_10d
+            research_window.loc[latest_idx, "support_distance_10d"] = support_distance_10d
+            research_window.loc[latest_idx, "resistance_distance_10d"] = resistance_distance_10d
             research_window.loc[latest_idx, "expected_regime_lag2"] = expected_regime_lag2
 
         def _run_research_predictions(names: list[str], call_map: dict[str, Any]) -> dict[str, str]:
@@ -1110,6 +1271,16 @@ def _build_research_row(
     view: Any,
 ) -> dict[str, Any]:
     current_close = _f((current_ohlcv or {}).get("close_price")) or _f(sf_row.get("close_1515"))
+    support_10d = _f(sf_row.get("recent_low_10d"))
+    resistance_10d = _f(sf_row.get("recent_high_10d"))
+    support_distance_10d = (
+        round((current_close - support_10d) / current_close, 6)
+        if current_close and support_10d is not None else None
+    )
+    resistance_distance_10d = (
+        round((resistance_10d - current_close) / current_close, 6)
+        if current_close and resistance_10d is not None else None
+    )
     next_open = _f((next_ohlcv or {}).get("open_price"))
     next_high = _f((next_ohlcv or {}).get("high_price"))
     next_low = _f((next_ohlcv or {}).get("low_price"))
@@ -1156,6 +1327,10 @@ def _build_research_row(
         "recent_low_5d": sf_row.get("recent_low_5d"),
         "recent_high_10d": sf_row.get("recent_high_10d"),
         "recent_low_10d": sf_row.get("recent_low_10d"),
+        "support_10d": support_10d,
+        "resistance_10d": resistance_10d,
+        "support_distance_10d": support_distance_10d,
+        "resistance_distance_10d": resistance_distance_10d,
         "recent_high_20d": sf_row.get("recent_high_20d"),
         "recent_low_20d": sf_row.get("recent_low_20d"),
         "range_position_5d": sf_row.get("range_position_5d"),
@@ -1194,6 +1369,9 @@ def _actual_trade_label(next_return_pct: float | None) -> str | None:
 
 _RESEARCH_STRATEGY_DEFINITIONS: dict[str, str] = {
     "BollingerMeanReversion": "Mean reversion: CALL below lower Bollinger band, PUT above upper Bollinger band.",
+    "MAAlignmentRoom": "Research MA alignment: CALL uses MA5 > MA10, MA10 above MA20, RSI14 < 50, and resistance_distance_10d > 0.5%; PUT uses MA5 < MA10, MA10 is >0.05% below MA20, RSI14 > 30, and support_distance_10d > 0.",
+    "MAAlignmentRoom_PutGuarded": "Research guarded variant: reuse MAAlignmentRoom, but keep PUT only when ret_5d < 0, range_position_10d < 0.5, and support_distance_10d <= 2%.",
+    "MAAlignmentRoom_ReboundCall": "Research CALL experiment: catch cleaner rebound setups when RSI14 is 25-45, ret_10d < 0, ret_5d is improving versus ret_10d, and resistance_distance_10d > 2%.",
     "expectedTrendDown_HighVolBreak_Put": "Research-only PUT: expected TREND_DOWN, ret_5d < 0, volatility_10d > volatility_20d, and range_position_10d < 0.5.",
     "expectedTrendDown_RallyFailing_Put": "Research-only PUT: expected TREND_DOWN, ret_10d > 0, ret_5d < half of ret_10d, and RSI14 > 45.",
     "expectedTrendDown_RSIWeakness_Put": "Research-only PUT: expected TREND_DOWN, 40 <= RSI14 <= 55, ret_5d < 0, and range_position_10d < 0.6.",
@@ -1333,7 +1511,7 @@ def _generate_experiment_logger(
         **{
             strategy: {
                 "dataset": dataset,
-                "base": "MaTrend_001" if "Trend" in strategy or strategy.startswith("MA_") else "RsiMeanReversion_6040",
+                "base": "MaTrend_001" if "Trend" in strategy or strategy.startswith("MA") else "RsiMeanReversion_6040",
                 "status": "active",
                 "remove_reason": "Active candidate; keep for further comparison.",
             }
