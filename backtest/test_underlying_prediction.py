@@ -233,6 +233,8 @@ _REGIME_DIRECT_CALLS: dict[str, dict[str, Any]] = {
 _BASE_RESEARCH_DIRECT_CALLS: dict[str, Any] = {
     "BollingerMeanReversion": signal_bollinger_mean_reversion,
     "MAAlignmentRoom": lambda window: _signal_ma_alignment_room(window),
+    "MAAlignmentRoom_base": lambda window: _signal_ma_alignment_room_base(window),
+    "MAAlignmentRoom_variant": lambda window: _signal_ma_alignment_room_variant(window),
     "MAAlignmentRoom_PutGuarded": lambda window: _signal_ma_alignment_room_put_guarded(window),
     "MAAlignmentRoom_ReboundCall": lambda window: _signal_ma_alignment_room_rebound_call(window),
     "MaTrend_001": signal_ma_trend,
@@ -454,6 +456,60 @@ def _signal_ma_alignment_room(window: Any) -> str:
         call_ma10_20_spread_threshold=0.0,
         put_ma10_20_spread_threshold=0.0005,
     )
+
+
+def _signal_ma_alignment_room_base(window: Any) -> str:
+    """Strict MA stack variant for side-by-side comparison with MAAlignmentRoom."""
+    if window.empty or "close_price" not in window:
+        return "NO_POSITION"
+    closes = window["close_price"].astype(float)
+    if len(closes) < 20:
+        return "NO_POSITION"
+
+    ma5 = float(closes.rolling(5).mean().iloc[-1])
+    ma10 = float(closes.rolling(10).mean().iloc[-1])
+    ma20 = float(closes.rolling(20).mean().iloc[-1])
+    rsi14 = _latest_float(window, "rsi14")
+    resistance_distance_10d = _latest_float(window, "resistance_distance_10d")
+    support_distance_10d = _latest_float(window, "support_distance_10d")
+    if (
+        pd.isna(ma5)
+        or pd.isna(ma10)
+        or pd.isna(ma20)
+        or rsi14 is None
+        or resistance_distance_10d is None
+        or support_distance_10d is None
+    ):
+        return "NO_POSITION"
+
+    room_distance_min = 0.005  # 0.5%
+    if ma5 > ma10 > ma20 and rsi14 < 65.0 and resistance_distance_10d > room_distance_min:
+        return "CALL"
+    if ma5 < ma10 < ma20 and rsi14 > 35.0 and support_distance_10d > room_distance_min:
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _signal_ma_alignment_room_variant(window: Any) -> str:
+    """MA30 stack variant: MA5 > MA10 > MA30 for CALL, inverse for PUT."""
+    if window.empty or "close_price" not in window:
+        return "NO_POSITION"
+    closes = window["close_price"].astype(float)
+    if len(closes) < 30:
+        return "NO_POSITION"
+
+    ma5 = float(closes.rolling(5).mean().iloc[-1])
+    ma10 = float(closes.rolling(10).mean().iloc[-1])
+    ma30 = float(closes.rolling(30).mean().iloc[-1])
+    rsi14 = _latest_float(window, "rsi14")
+    if pd.isna(ma5) or pd.isna(ma10) or pd.isna(ma30) or rsi14 is None:
+        return "NO_POSITION"
+
+    if ma5 > ma10 > ma30 and rsi14 < 65.0:
+        return "CALL"
+    if ma5 < ma10 < ma30 and rsi14 > 35.0:
+        return "PUT"
+    return "NO_POSITION"
 
 
 def _signal_ma_alignment_room_rebound_call(window: Any) -> str:
@@ -1370,6 +1426,8 @@ def _actual_trade_label(next_return_pct: float | None) -> str | None:
 _RESEARCH_STRATEGY_DEFINITIONS: dict[str, str] = {
     "BollingerMeanReversion": "Mean reversion: CALL below lower Bollinger band, PUT above upper Bollinger band.",
     "MAAlignmentRoom": "Research MA alignment: CALL uses MA5 > MA10, MA10 above MA20, RSI14 < 50, and resistance_distance_10d > 0.5%; PUT uses MA5 < MA10, MA10 is >0.05% below MA20, RSI14 > 30, and support_distance_10d > 0.",
+    "MAAlignmentRoom_base": "Strict MA stack baseline: CALL when MA5 > MA10 > MA20, RSI14 < 65, and resistance_distance_10d > 0.5%; PUT when MA5 < MA10 < MA20, RSI14 > 35, and support_distance_10d > 0.5%.",
+    "MAAlignmentRoom_variant": "MA30 stack variant: CALL when MA5 > MA10 > MA30 and RSI14 < 65; PUT when MA5 < MA10 < MA30 and RSI14 > 35.",
     "MAAlignmentRoom_PutGuarded": "Research guarded variant: reuse MAAlignmentRoom, but keep PUT only when ret_5d < 0, range_position_10d < 0.5, and support_distance_10d <= 2%.",
     "MAAlignmentRoom_ReboundCall": "Research CALL experiment: catch cleaner rebound setups when RSI14 is 25-45, ret_10d < 0, ret_5d is improving versus ret_10d, and resistance_distance_10d > 2%.",
     "expectedTrendDown_HighVolBreak_Put": "Research-only PUT: expected TREND_DOWN, ret_5d < 0, volatility_10d > volatility_20d, and range_position_10d < 0.5.",
@@ -1571,6 +1629,102 @@ def _fmt(value: Any) -> str:
     return f"{float(value):.2f}"
 
 
+_RESEARCH_WINDOW_OVERLAY_COLUMNS = (
+    "rsi14",
+    "range_position_5d",
+    "range_position_10d",
+    "recent_high_10d",
+    "recent_low_10d",
+    "ret_5d",
+    "ret_10d",
+    "ma5d_slope",
+    "ma10d_slope",
+    "trend_efficiency_5d",
+    "trend_efficiency_10d",
+    "volatility_10d",
+    "volatility_20d",
+    "support_10d",
+    "resistance_10d",
+    "support_distance_10d",
+    "resistance_distance_10d",
+    "expected_regime_lag2",
+)
+
+
+def _build_research_window_from_csv_slice(slice_df: pd.DataFrame) -> pd.DataFrame:
+    window = slice_df.copy().reset_index(drop=True)
+    window["close_price"] = pd.to_numeric(window["close_1515"], errors="coerce")
+    return window
+
+
+def _base_research_strategy_names() -> list[str]:
+    strategies = load_underlying_prediction_strategies()
+    return sorted(
+        set(strategies.keys()).union(_BASE_RESEARCH_DIRECT_CALLS.keys()) - _RESEARCH_EXCLUDED_STRATEGIES
+    )
+
+
+def refresh_research_outputs_from_csv(
+    research_output_path: Path = DEFAULT_RESEARCH_OUTPUT,
+    *,
+    expected_trend_research_output_path: Path | None = DEFAULT_EXPECTED_TREND_RESEARCH_OUTPUT,
+) -> dict[str, Any]:
+    """Recompute flat research strategy columns from an existing base.csv (no DB)."""
+    if not research_output_path.exists():
+        raise FileNotFoundError(f"Research CSV not found: {research_output_path}")
+
+    df = pd.read_csv(research_output_path)
+    if df.empty or "close_1515" not in df.columns:
+        raise ValueError(f"Research CSV missing required columns: {research_output_path}")
+
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    strategy_names = _base_research_strategy_names()
+    refreshed_predictions: list[dict[str, str]] = []
+
+    for idx in range(len(df)):
+        start = max(0, idx - DEFAULT_LOOKBACK_DAYS + 1)
+        research_window = _build_research_window_from_csv_slice(df.iloc[start: idx + 1])
+        predictions: dict[str, str] = {}
+        for strategy_name in strategy_names:
+            strategy = _BASE_RESEARCH_DIRECT_CALLS.get(strategy_name)
+            if strategy is None or research_window.empty:
+                predictions[strategy_name] = "NO_POSITION"
+                continue
+            try:
+                raw_value = str(strategy(research_window)).strip().upper()
+                predictions[strategy_name] = (
+                    raw_value if raw_value in {"CALL", "PUT", "NO_POSITION"} else "NO_POSITION"
+                )
+            except Exception:
+                predictions[strategy_name] = "NO_POSITION"
+        refreshed_predictions.append(predictions)
+
+    for strategy_name in strategy_names:
+        if strategy_name == "unknown":
+            continue
+        df[f"strategy_{strategy_name}_signal"] = [
+            row.get(strategy_name, "NO_POSITION") for row in refreshed_predictions
+        ]
+
+    research_output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(research_output_path, index=False)
+    summary_path = research_output_path.with_name(research_output_path.stem + "_summary.txt")
+    _generate_research_summary(df, summary_path)
+
+    expected_trend_df: pd.DataFrame | None = None
+    if expected_trend_research_output_path and expected_trend_research_output_path.exists():
+        expected_trend_df = pd.read_csv(expected_trend_research_output_path)
+
+    _generate_experiment_logger(
+        base_df=df,
+        expected_trend_df=expected_trend_df,
+        output_path=DEFAULT_EXPERIMENT_LOGGER_OUTPUT,
+    )
+    print(f"Refreshed research outputs at {research_output_path}")
+    print(f"Research summary written to {summary_path}")
+    return {"rows": len(df), "path": str(research_output_path), "summary_path": str(summary_path)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate NIFTY prediction CSV from SignalFeatureDaily.")
     parser.add_argument("--underlying", default="NIFTY", help="Underlying symbol. Default: NIFTY")
@@ -1598,7 +1752,26 @@ def main() -> None:
             f"default: {DEFAULT_REGIME_COMPARISON}"
         ),
     )
+    parser.add_argument(
+        "--refresh-research-only",
+        action="store_true",
+        help=(
+            "Recompute strategy_* columns and summary from an existing research CSV "
+            "(no database). Useful after adding research strategies such as MAAlignmentRoom_base."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.refresh_research_only:
+        result = refresh_research_outputs_from_csv(
+            research_output_path=Path(args.research_output) if args.research_output else DEFAULT_RESEARCH_OUTPUT,
+            expected_trend_research_output_path=(
+                Path(args.expected_trend_research_output)
+                if args.expected_trend_research_output else None
+            ),
+        )
+        print(result)
+        return
 
     result = generate_prediction_csv(
         underlying=args.underlying.upper(),

@@ -1,0 +1,41 @@
+Strategy family: RangeBreakout
+==============================
+rows: 245   THRESHOLD = 0.500%
+base CALL precision (random): 0.314   base PUT precision (random): 0.384
+
+Definitions
+-----------
+  RangeBreakout:
+    Two-sided 20-day breakout. CALL when close > the prior-20-day high; PUT when close < the
+    prior-20-day low. Merges the old TREND_UP/TREND_DOWN regime-gated breakouts into one
+    ungated signal.
+
+variant                                    n_call  n_put    prec  recall      f1    cov
+-----------------------------------------------------------------------------------------------
+RangeBreakout                                  11     15   0.423   0.071   0.122  0.106
+
+Miss patterns
+-------------
+Where each variant loses precision (wrong fires) and recall (missed moves):
+
+  RangeBreakout:
+    Precision misses: 15 of 26 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      ret_5d                   wrong=0.008659 vs correct=-0.02594  (higher on wrong)
+      ma10d_slope              wrong=0.006282 vs correct=-0.01481  (higher on wrong)
+      ret_10d                  wrong=0.01406 vs correct=-0.03838  (higher on wrong)
+      rsi14                    wrong=54.7 vs correct=34.55  (higher on wrong)
+    Recall misses: 144 of 155 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      support_distance_10d     missed=0.01727 vs caught=-0.003458  (higher on missed)
+      rsi14                    missed=47.97 vs caught=34.55  (higher on missed)
+      vix_chg_1d               missed=-0.05319 vs caught=1.318  (lower on missed)
+      ret_5d                   missed=-0.003446 vs caught=-0.02594  (higher on missed)
+
+Notes
+-----
+precision = correct fires / total fires.
+recall    = correct fires / days the threshold move actually occurred.
+f1        = harmonic mean of precision and recall.
+Add tweaked variants as new strategy_<family>_<variant>_signal columns to
+this same CSV to compare against the existing variants here.

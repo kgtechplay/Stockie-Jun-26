@@ -6,188 +6,153 @@ Update rule: add a registry entry when creating a strategy; when removing it, ch
 ## MAAlignmentRoom
 - Dataset: base
 - Status: active
-- Precision/recall: 32.39% / 19.33% (71 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Precision/recall: 31.43% / 18.64% (70 signals)
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Active candidate; keep for further comparison.
 
 ## MAAlignmentRoom_BreakdownPut
 - Dataset: base
 - Status: removed
 - Precision/recall: 26.87% / 15.13% (67 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Dropped from active research because it was weaker than the main MAAlignmentRoom PUT leg and the guarded PUT variant.
 
 ## MAAlignmentRoom_CallSelective
 - Dataset: base
 - Status: removed
 - Precision/recall: 28.30% / 12.61% (53 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Merged its stronger CALL leg into the unified MAAlignmentRoom rule.
 
 ## MAAlignmentRoom_Loose
 - Dataset: base
 - Status: removed
 - Precision/recall: 22.06% / 12.61% (68 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Superseded by MAAlignmentRoom_TightSpread, which improved precision and recall with a stronger MA10/MA20 spread filter.
 
 ## MAAlignmentRoom_PutGuarded
 - Dataset: base
 - Status: active
-- Precision/recall: 37.21% / 13.45% (43 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Precision/recall: 35.71% / 12.71% (42 signals)
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Active candidate; keep for further comparison.
 
 ## MAAlignmentRoom_PutLoose
 - Dataset: base
 - Status: removed
 - Precision/recall: 26.25% / 17.65% (80 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Merged its stronger PUT leg into the unified MAAlignmentRoom rule.
 
 ## MAAlignmentRoom_ReboundCall
 - Dataset: base
 - Status: active
-- Precision/recall: 42.86% / 15.13% (42 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Precision/recall: 36.36% / 10.17% (33 signals)
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Active candidate; keep for further comparison.
 
 ## MAAlignmentRoom_Strict
 - Dataset: base
 - Status: removed
 - Precision/recall: 20.29% / 11.76% (69 signals)
-- Base comparison: MaTrend_001 precision/recall 23.08% / 42.86%
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
 - Removal decision: Superseded by the looser MAAlignmentRoom rule, which improved precision and recall while preserving the same research idea.
+
+## MAAlignmentRoom_base
+- Dataset: base
+- Status: active
+- Precision/recall: 21.25% / 14.41% (80 signals)
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
+- Removal decision: Active candidate; keep for further comparison.
+
+## MAAlignmentRoom_variant
+- Dataset: base
+- Status: active
+- Precision/recall: 22.62% / 16.10% (84 signals)
+- Base comparison: MaTrend_001 precision/recall 24.14% / 41.53%
+- Removal decision: Active candidate; keep for further comparison.
 
 ## MA_Momentum_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 20.51% / 6.72% (39 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Lower precision than base MA Trend CALL and weaker than the v2 momentum filter.
 
 ## MA_Momentum_Call_v2
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 26.09% / 5.04% (23 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Improved over MA_Momentum_Call but was superseded by expected-regime trend-up strategies.
 
 ## MA_Rebound_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 25.71% / 7.56% (35 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Dominated by MA_Rebound_Call_v2 and later superseded by expected-regime CALL experiments.
 
 ## MA_Rebound_Call_v2
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 36.84% / 5.88% (19 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Useful but superseded by expectedTrendUp_DipStabilizing_Call and expectedTrendUp_RangeRecovery_Call.
 
 ## MA_Revised_PUT
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 31.25% / 16.81% (64 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Improved raw MA PUT precision but superseded by expected-regime TREND_DOWN strategies.
 
 ## MaTrend_Constrained_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 25.00% / 1.68% (8 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Too restrictive: only 8 signals, and it filtered out most correct CALL candidates.
 
 ## MaTrend_Constrained_Put
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 18.03% / 9.24% (61 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Worse than base MA Trend on precision and recall; retained too many stale mid/high-range PUTs.
 
 ## expectedTrendDown_BreakdownContinuation_Put
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 66.67% / 9.76% (6 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Dominated by expectedTrendDown_RSIWeakness_Put and expectedTrendDown_HighVolBreak_Put.
-
-## expectedTrendDown_HighVolBreak_Put
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 75.00% / 15.00% (8 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
 
 ## expectedTrendDown_OverboughtFade_Put
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: n/a% / 0.00% (0 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: No signals fired in the expected-trend sample.
-
-## expectedTrendDown_RSIWeakness_Put
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 85.71% / 15.00% (7 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
-
-## expectedTrendDown_RallyFailing_Put
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 100.00% / 5.00% (2 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
-
-## expectedTrendDown_RangeReject_Put
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 100.00% / 2.50% (1 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
 
 ## expectedTrendUp_BreakoutContinuation_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 60.00% / 7.32% (5 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Dominated by stronger expected TREND_UP CALL candidates.
-
-## expectedTrendUp_DipStabilizing_Call
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 100.00% / 20.00% (8 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
 
 ## expectedTrendUp_LowVolPullback_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 0.00% / 0.00% (1 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Only 1 signal and 0 correct in the expected-trend sample.
 
 ## expectedTrendUp_OversoldBounce_Call
 - Dataset: expectedRegime_Trend
 - Status: removed
 - Precision/recall: 87.50% / 17.07% (8 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
+- Base comparison: MaTrend_001 precision/recall n/a% / n/a%
 - Removal decision: Dominated by expectedTrendUp_DipStabilizing_Call and expectedTrendUp_RangeRecovery_Call.
-
-## expectedTrendUp_RSIRecovery_Call
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 100.00% / 7.50% (3 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.
-
-## expectedTrendUp_RangeRecovery_Call
-- Dataset: expectedRegime_Trend
-- Status: active
-- Precision/recall: 90.00% / 22.50% (10 signals)
-- Base comparison: MaTrend_001 precision/recall 48.72% / 47.50%
-- Removal decision: Active candidate; keep for further comparison.

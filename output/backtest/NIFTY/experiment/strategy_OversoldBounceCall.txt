@@ -1,0 +1,60 @@
+Strategy family: OversoldBounceCall
+===================================
+rows: 245   THRESHOLD = 0.500%
+base CALL precision (random): 0.314   base PUT precision (random): 0.384
+
+Definitions
+-----------
+  OversoldBounceCall_HighPrecision:
+    CALL when range_position_10d <= 0.20 (close near the 10-day low) AND vix_close >= 13.
+    Oversold mean-reversion bounce, gated away from dead low-volatility days.
+
+  OversoldBounceCall_MoreTrades:
+    CALL when rsi14 <= 42 AND resistance_distance_10d >= 2.5% (oversold with headroom to
+    resistance) AND vix_close >= 13. Looser entry than the HighPrecision variant, so it
+    fires more often.
+
+variant                                    n_call  n_put    prec  recall      f1    cov
+-----------------------------------------------------------------------------------------------
+OversoldBounceCall_HighPrecision               27      0   0.741   0.260   0.385  0.110
+OversoldBounceCall_MoreTrades                  37      0   0.703   0.338   0.456  0.151
+
+Miss patterns
+-------------
+Where each variant loses precision (wrong fires) and recall (missed moves):
+
+  OversoldBounceCall_HighPrecision:
+    Precision misses: 7 of 27 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      vix_close                wrong=20.71 vs correct=18.1  (higher on wrong)
+      volume_day               wrong=1.252e+05 vs correct=1.036e+05  (higher on wrong)
+      rsi14                    wrong=33.05 vs correct=35.67  (lower on wrong)
+      volatility_10d           wrong=0.01114 vs correct=0.009378  (higher on wrong)
+    Recall misses: 57 of 77 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      range_position_10d       missed=0.4302 vs caught=-0.02568  (higher on missed)
+      rsi14                    missed=47.59 vs caught=35.67  (higher on missed)
+      ret_5d                   missed=-0.002913 vs caught=-0.02428  (higher on missed)
+      support_distance_10d     missed=0.01967 vs caught=-0.0004757  (higher on missed)
+
+  OversoldBounceCall_MoreTrades:
+    Precision misses: 11 of 37 fires were wrong.
+    On wrong fires vs correct fires, the biggest tells were:
+      volume_day               wrong=1.309e+05 vs correct=1.119e+05  (higher on wrong)
+      rsi14                    wrong=33.21 vs correct=35.37  (lower on wrong)
+      trend_efficiency_10d     wrong=0.4724 vs correct=0.3961  (higher on wrong)
+      vix_chg_1d               wrong=-0.06091 vs correct=0.6977  (lower on wrong)
+    Recall misses: 51 of 77 actual-move days were not caught.
+    On missed winning days vs caught winning days, the biggest tells were:
+      rsi14                    missed=49.15 vs caught=35.37  (higher on missed)
+      resistance_distance_10d  missed=0.01768 vs caught=0.05168  (lower on missed)
+      ret_10d                  missed=0.0007957 vs caught=-0.03878  (higher on missed)
+      ma10d_slope              missed=0.000491 vs caught=-0.01718  (higher on missed)
+
+Notes
+-----
+precision = correct fires / total fires.
+recall    = correct fires / days the threshold move actually occurred.
+f1        = harmonic mean of precision and recall.
+Add tweaked variants as new strategy_<family>_<variant>_signal columns to
+this same CSV to compare against the existing variants here.
