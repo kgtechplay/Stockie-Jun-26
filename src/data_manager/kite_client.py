@@ -73,8 +73,11 @@ class KiteClient:
 
             access_token = _clean_token(str(db_token or ""))
             if access_token and len(access_token) >= 10:
-                token_path.parent.mkdir(parents=True, exist_ok=True)
-                token_path.write_text(access_token, encoding="utf-8")
+                try:
+                    token_path.parent.mkdir(parents=True, exist_ok=True)
+                    token_path.write_text(access_token, encoding="utf-8")
+                except Exception:
+                    pass
                 return access_token
         except Exception:
             pass

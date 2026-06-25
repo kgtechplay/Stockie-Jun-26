@@ -4,6 +4,10 @@ Daily NIFTY/index underlying OHLC refresh.
 This is the morning/manual entrypoint for:
   - UnderlyingSnapshot daily OHLC rows
   - SignalFeatureDaily rows via scripts/Common/calculate_underlying_features.py
+  - NIFTY futures volume from the NSE FO bhavcopy via
+    scripts/backfill_NIFTY/backfill_nifty_volume.py (Kite returns 0 index volume)
+  - India VIX into MacroFactorDaily via
+    scripts/backfill_NIFTY/backfill_india_vix.py (regime router input)
 
 Default date behavior:
   - Morning/pre-close run: refresh yesterday.
@@ -140,6 +144,29 @@ def run_supabase_daily_market_refresh(
         underlyings=symbols,
     )
 
+    # Kite returns 0 volume for index OHLC, so backfill NIFTY futures volume from
+    # the NSE FO bhavcopy and recompute the rolling volume windows. This is an
+    # external HTTP call; never let an NSE outage fail the daily refresh.
+    volume_summary: dict | None = None
+    if "NIFTY" in symbols:
+        try:
+            from scripts.backfill_NIFTY.backfill_nifty_volume import run_volume_backfill
+            volume_summary = run_volume_backfill(start_date, end_date)
+        except Exception as exc:  # noqa: BLE001 - resilience for the cron job
+            print(f"[WARN] NIFTY volume backfill skipped: {exc}")
+            volume_summary = {"error": str(exc)}
+
+    # India VIX is the regime router input but is not part of the index OHLC
+    # candles, so fetch it from Kite into MacroFactorDaily. Resilient like the
+    # volume step: a Kite/VIX hiccup must not fail the daily refresh.
+    vix_summary: dict | None = None
+    try:
+        from scripts.backfill_NIFTY.backfill_india_vix import run_backfill_india_vix
+        vix_summary = run_backfill_india_vix(start_date, end_date)
+    except Exception as exc:  # noqa: BLE001 - resilience for the cron job
+        print(f"[WARN] India VIX backfill skipped: {exc}")
+        vix_summary = {"error": str(exc)}
+
     return {
         "provider": "supabase",
         "underlyings": symbols,
@@ -147,6 +174,8 @@ def run_supabase_daily_market_refresh(
         "end_date": end_date.isoformat(),
         "underlying_snapshot": summary,
         "signal_features": feature_summary,
+        "nifty_volume": volume_summary,
+        "india_vix": vix_summary,
     }
 
 

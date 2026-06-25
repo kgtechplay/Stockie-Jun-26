@@ -1,0 +1,232 @@
+"""Feature dataset assembly + labelling for the cascade.
+
+Reads the canonical feature store (BASE_CSV), appends any newer SignalFeatureDaily
+rows that already have a realised next-day outcome, joins India VIX, routes each
+day into the calm/stress volatility regime and derives the regime-aware
+actual_trade_label. Read-only w.r.t. the DB except for SELECTing India VIX and the
+recent feature rows.
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+
+from src.common.config import get_settings
+from src.data_manager.db.client_factory import get_database_client
+
+from .constants import (
+    FEATURE_STORE, CALL, PUT, FLAT,
+    REGIME_CALM, REGIME_STRESS, REGIME_VIX_CUTOFF, REGIME_VOL_CUTOFF, REGIME_THRESHOLD,
+    _DROP_EXACT, _VIX_COLS, _BASE_STR_COLS,
+)
+from .global_index_features import add_global_index_features
+
+
+def classify_regime(df: pd.DataFrame) -> pd.Series:
+    """Route each trade_date into the calm or stress volatility regime using
+    only same-day features (no lookahead): calm = low India VIX AND low realised
+    10-day volatility; everything else is stress."""
+    calm = (df["vix_close"] < REGIME_VIX_CUTOFF) & (df["volatility_10d"] < REGIME_VOL_CUTOFF)
+    return pd.Series(np.where(calm.fillna(False), REGIME_CALM, REGIME_STRESS), index=df.index)
+
+
+def _label_at(df: pd.DataFrame, threshold: float) -> np.ndarray:
+    """Touch-based CALL/PUT/BOTH/NO_POSITION label at a given intraday threshold."""
+    o, h, lo = df["next_open"], df["next_high"], df["next_low"]
+    call_ok = (h - o) / o >= threshold
+    put_ok = (o - lo) / o >= threshold
+    return np.select(
+        [call_ok & ~put_ok, put_ok & ~call_ok, call_ok & put_ok],
+        [CALL, PUT, "BOTH"],
+        default=FLAT,
+    )
+
+
+def _call_ok(df: pd.DataFrame) -> pd.Series:
+    return df["actual_trade_label"].isin([CALL, "BOTH"])
+
+
+def _put_ok(df: pd.DataFrame) -> pd.Series:
+    return df["actual_trade_label"].isin([PUT, "BOTH"])
+
+
+def load_vix() -> pd.DataFrame:
+    settings = get_settings()
+    db = get_database_client(settings)
+    db.connect()
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute(
+                'SELECT factor_date, india_vix FROM "MacroFactorDaily" '
+                "WHERE india_vix IS NOT NULL ORDER BY factor_date"
+            )
+            rows = cur.fetchall()
+    finally:
+        db.close()
+    vix = pd.DataFrame(rows, columns=["trade_date", "vix_close"])
+    vix["trade_date"] = pd.to_datetime(vix["trade_date"]).dt.strftime("%Y-%m-%d")
+    vix["vix_close"] = vix["vix_close"].astype(float)
+    vix["vix_chg_1d"] = vix["vix_close"].diff()
+    vix["vix_chg_pct"] = vix["vix_close"].pct_change()
+    return vix
+
+
+def _load_recent_feature_rows(existing: pd.DataFrame) -> pd.DataFrame:
+    """Pull any SignalFeatureDaily NIFTY rows newer than the latest base date and
+    shape them into the (already column-stripped) base schema so they flow through
+    the whole pipeline. Only dates that already have a realized next-day candle are
+    returned (a date is scorable only once D+1 exists); the newest still-open day
+    is therefore held back until its outcome lands. Returns an empty frame (matching
+    `existing` columns) when there is nothing new or the DB is unavailable."""
+    max_date = str(existing["trade_date"].max())
+    try:
+        settings = get_settings()
+        db = get_database_client(settings)
+        db.connect()
+        try:
+            with db.conn.cursor() as cur:
+                cur.execute(
+                    'SELECT * FROM "SignalFeatureDaily" '
+                    "WHERE symbol = %s AND signal_date >= %s ORDER BY signal_date",
+                    ("NIFTY", max_date),
+                )
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 - never let a DB hiccup break the rebuild
+        print(f"[WARN] recent-row append skipped: {exc}")
+        return existing.iloc[0:0].copy()
+
+    sf = pd.DataFrame(rows, columns=cols)
+    if sf.empty:
+        return existing.iloc[0:0].copy()
+
+    sf = sf.rename(columns={"signal_date": "trade_date"})
+    sf["trade_date"] = pd.to_datetime(sf["trade_date"]).dt.strftime("%Y-%m-%d")
+    sf = sf.sort_values("trade_date").reset_index(drop=True)
+
+    # realized D+1 outcomes (used only for grading), from the next chronological row
+    sf["next_trade_date"] = sf["trade_date"].shift(-1)
+    sf["next_open"] = sf["open_915"].shift(-1)
+    sf["next_high"] = sf["high_day"].shift(-1)
+    sf["next_low"] = sf["low_day"].shift(-1)
+    sf["next_close"] = sf["close_1515"].shift(-1)
+    sf["next_return_pct"] = (sf["next_close"] - sf["close_1515"]) / sf["close_1515"]
+
+    # support/resistance levels + distances derived from the 10-day extremes
+    sf["support_10d"] = sf["recent_low_10d"]
+    sf["resistance_10d"] = sf["recent_high_10d"]
+    sf["support_distance_10d"] = (sf["close_1515"] - sf["support_10d"]) / sf["close_1515"]
+    sf["resistance_distance_10d"] = (sf["resistance_10d"] - sf["close_1515"]) / sf["close_1515"]
+
+    # keep only genuinely new, scorable dates (a realized next-day candle exists)
+    sf = sf[(sf["trade_date"] > max_date) & sf["next_open"].notna()]
+    if sf.empty:
+        return existing.iloc[0:0].copy()
+
+    out = sf.reindex(columns=existing.columns)
+    for col in out.columns:
+        if col not in _BASE_STR_COLS:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.reset_index(drop=True)
+
+
+def _load_feature_rows_from_db() -> pd.DataFrame:
+    settings = get_settings()
+    db = get_database_client(settings)
+    db.connect()
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute(
+                'SELECT * FROM "SignalFeatureDaily" '
+                "WHERE symbol = %s ORDER BY signal_date",
+                ("NIFTY",),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    finally:
+        db.close()
+
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        raise RuntimeError('No NIFTY rows found in "SignalFeatureDaily" for DB-backed prediction.')
+
+    df = df.rename(columns={"signal_date": "trade_date"})
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    df["next_trade_date"] = df["trade_date"].shift(-1)
+    df["next_open"] = df["open_915"].shift(-1)
+    df["next_high"] = df["high_day"].shift(-1)
+    df["next_low"] = df["low_day"].shift(-1)
+    df["next_close"] = df["close_1515"].shift(-1)
+    df["next_return_pct"] = (df["next_close"] - df["close_1515"]) / df["close_1515"]
+    df["support_10d"] = df["recent_low_10d"]
+    df["resistance_10d"] = df["recent_high_10d"]
+    df["support_distance_10d"] = (df["close_1515"] - df["support_10d"]) / df["close_1515"]
+    df["resistance_distance_10d"] = (df["resistance_10d"] - df["close_1515"]) / df["close_1515"]
+    df = df[[c for c in df.columns if c not in _VIX_COLS and c != "regime"]]
+    for col in df.columns:
+        if col not in _BASE_STR_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _load_seed_feature_rows() -> tuple[pd.DataFrame, bool]:
+    source = os.getenv("NIFTY_PREDICTION_FEATURE_SOURCE", "auto").strip().lower()
+    if source not in {"auto", "csv", "db"}:
+        raise ValueError("NIFTY_PREDICTION_FEATURE_SOURCE must be one of: auto, csv, db")
+
+    if source == "db" or (source == "auto" and not FEATURE_STORE.exists()):
+        return _load_feature_rows_from_db(), True
+
+    df = pd.read_csv(FEATURE_STORE)
+    df = df[[c for c in df.columns
+             if c not in _DROP_EXACT
+             and not c.startswith("strategy_")
+             and c not in _VIX_COLS
+             and c != "regime"]]
+    return df, False
+
+
+def build_base() -> pd.DataFrame:
+    """Read the current base.csv, strip regime/strategy/label columns, join VIX,
+    and (re)derive actual_trade_label from the 0.5% intraday rule.
+
+    Idempotent: safe to re-run on an already-restructured base.csv because all
+    feature + next_* columns are retained.
+    """
+    df, loaded_from_db = _load_seed_feature_rows()
+
+    # Append any newer SignalFeatureDaily rows (frozen here = base.csv max date),
+    # so the recent dates flow through regime/label/signal/cascade and are persisted
+    # back into the feature store on write. New rows are graded with the same rules.
+    if not loaded_from_db:
+        recent = _load_recent_feature_rows(df)
+        if not recent.empty:
+            df = pd.concat([df, recent], ignore_index=True)
+            print(f"  appended {len(recent)} new dated row(s): "
+                  f"{', '.join(recent['trade_date'])}")
+
+    df = df.merge(load_vix(), on="trade_date", how="left")
+    df = add_global_index_features(df)
+
+    # Volatility regime first, then a regime-aware label: stress rows are graded
+    # at 0.5% and calm rows at 0.3% (calm days rarely print a 0.5% move).
+    df["regime"] = classify_regime(df)
+    lab = pd.Series(FLAT, index=df.index, dtype=object)
+    for regime, th in REGIME_THRESHOLD.items():
+        mask = df["regime"] == regime
+        lab.loc[mask] = _label_at(df.loc[mask], th)
+    df["actual_trade_label"] = lab
+    return df
+
+
+def regime_frame(df: pd.DataFrame, regime: str) -> pd.DataFrame:
+    """Subset to one regime and (re)label it at that regime's threshold, so
+    strategy scoring inside the regime uses the regime-appropriate move size."""
+    sub = df[df["regime"] == regime].copy()
+    sub["actual_trade_label"] = _label_at(sub, REGIME_THRESHOLD[regime])
+    return sub

@@ -72,14 +72,15 @@ def view(
     score: float = 85,
     stock_regime: str = "TREND_UP",
 ) -> UnderlyingView:
+    aligned_regime = "TREND_DOWN" if direction == "BEARISH" else "TREND_UP"
     return UnderlyingView(
         symbol="NIFTY",
         trade_date="2026-05-15",
         raw_signal=raw_signal,  # type: ignore[arg-type]
         direction=direction,  # type: ignore[arg-type]
         stock_regime=stock_regime,  # type: ignore[arg-type]
-        sector_regime="TREND_UP",
-        benchmark_regime="TREND_UP",
+        sector_regime=aligned_regime,
+        benchmark_regime=aligned_regime,
         primary_strategy="MaTrend_001",
         setup_type="TREND_UP_PULLBACK_LONG",
         strength_score=score,
@@ -103,7 +104,12 @@ def view(
         reasons=[],
         warnings=[],
         is_option_eligible=True,
-        option_bias="BULLISH_STRONG" if score >= 80 else "BULLISH_MODERATE",
+        option_bias=(
+            "BULLISH_STRONG" if direction == "BULLISH" and score >= 80
+            else "BULLISH_MODERATE" if direction == "BULLISH"
+            else "BEARISH_STRONG" if score >= 80
+            else "BEARISH_MODERATE"
+        ),
     )
 
 
@@ -147,29 +153,50 @@ class OptionSelectionTests(unittest.TestCase):
     def test_bias_and_strategy_rules(self) -> None:
         self.assertEqual(derive_option_bias(view()), "BULLISH_STRONG")
         self.assertEqual(derive_option_bias(view(score=60)), "NEUTRAL")
-        self.assertEqual(derive_option_bias(view(stock_regime="CHOPPY")), "NEUTRAL")
+        self.assertEqual(derive_option_bias(view(stock_regime="CHOPPY")), "BULLISH_STRONG")
         self.assertEqual(
             choose_option_strategy_type("BULLISH_STRONG", 40, None, 0.01, 3, 10),
             "LONG_CALL",
         )
         self.assertEqual(
             choose_option_strategy_type("BULLISH_STRONG", 75, None, 0.01, 3, 10),
-            "BULL_CALL_SPREAD",
+            "LONG_CALL",
+        )
+        self.assertEqual(
+            choose_option_strategy_type("BULLISH_STRONG", 40, None, 0.01, 3, 1),
+            "LONG_CALL",
         )
         self.assertEqual(
             choose_option_strategy_type("BEARISH_MODERATE", 40, None, 0.01, 3, 10),
-            "BEAR_PUT_SPREAD",
+            "LONG_PUT",
         )
 
     def test_long_candidate_filters(self) -> None:
         contracts = [
-            contract("NIFTY26MAY10000CE", 10000, "CE", 0.52),
-            contract("NIFTY26MAY10000PE", 10000, "PE", -0.52),
-            contract("NIFTY26MAY10500CE", 10500, "CE", 0.10),
+            contract("NIFTY26JUN9800CE", 9800, "CE", 0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN10200PE", 10200, "PE", -0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN10200CE", 10200, "CE", 0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN9800PE", 9800, "PE", -0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN9700CE", 9700, "CE", 0.62, expiry="2026-06-19"),
+            contract("NIFTY26MAY9800CE", 9800, "CE", 0.78),
         ]
         features = compute_option_features_for_chain(contracts, 10000, "2026-05-15", [0.15, 0.20, 0.25])
         self.assertEqual(len(filter_long_call_candidates(contracts, features)), 1)
         self.assertEqual(len(filter_long_put_candidates(contracts, features)), 1)
+
+    def test_iv_outlier_uses_same_expiry_atm_iv(self) -> None:
+        contracts = [
+            contract("NIFTY26MAY10000CE", 10000, "CE", 0.50, expiry="2026-05-16", iv=0.50),
+            contract("NIFTY26JUN9800CE", 9800, "CE", 0.78, expiry="2026-06-19", iv=0.20),
+            contract("NIFTY26JUN10000CE", 10000, "CE", 0.52, expiry="2026-06-19", iv=0.21),
+        ]
+
+        features = compute_option_features_for_chain(contracts, 10000, "2026-05-15", [0.15, 0.20, 0.25])
+        target = features["NIFTY26JUN9800CE"]
+
+        self.assertAlmostEqual(target.iv_vs_atm_pct or 0, -0.047619, places=5)
+        self.assertFalse(target.is_iv_outlier)
+        self.assertEqual(len(filter_long_call_candidates(contracts, features)), 1)
 
     def test_strategy_build_risk_and_score(self) -> None:
         contracts = [
@@ -191,8 +218,8 @@ class OptionSelectionTests(unittest.TestCase):
 
     def test_selector_selects_long_call(self) -> None:
         contracts = [
-            contract("NIFTY26MAY10000CE", 10000, "CE", 0.52),
-            contract("NIFTY26MAY10000PE", 10000, "PE", -0.52),
+            contract("NIFTY26JUN9800CE", 9800, "CE", 0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN10200PE", 10200, "PE", -0.78, expiry="2026-06-19"),
         ]
         with patch(
             "src.technical_analysis.optionselection.option_selector.load_option_chain_with_calcs",
@@ -200,6 +227,24 @@ class OptionSelectionTests(unittest.TestCase):
         ):
             result = select_option_strategy(object(), view(), 10000, atm_iv_history_90d=[0.10, 0.20, 0.40])
         self.assertEqual(result.selected_strategy.strategy_type, "LONG_CALL")
+        self.assertIsNone(result.no_trade_reason)
+
+    def test_selector_selects_long_put(self) -> None:
+        contracts = [
+            contract("NIFTY26JUN9800CE", 9800, "CE", 0.78, expiry="2026-06-19"),
+            contract("NIFTY26JUN10200PE", 10200, "PE", -0.78, expiry="2026-06-19"),
+        ]
+        with patch(
+            "src.technical_analysis.optionselection.option_selector.load_option_chain_with_calcs",
+            return_value=contracts,
+        ):
+            result = select_option_strategy(
+                object(),
+                view(raw_signal="PUT", direction="BEARISH", stock_regime="TREND_DOWN"),
+                10000,
+                atm_iv_history_90d=[0.10, 0.20, 0.40],
+            )
+        self.assertEqual(result.selected_strategy.strategy_type, "LONG_PUT")
         self.assertIsNone(result.no_trade_reason)
 
 
@@ -224,21 +269,34 @@ def _f(val: Any) -> float | None:
 
 
 def _reconstruct_view(row: dict[str, Any]) -> UnderlyingView:
+    trade_date = str(row.get("date") or row.get("trade_date"))
+    prediction_side = str(row.get("direction") or row.get("final_prediction") or row.get("raw_signal") or "NO_POSITION")
+    if prediction_side == "BULLISH":
+        prediction_side = "CALL"
+    elif prediction_side == "BEARISH":
+        prediction_side = "PUT"
+    if prediction_side not in {"CALL", "PUT"}:
+        prediction_side = "NO_POSITION"
+    internal_direction = "BULLISH" if prediction_side == "CALL" else "BEARISH" if prediction_side == "PUT" else "NEUTRAL"
+    strength_score = float(row.get("strength_score") or 0)
+    confidence = str(row.get("confidence") or "")
+    if confidence not in {"LOW", "MEDIUM", "HIGH"}:
+        confidence = "HIGH" if strength_score >= 80 else "MEDIUM" if strength_score >= 65 else "LOW"
     return UnderlyingView(
         symbol="NIFTY",
-        trade_date=str(row["date"]),
-        raw_signal=str(row.get("raw_signal") or "NO_POSITION"),  # type: ignore[arg-type]
-        direction=str(row.get("direction") or "NEUTRAL"),  # type: ignore[arg-type]
-        stock_regime=str(row.get("stock_regime") or "UNKNOWN"),  # type: ignore[arg-type]
+        trade_date=trade_date,
+        raw_signal=prediction_side,  # type: ignore[arg-type]
+        direction=internal_direction,  # type: ignore[arg-type]
+        stock_regime=str(row.get("stock_regime") or row.get("volatility_regime") or row.get("regime") or "UNKNOWN"),  # type: ignore[arg-type]
         sector_regime=None,
         benchmark_regime=None,
         primary_strategy=str(row.get("primary_strategy") or "") or None,
-        setup_type=str(row.get("setup_type") or ""),
-        strength_score=float(row.get("strength_score") or 0),
-        confidence=str(row.get("confidence") or "LOW"),  # type: ignore[arg-type]
+        setup_type=str(row.get("setup_type") or "NO_SETUP"),  # type: ignore[arg-type]
+        strength_score=strength_score,
+        confidence=confidence,  # type: ignore[arg-type]
         expected_move_pct=_f(row.get("expected_move_pct")),
         expected_move_abs=_f(row.get("expected_move_abs")),
-        expected_holding_days=int(row.get("expected_holding_days") or 1),
+        expected_holding_days=int(row.get("expected_holding_days") or (3 if prediction_side in {"CALL", "PUT"} else 0)),
         atr14=_f(row.get("atr14")),
         volatility_20d=_f(row.get("volatility_20d")),
         volume_ratio=None,
@@ -254,9 +312,15 @@ def _reconstruct_view(row: dict[str, Any]) -> UnderlyingView:
         strategy_signals=[],
         reasons=[],
         warnings=[],
-        is_option_eligible=str(row.get("is_option_eligible") or "").lower() in ("true", "1"),
+        is_option_eligible=pd.NA,
         option_bias=str(row.get("option_bias") or "NEUTRAL"),  # type: ignore[arg-type]
     )
+
+
+def _is_option_candidate_row(row: dict[str, Any]) -> bool:
+    prediction_side = str(row.get("direction") or row.get("final_prediction") or "NO_POSITION")
+    strength_score = _f(row.get("strength_score")) or 0.0
+    return prediction_side in {"CALL", "PUT"} and strength_score >= 65
 
 
 def _fetch_atm_iv_history(conn, underlying: str, spot_price: float, as_of_date: date) -> list[float]:
@@ -285,6 +349,47 @@ def _fetch_atm_iv_history(conn, underlying: str, spot_price: float, as_of_date: 
         cur.execute(sql, (spot_price, underlying.upper(), as_of_date))
         rows = cur.fetchall()
     return [float(r[0]) for r in rows if r[0] is not None]
+
+
+def _load_prediction_rows_from_db(conn, underlying: str, model_version: str) -> pd.DataFrame:
+    sql = """
+        SELECT
+            trade_date,
+            next_trade_date,
+            open_915,
+            high_day,
+            low_day,
+            close_1515,
+            volume_day,
+            vix_close,
+            vix_chg_1d,
+            vix_chg_pct,
+            regime,
+            next_open,
+            next_high,
+            next_low,
+            next_close,
+            next_return_pct,
+            final_prediction,
+            direction,
+            volatility_regime,
+            primary_strategy,
+            strategy_precision,
+            signal_style,
+            strength_score,
+            strength_label,
+            confidence_level,
+            actual_trade_label
+        FROM "NiftyPrediction"
+        WHERE UPPER(symbol) = %s
+          AND model_version = %s
+        ORDER BY trade_date
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (underlying.upper(), model_version))
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _to_date(val: Any) -> date:
@@ -430,10 +535,23 @@ def generate_option_selection_csv(
     input_path: Path = DEFAULT_INPUT,
     output_path: Path = DEFAULT_OUTPUT,
     underlying: str = "NIFTY",
+    prediction_source: str = "csv",
+    model_version: str = "cascade_v1",
 ) -> dict[str, Any]:
-    if not input_path.exists():
+    settings = get_settings()
+    db = get_database_client(settings)
+    db.connect()
+
+    if prediction_source == "db":
+        pred_df = _load_prediction_rows_from_db(db.conn, underlying, model_version)
+        if pred_df.empty:
+            db.close()
+            print(f"No NiftyPrediction rows found for {underlying} model_version={model_version}.")
+            return {"rows": 0, "path": str(output_path)}
+        print(f"Loaded {len(pred_df)} prediction rows from NiftyPrediction")
+    elif not input_path.exists():
         print(f"Prediction CSV missing at {input_path}; running underlying prediction first...")
-        from backtest.test_underlying_prediction import generate_prediction_csv
+        from src.technical_analysis.cascade.pipeline import generate_prediction_csv
 
         prediction_result = generate_prediction_csv(
             underlying=underlying.upper(),
@@ -444,34 +562,35 @@ def generate_option_selection_csv(
             ),
         )
         if int(prediction_result.get("rows") or 0) == 0 or not input_path.exists():
+            db.close()
             raise FileNotFoundError(
                 f"Prediction CSV not found at {input_path} and automatic generation produced no rows."
             )
+        pred_df = pd.read_csv(input_path)
+    else:
+        pred_df = pd.read_csv(input_path)
 
-    pred_df = pd.read_csv(input_path)
     if pred_df.empty:
+        db.close()
         print("Prediction CSV is empty — nothing to process.")
         return {"rows": 0, "path": str(output_path)}
 
-    print(f"Loaded {len(pred_df)} prediction rows from {input_path}")
-
-    settings = get_settings()
-    db = get_database_client(settings)
-    db.connect()
+    if prediction_source != "db":
+        print(f"Loaded {len(pred_df)} prediction rows from {input_path}")
 
     output_rows: list[dict[str, Any]] = []
     try:
         for _, pred_row in pred_df.iterrows():
             base = pred_row.to_dict()
-            signal_date_str = str(base["date"])
+            signal_date_str = str(base.get("date") or base.get("trade_date"))
             signal_date = date.fromisoformat(signal_date_str)
-            is_eligible = str(base.get("is_option_eligible") or "").lower() in ("true", "1")
+            is_eligible = _is_option_candidate_row(base)
 
             if not is_eligible:
                 base.update({
                     "selected_strategy": "NO_TRADE",
                     "option_bias_selected": base.get("option_bias", "NEUTRAL"),
-                    "no_trade_reason": "Not option eligible",
+                    "no_trade_reason": "No tradable direction/strength",
                     "evaluated_candidate_count": 0,
                     "strategy_direction": "", "entry_debit_or_credit": None,
                     "max_profit": None, "max_loss": None, "breakeven": None,
@@ -493,7 +612,7 @@ def generate_option_selection_csv(
                 continue
 
             underlying_view = _reconstruct_view(base)
-            spot_price = _f(base.get("close")) or 0.0
+            spot_price = _f(base.get("close")) or _f(base.get("close_1515")) or 0.0
             as_of_time = f"{signal_date_str} 15:15:00"
 
             iv_history: list[float] = []
@@ -567,7 +686,8 @@ def generate_option_selection_csv(
     out_df.to_csv(output_path, index=False)
     print(f"\nWrote {len(out_df)} rows → {output_path}")
 
-    eligible = out_df[out_df["is_option_eligible"].astype(str).str.lower().isin(("true", "1"))]
+    eligible_mask = out_df.apply(lambda row: _is_option_candidate_row(row.to_dict()), axis=1)
+    eligible = out_df[eligible_mask]
     traded = eligible[eligible["selected_strategy"].notna() & (eligible["selected_strategy"] != "NO_TRADE")]
     if not traded.empty:
         wins = (traded["option_result"] == "PROFIT").sum()
@@ -584,19 +704,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--input", default=str(DEFAULT_INPUT),
-        help=f"Prediction CSV from test_underlying_prediction.py. Default: {DEFAULT_INPUT}",
+        help=f"Prediction CSV from the cascade pipeline. Default: {DEFAULT_INPUT}",
     )
     parser.add_argument(
         "--output", default=str(DEFAULT_OUTPUT),
         help=f"Output CSV path. Default: {DEFAULT_OUTPUT}",
     )
     parser.add_argument("--underlying", default="NIFTY", help="Underlying symbol. Default: NIFTY")
+    parser.add_argument(
+        "--prediction-source", choices=("csv", "db"), default="csv",
+        help="Read upstream predictions from local CSV or Supabase NiftyPrediction. Default: csv",
+    )
+    parser.add_argument(
+        "--model-version", default="cascade_v1",
+        help="NiftyPrediction model_version when --prediction-source=db. Default: cascade_v1",
+    )
     args = parser.parse_args()
 
     result = generate_option_selection_csv(
         input_path=Path(args.input),
         output_path=Path(args.output),
         underlying=args.underlying.upper(),
+        prediction_source=args.prediction_source,
+        model_version=args.model_version,
     )
     print(result)
 

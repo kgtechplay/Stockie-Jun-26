@@ -11,7 +11,7 @@ Run:
     python scripts/backfill_NIFTY/backfill_nifty_volume.py --start 2026-01-01 --end 2026-06-17
 
 After this script completes, re-run the prediction backtest to pick up volume windows:
-    python backtest/test_underlying_prediction.py
+    python -m src.technical_analysis.cascade.pipeline
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def _trading_days(start: date, end: date) -> list[date]:
     days = []
     d = start
     while d <= end:
-        if d.weekday() < 5:  # Monâ€“Fri; holidays handled by missing bhavcopy files
+        if d.weekday() < 5:  # Mon-Fri; holidays handled by missing bhavcopy files
             days.append(d)
         d += timedelta(days=1)
     return days

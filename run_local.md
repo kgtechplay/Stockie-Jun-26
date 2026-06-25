@@ -1,134 +1,116 @@
-﻿# Run Locally
+# Run Locally
+
+This repo is DB-first for the NIFTY production flow. Local files under `output/`
+are developer artifacts only and are ignored by git.
 
 ## Prerequisites
 
-- Python virtual environment activated (`.venv`)
-- `.env` file present at repo root (copy from `.env.example` and fill in values)
-- Supabase or Azure SQL database reachable
-- Kite access token refreshed for today in `KiteAccessToken` (see step below if needed)
+- Python virtual environment activated.
+- `.env` present at repo root.
+- Supabase reachable through `SUPABASE_CONN_STR`.
+- Kite access token refreshed for the trading day if running market or option
+  snapshot jobs.
 
-## 1. Refresh Kite Access Token (once per trading day)
+Required production environment variables:
 
-```powershell
-python scripts/daily_NIFTY/daily_get_kite_access_token.py
+```text
+DATABASE_PROVIDER=supabase
+SUPABASE_CONN_STR=<postgres connection string>
+KITE_API_KEY=<kite api key>
+KITE_API_SECRET=<kite api secret>
 ```
 
-If you already have the redirect URL from the Kite login flow:
+## Daily NIFTY Signal Flow
+
+Run upstream refresh jobs first:
 
 ```powershell
-python scripts/daily_NIFTY/daily_get_kite_access_token.py "http://127.0.0.1/?request_token=...&status=success"
+python scripts/daily_NIFTY/daily_market_refresh.py --underlying NIFTY
+python scripts/Common/load_daily_index_data.py --no-local-output
+python scripts/daily_NIFTY/daily_optionInstrument_refresh.py --underlying NIFTY
+python scripts/daily_NIFTY/daily_NIFTYoption_snapshot.py
 ```
 
-The token helper writes the access token to the configured database table
-`KiteAccessToken`. Local `kite_access_token.txt` writes are best-effort cache
-writes only, so Render/cron runs do not depend on local files.
+If the option snapshot job did not calculate IV/Greeks in the deployed flow,
+run the calc job for the same date before signal generation:
 
-## 2. Start the Flask App
+```powershell
+python scripts/Common/calculate_option_snapshot_calc.py --from-date 2026-06-26 --to-date 2026-06-26
+```
+
+Then run the cron-friendly signal wrapper:
+
+```powershell
+python scripts/daily_NIFTY/daily_nifty_signal.py --model-version cascade_v1
+```
+
+The wrapper runs production prediction, persists `NiftyPrediction`, runs option
+selection for the latest unresolved prediction, persists `NiftyOptionSelection`,
+and prints `FINAL_SIGNAL_JSON=...` with one actionable option token/symbol plus
+target levels.
+
+To rerun option selection for an existing prediction row without rerunning the
+prediction step:
+
+```powershell
+python scripts/daily_NIFTY/daily_nifty_signal.py --skip-prediction --trade-date 2026-06-25 --model-version cascade_v1
+```
+
+Stop loss is disabled by default. Enable it explicitly if needed:
+
+```powershell
+python scripts/daily_NIFTY/daily_nifty_signal.py --model-version cascade_v1 --stop-loss-pct 0.01
+```
+
+## Individual Jobs
+
+Prediction only:
+
+```powershell
+python scripts/daily_NIFTY/daily_nifty_prediction.py --model-version cascade_v1
+```
+
+Option selection only:
+
+```powershell
+python scripts/daily_NIFTY/daily_option_selection.py --trade-date 2026-06-25 --model-version cascade_v1
+```
+
+News sentiment is intentionally not wired into production NIFTY prediction yet.
+Run it only for research or if a separate cron needs to maintain sentiment data:
+
+```powershell
+python scripts/daily_NIFTY/daily_news_sentiment.py --sector-classifier keyword
+```
+
+## Flask App
+
+The Flask dashboard reads Supabase directly. It shows a stock dropdown and a
+June NIFTY 50 table with predicted direction, actual trade label, option
+selection, targets, and option snapshot-derived P&L.
 
 ```powershell
 python flask_app.py
 ```
 
-Open your browser at `http://127.0.0.1:5000`.
+Open `http://127.0.0.1:5000`.
 
----
-
-## NIFTY Technical Dashboard
-
-The Flask app is intentionally NIFTY-only. It shows NIFTY data/trends from
-`output/backtest/NIFTY/production/NIFTY_prediction.csv` and exposes only NIFTY Predict and
-Backtest actions.
-
-Click **Predict** to run today's NIFTY direction prediction using all registered
-strategies. Click **Backtest** to regenerate the legacy NIFTY CSV backtest.
-
-To generate predictions from the CLI directly:
+## Validation
 
 ```powershell
-python src/services/historical_prediction.py --underlying NIFTY
+python -m pytest backtest/test_optionselection_e2e.py backtest/test_cascade_option_signal_mapper.py backtest/test_underlying_prediction.py
+python -m pytest backtest/test_news_sentiment.py
 ```
-
-This writes `output/backtest/NIFTY/production/NIFTY_prediction.csv` covering the last 60 days.
-
----
-
-## Backtest NIFTY
-
-Click **Backtest**. The app will:
-   - Generate 60 days of historical predictions if the file does not exist.
-   - Enrich each prediction row with next-day market data (`next_open`, `max_high_price`, `min_low_price`).
-   - Classify `actual_move` (CALL / PUT / NO_POSITION) and compute `max_delta_pct`.
-   - Evaluate each strategy column and write results back to `output/backtest/NIFTY/production/NIFTY_prediction.csv`.
-3. A CSV preview and summary metrics are shown in the browser.
-
-**Output columns:**
-
-```text
-underlying, date, next_date, today_close, next_open, next_close,
-max_high_price, min_low_price, actual_move, max_delta_pct,
-aggregate_decision, aggregate_decision_result, detected_regime,
-<strategy>, <strategy_result>, ...
-```
-
-**actual_move logic:**
-
-```text
-CALL        â€” max_high > next_open Ã— 1.01  AND  min_low > next_open Ã— 0.995
-PUT         â€” min_low  < next_open Ã— 0.99  AND  max_high < next_open Ã— 1.005
-NO_POSITION â€” volatile/mixed/flat day
-```
-
-**Profit/stop thresholds (historical backtest):**
-
-```text
-profit target = 1%   (next_open Â± 1%)
-stop loss     = 0.5% (next_open âˆ“ 0.5%)
-```
-
-The old CSV backtest runner is parked under `tests/legacy` so it does not look
-like a production package. To run it manually:
-
-```powershell
-python tests/legacy/historical_underlying_backtest.py --underlying NIFTY
-```
-
----
-
-## News Signal Backtest
-
-News prediction/backtesting is no longer exposed in the Flask app. To run the
-full news orchestration pipeline from Python:
-
-```python
-from src.news_analysis_phase2.orchestration_service import OrchestrationService
-
-result = OrchestrationService.default().run()
-```
-
-To run the news backtest standalone:
-
-```powershell
-python src/news_analysis_phase2/backtest/news_underlying_backtest.py --signal-journal-file output/trade_signal_journal.csv
-```
-
----
 
 ## Troubleshooting
 
-**Port 5000 already in use:**
+Port 5000 already in use:
 
 ```powershell
 netstat -ano | findstr ":5000"
 Stop-Process -Id <PID> -Force
-python flask_app.py
 ```
 
-**No stocks in the dropdown:**
-Run `python scripts/legacy/populate_watched_instruments.py` and ensure `WatchedInstrument` has `is_active = 1` rows.
-
-**No market data for backtest:**
-Run the daily market refresh to populate `UnderlyingSnapshot` and `UnderlyingCandle5m`:
-
-```powershell
-python scripts/daily_NIFTY/daily_market_refresh.py --lookback 90 --underlying RELIANCE
-```
+Missing option selection usually means one of these is absent for the signal
+date: `NiftyPrediction`, `OptionInstrument`, `OptionSnapshot`, or
+`OptionSnapshotCalc`.

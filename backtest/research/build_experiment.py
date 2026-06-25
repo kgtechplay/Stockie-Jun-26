@@ -1,26 +1,47 @@
 """Restructure the NIFTY direction-prediction experiment capture.
 
-Produces, under output/backtest/NIFTY/experiment/:
+Persists the shared feature store to output/feature_store/NIFTY_base.csv (the
+neutral location both pipelines read), and writes the experiment reports under
+output/backtest/NIFTY/experiment/:
 
-  base.csv / base.txt
-      Feature-only dataset (regime + strategy_* + final_raw_signal removed),
-      enriched with India VIX signals, plus actual_trade_label derived from a
-      0.5% next-day intraday move from next_open.
+  NIFTY_base.csv (feature store, written to output/feature_store/)
+      Feature-only dataset (strategy_* + final_raw_signal removed), enriched with
+      India VIX signals, a `regime` column (calm/stress volatility router) and
+      actual_trade_label derived from a 0.5% next-day intraday move from next_open.
+      Shared with production.
 
-  strategy_<Name>.csv / .txt   (one set per strategy family)
-      base columns + that family's signal column(s), scored vs actual_trade_label
-      for precision / recall / F1.
+  base.txt
+      Human-readable report describing the feature store + the final-prediction
+      cascade. Lives under the experiment dir.
 
-  comparison.txt
-      Side-by-side comparison and observations across every strategy variant.
+  <regime>_strategy_<Name>.csv / .txt   (one set per regime per strategy family)
+      Rows for that volatility regime + the family's signal column(s), scored vs a
+      regime-appropriate threshold (stress 0.5%, calm 0.3%) for precision/recall/F1.
+
+  comparison.csv
+      Side-by-side comparison across every strategy variant, grouped by regime.
+      Common across regimes.
 
 Read-only w.r.t. the DB except for SELECTing India VIX from MacroFactorDaily.
 Inputs are point-in-time as of trade_date; next_* columns are realized D+1
 outcomes used only for grading.
+
+ARCHITECTURE
+------------
+This is the RESEARCH harness. The cascade engine (dataset assembly, labelling,
+precision-floor voting, scoring, walk-forward) lives ONCE in
+src/technical_analysis/cascade and is shared with production. This module only
+adds the experiment-specific layers:
+  * the FULL strategy roster — the promoted strategies (imported from cascade)
+    PLUS the still-experimental ones defined below (MAAlignmentRoom, RangeBreakout),
+    which production deliberately excludes; and
+    * the report writers (base.txt, per-strategy CSV/TXT, comparison.csv).
+Production (src/technical_analysis/cascade/pipeline.py) imports the same cascade
+engine but registers only the promoted roster, so the two pipelines share the
+engine yet diverge on strategies.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import sys
 import textwrap
@@ -31,144 +52,90 @@ import pandas as pd
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
-from src.common.config import get_settings
-from src.data_manager.db.client_factory import get_database_client
+from src.technical_analysis.cascade.constants import (
+    FEATURE_STORE, CALL, PUT, FLAT, THRESHOLD,
+    REGIME_CALM, REGIME_STRESS,
+    REGIME_VIX_CUTOFF, REGIME_VOL_CUTOFF, REGIME_THRESHOLD,
+    REGIME_PRECISION_FLOOR, MIN_FIRES, WF_WINDOW,
+)
+from src.technical_analysis.cascade.dataset import (
+    build_base, regime_frame, _call_ok, _put_ok,
+)
+from src.technical_analysis.cascade.engine import (
+    Metrics, score_signal, _fmt,
+    gather_regime_signals, build_regime_cascade, walk_forward_regime,
+    score_final, _confusion_lines,
+)
+from src.technical_analysis.cascade.strategies import (
+    _sig,
+    oversold_bounce_call, down_momentum_put, momentum_directional, mean_reversion,
+    calm_trend_call, calm_fade_put, calm_momentum_put,
+    PROMOTED_DEFINITIONS,
+)
 
+# Experiment artifacts (base.txt, per-strategy CSV/TXT, comparison.csv). The
+# feature store (base.csv) is NOT written here — it lives in the neutral
+# FEATURE_STORE location shared with production.
 EXPERIMENT_DIR = project_root / "output" / "backtest" / "NIFTY" / "experiment"
-BASE_CSV = EXPERIMENT_DIR / "base.csv"
-THRESHOLD = 0.005  # 0.5% next-day intraday move (touch) from next_open
 
-CALL, PUT, FLAT = "CALL", "PUT", "NO_POSITION"
+GLOBAL_REGION_COLS = [
+    "global_us_return_mean",
+    "global_europe_return_mean",
+    "global_asia_return_mean",
+]
 
-# columns dropped when forming the feature-only base
-_DROP_EXACT = {"final_raw_signal", "selected_regime", "hindsight_regime",
-               "expected_regime_lag2", "actual_trade_label"}
-_VIX_COLS = ["vix_close", "vix_chg_1d", "vix_chg_pct"]
+GLOBAL_WEIGHTED_TILT_THRESHOLD = 0.001
 
-
-# ───────────────────────── data assembly ─────────────────────────
-
-def _load_vix() -> pd.DataFrame:
-    settings = get_settings()
-    db = get_database_client(settings)
-    db.connect()
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute(
-                'SELECT factor_date, india_vix FROM "MacroFactorDaily" '
-                "WHERE india_vix IS NOT NULL ORDER BY factor_date"
-            )
-            rows = cur.fetchall()
-    finally:
-        db.close()
-    vix = pd.DataFrame(rows, columns=["trade_date", "vix_close"])
-    vix["trade_date"] = pd.to_datetime(vix["trade_date"]).dt.strftime("%Y-%m-%d")
-    vix["vix_close"] = vix["vix_close"].astype(float)
-    vix["vix_chg_1d"] = vix["vix_close"].diff()
-    vix["vix_chg_pct"] = vix["vix_close"].pct_change()
-    return vix
+CONTEXT_ROLLING_WINDOW = 60
+CONTEXT_MIN_PERIODS = 30
 
 
-def build_base() -> pd.DataFrame:
-    """Read the current base.csv, strip regime/strategy/label columns, join VIX,
-    and (re)derive actual_trade_label from the 0.5% intraday rule.
-
-    Idempotent: safe to re-run on an already-restructured base.csv because all
-    feature + next_* columns are retained.
-    """
-    df = pd.read_csv(BASE_CSV)
-    df = df[[c for c in df.columns
-             if c not in _DROP_EXACT
-             and not c.startswith("strategy_")
-             and c not in _VIX_COLS]]
-
-    df = df.merge(_load_vix(), on="trade_date", how="left")
-
-    o, h, lo = df["next_open"], df["next_high"], df["next_low"]
-    # Touch-based: did the next-day intraday move reach the threshold from open?
-    call_ok = (h - o) / o >= THRESHOLD
-    put_ok = (o - lo) / o >= THRESHOLD
-    label = np.select(
-        [call_ok & ~put_ok, put_ok & ~call_ok, call_ok & put_ok],
-        [CALL, PUT, "BOTH"],
-        default=FLAT,
-    )
-    df["actual_trade_label"] = label
-    return df
+def _rolling_quantile(series: pd.Series, q: float) -> pd.Series:
+    return series.rolling(CONTEXT_ROLLING_WINDOW, min_periods=CONTEXT_MIN_PERIODS).quantile(q).shift(1)
 
 
-def _call_ok(df: pd.DataFrame) -> pd.Series:
-    return df["actual_trade_label"].isin([CALL, "BOTH"])
+def _rolling_median(series: pd.Series) -> pd.Series:
+    return series.rolling(CONTEXT_ROLLING_WINDOW, min_periods=CONTEXT_MIN_PERIODS).median().shift(1)
 
 
-def _put_ok(df: pd.DataFrame) -> pd.Series:
-    return df["actual_trade_label"].isin([PUT, "BOTH"])
+def _atr_pct(df: pd.DataFrame) -> pd.Series:
+    return pd.to_numeric(df["atr14"], errors="coerce") / pd.to_numeric(df["close_1515"], errors="coerce")
 
 
-# ───────────────────────── strategy definitions ─────────────────────────
-# Each entry: signal_column_name -> callable(df) -> Series of CALL/PUT/NO_POSITION
-
-def _sig(mask: pd.Series, side: str) -> pd.Series:
-    return pd.Series(np.where(mask.fillna(False), side, FLAT), index=mask.index)
-
-
-def oversold_bounce_call(df: pd.DataFrame) -> dict[str, pd.Series]:
-    rsi, room = df["rsi14"], df["resistance_distance_10d"]
-    rp10, vix = df["range_position_10d"], df["vix_close"]
-    return {
-        "strategy_OversoldBounceCall_HighPrecision_signal":
-            _sig((rp10 <= 0.20) & (vix >= 13), CALL),
-        "strategy_OversoldBounceCall_MoreTrades_signal":
-            _sig((rsi <= 42) & (room >= 0.025) & (vix >= 13), CALL),
-    }
+def _two_sided_signal(call: pd.Series, put: pd.Series) -> pd.Series:
+    sig = np.where(call.fillna(False), CALL,
+          np.where(put.fillna(False), PUT, FLAT))
+    return pd.Series(sig, index=call.index)
 
 
-def down_momentum_put(df: pd.DataFrame) -> dict[str, pd.Series]:
-    s20, vol, dvix, vix = df["ma20_slope"], df["volume_day"], df["vix_chg_1d"], df["vix_close"]
-    return {
-        "strategy_DownMomentumPut_HighPrecision_signal":
-            _sig((s20 <= -0.003) & (vol >= 90000) & (dvix > 0), PUT),
-        "strategy_DownMomentumPut_MoreTrades_signal":
-            _sig((s20 <= -0.003) & (vol >= 90000) & (vix >= 13), PUT),
-    }
+def _trend_call_context(df: pd.DataFrame) -> pd.Series:
+    return (df["ma20_slope"] > 0) & (df["ma10d_slope"] > 0) & (df["trend_efficiency_10d"] >= 0.30)
 
 
-def momentum_directional(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Merged best-balanced CALL + PUT into one two-sided directional signal.
-
-    CALL fires on >=2 oversold-reversion votes (max 4); PUT fires on >=3
-    down-momentum votes (max 5). When both sides fire on the same day the
-    conflict is resolved by normalised vote strength (votes / max_votes): the
-    side that is more strongly confirmed wins. This vote-margin tie-break is
-    far better than dropping conflicts, because oversold and down-momentum
-    conditions overlap heavily on falling days.
-    """
-    rsi, ret5, room, rp10 = df["rsi14"], df["ret_5d"], df["resistance_distance_10d"], df["range_position_10d"]
-    s20, s10, vol, bbw, ret10 = df["ma20_slope"], df["ma10d_slope"], df["volume_day"], df["bb_width"], df["ret_10d"]
-
-    call_votes = ((rsi <= 42).astype(int) + (ret5 < -0.012).astype(int)
-                  + (room >= 0.025).astype(int) + (rp10 <= 0.25).astype(int))
-    put_votes = (((s20 <= -0.003) | (s10 <= -0.004)).astype(int)
-                 + (ret10 <= -0.005).astype(int) + (vol >= 88000).astype(int)
-                 + (bbw >= 0.055).astype(int) + (rp10 <= 0.40).astype(int))
-
-    call_fire = call_votes >= 2
-    put_fire = put_votes >= 3
-    call_strength = call_votes / 4.0
-    put_strength = put_votes / 5.0
-    conflict_pick = np.where(put_strength >= call_strength, PUT, CALL)
-    sig = np.where(call_fire & ~put_fire, CALL,
-          np.where(put_fire & ~call_fire, PUT,
-          np.where(call_fire & put_fire, conflict_pick, FLAT)))
-    return {"strategy_MomentumDirectional_signal": pd.Series(sig, index=df.index)}
+def _dynamic_call_rsi_cap(df: pd.DataFrame) -> pd.Series:
+    rolling_cap = _rolling_quantile(df["rsi14"], 0.70).clip(lower=50.0, upper=62.0)
+    trend_cap = pd.Series(np.where(_trend_call_context(df), 58.0, 50.0), index=df.index)
+    return pd.concat([rolling_cap, trend_cap], axis=1).max(axis=1).fillna(trend_cap)
 
 
-# ───────────────────────── existing / legacy strategies ─────────────────────────
-# Faithful vectorised reproductions of the strategies previously stored as the
-# dropped strategy_* columns (logic from
-# src/technical_analysis/prediction/strategies.py and
-# backtest/test_underlying_prediction.py). Regime gating is removed because the
-# regime columns are excluded from base.csv by design.
+def _dynamic_room_floor(df: pd.DataFrame) -> pd.Series:
+    rolling_floor = _rolling_quantile(df["resistance_distance_10d"], 0.40).clip(lower=0.004, upper=0.025)
+    atr_floor = (0.25 * _atr_pct(df)).clip(lower=0.004, upper=0.020)
+    return pd.concat([rolling_floor, atr_floor], axis=1).min(axis=1).fillna(0.006)
+
+
+def _dynamic_support_floor(df: pd.DataFrame) -> pd.Series:
+    rolling_floor = _rolling_quantile(df["support_distance_10d"], 0.40).clip(lower=0.004, upper=0.025)
+    atr_floor = (0.25 * _atr_pct(df)).clip(lower=0.004, upper=0.020)
+    return pd.concat([rolling_floor, atr_floor], axis=1).min(axis=1).fillna(0.006)
+
+
+# ───────────────────────── experimental (not-yet-promoted) strategies ─────────────────────────
+# Faithful vectorised reproductions of strategies that have NOT cleared the
+# precision floor in production. They remain here so the experiment keeps probing
+# them; production's promoted roster (cascade.strategies) deliberately excludes
+# them. Regime gating is removed because the regime columns are excluded from
+# base.csv by design.
 
 def _ma_alignment_room_base(df: pd.DataFrame) -> pd.Series:
     """MAAlignmentRoom unified rule (call precedence), ungated."""
@@ -201,26 +168,137 @@ def ma_alignment_room(df: pd.DataFrame) -> dict[str, pd.Series]:
     spread = (df["ma10"] - df["ma20"]) / df["ma20"]
     matrend = np.where(spread > 0.001, CALL, np.where(spread < -0.001, PUT, FLAT))
 
+    close = df["close_1515"].astype(float)
+    ma5 = close.rolling(5).mean()
+    ma10, ma20 = df["ma10"], df["ma20"]
+    rsi = df["rsi14"]
+    room = df["resistance_distance_10d"]
+    support_room = df["support_distance_10d"]
+    call_rsi_cap = _dynamic_call_rsi_cap(df)
+    room_floor = _dynamic_room_floor(df)
+    support_floor = _dynamic_support_floor(df)
+    trend_context = _trend_call_context(df)
+    context_call = (
+        (ma5 > ma10)
+        & (spread > 0.0)
+        & (rsi <= call_rsi_cap)
+        & (room >= room_floor)
+    )
+    trend_cont_call = (
+        (ma5 > ma10)
+        & (ma10 > ma20)
+        & trend_context
+        & (rsi <= call_rsi_cap)
+        & (df["range_position_10d"] <= 0.90)
+        & (room >= room_floor)
+    )
+    spread_band = _rolling_median(spread).fillna(0.0)
+    context_put = (
+        (ma5 < ma10)
+        & (spread < spread_band.clip(upper=-0.0005))
+        & (rsi >= _rolling_quantile(rsi, 0.30).clip(lower=35.0, upper=50.0).fillna(42.0))
+        & (support_room >= support_floor)
+    )
+    context_band = _two_sided_signal(context_call, context_put)
+    put_expansion_guard = (df["bb_width"] >= 0.055) & (room >= 0.015)
+
     return {
         "strategy_MAAlignmentRoom_signal": base,
         "strategy_MAAlignmentRoom_PutGuarded_signal": put_guarded,
         "strategy_MAAlignmentRoom_ReboundCall_signal": rebound_call,
         "strategy_MaTrend_001_signal": pd.Series(matrend, index=df.index),
+        "strategy_MAAlignmentRoom_ContextBand_signal": context_band,
+        "strategy_MAAlignmentRoom_TrendContinuationCall_signal": _sig(trend_cont_call, CALL),
+        "strategy_MAAlignmentRoom_ContextBand_PutExpansionGuard_signal": _sig(
+            (context_band == PUT) & put_expansion_guard,
+            PUT,
+        ),
     }
 
 
-def mean_reversion(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Merged mean-reversion family: Bollinger + RSI_6040 (both ungated)."""
-    close, upper, lower = df["close_1515"], df["bb_upper"], df["bb_lower"]
-    boll = np.where(close < lower, CALL, np.where(close > upper, PUT, FLAT))
+def oversold_bounce_call_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = oversold_bounce_call(df)
+    rsi, room, rp10, vix = df["rsi14"], df["resistance_distance_10d"], df["range_position_10d"], df["vix_close"]
+    call_rsi_cap = _dynamic_call_rsi_cap(df)
+    room_floor = _dynamic_room_floor(df)
+    trend_context = _trend_call_context(df)
+    out["strategy_OversoldBounceCall_ContextRoom_signal"] = _sig(
+        (rsi <= call_rsi_cap) & (room >= room_floor) & (vix >= 12),
+        CALL,
+    )
+    out["strategy_OversoldBounceCall_ContextRoom_PrecisionGuard_signal"] = _sig(
+        (rsi <= call_rsi_cap)
+        & (room >= room_floor)
+        & (vix >= 15)
+        & (df["bb_width"] >= 0.055)
+        & (rsi <= 52),
+        CALL,
+    )
+    out["strategy_OversoldBounceCall_TrendBand_signal"] = _sig(
+        trend_context & (rsi <= call_rsi_cap) & (room >= room_floor) & (rp10 <= 0.90) & (vix >= 12),
+        CALL,
+    )
+    return out
 
+
+def momentum_directional_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = momentum_directional(df)
+    rsi, ret5, room, rp10 = df["rsi14"], df["ret_5d"], df["resistance_distance_10d"], df["range_position_10d"]
+    s20, s10, vol, bbw, ret10 = df["ma20_slope"], df["ma10d_slope"], df["volume_day"], df["bb_width"], df["ret_10d"]
+    trend_context = _trend_call_context(df)
+    call_rsi_cap = _dynamic_call_rsi_cap(df)
+    room_floor = _dynamic_room_floor(df)
+    call_votes = (
+        (rsi <= call_rsi_cap).astype(int)
+        + (ret5 <= _rolling_quantile(ret5, 0.45).fillna(-0.002)).astype(int)
+        + (room >= room_floor).astype(int)
+        + (rp10 <= np.where(trend_context, 0.90, 0.35)).astype(int)
+        + trend_context.astype(int)
+    )
+    put_votes = (
+        ((s20 <= _rolling_quantile(s20, 0.35).fillna(-0.003)) | (s10 <= _rolling_quantile(s10, 0.35).fillna(-0.004))).astype(int)
+        + (ret10 <= _rolling_quantile(ret10, 0.35).fillna(-0.005)).astype(int)
+        + (vol >= np.minimum(88000.0, 1.2 * df["volume_20d"])).astype(int)
+        + (bbw >= _rolling_quantile(bbw, 0.55).fillna(0.055)).astype(int)
+        + (rp10 <= 0.45).astype(int)
+    )
+    call_fire = call_votes >= 3
+    put_fire = put_votes >= 3
+    conflict_pick = np.where((put_votes / 5.0) >= (call_votes / 5.0), PUT, CALL)
+    sig = np.where(call_fire & ~put_fire, CALL,
+          np.where(put_fire & ~call_fire, PUT,
+          np.where(call_fire & put_fire, conflict_pick, FLAT)))
+    out["strategy_MomentumDirectional_ContextVotes_signal"] = pd.Series(sig, index=df.index)
+    context_sig = out["strategy_MomentumDirectional_ContextVotes_signal"]
+    call_expansion_guard = df["bb_width"] >= 0.055
+    expansion_guard = (df["bb_width"] >= 0.055) & (df["resistance_distance_10d"] >= 0.015)
+    strong_expansion_guard = (df["vix_close"] >= 16) & (df["bb_width"] >= 0.065)
+    out["strategy_MomentumDirectional_ContextVotes_CallExpansionGuard_signal"] = _sig(
+        (context_sig == CALL) & call_expansion_guard,
+        CALL,
+    )
+    out["strategy_MomentumDirectional_ContextVotes_ExpansionGuard_signal"] = context_sig.where(expansion_guard, FLAT)
+    out["strategy_MomentumDirectional_ContextVotes_StrongExpansionGuard_signal"] = context_sig.where(strong_expansion_guard, FLAT)
+    return out
+
+
+def mean_reversion_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = mean_reversion(df)
     rsi = df["rsi14"]
-    rsi_mr = np.where(rsi <= 40.0, CALL, np.where(rsi >= 60.0, PUT, FLAT))
-
-    return {
-        "strategy_BollingerMeanReversion_signal": pd.Series(boll, index=df.index),
-        "strategy_RsiMeanReversion_6040_signal": pd.Series(rsi_mr, index=df.index),
-    }
+    low_band = _rolling_quantile(rsi, 0.30).clip(lower=32.0, upper=43.0).fillna(40.0)
+    high_band = _rolling_quantile(rsi, 0.70).clip(lower=57.0, upper=68.0).fillna(60.0)
+    out["strategy_RsiMeanReversion_ContextBand_signal"] = pd.Series(
+        np.where(rsi <= low_band, CALL, np.where(rsi >= high_band, PUT, FLAT)),
+        index=df.index,
+    )
+    close = df["close_1515"]
+    lower_trigger = df["bb_lower"] + (0.15 * df["atr14"])
+    upper_trigger = df["bb_upper"] - (0.15 * df["atr14"])
+    out["strategy_BollingerMeanReversion_ATRBand_signal"] = pd.Series(
+        np.where(close < lower_trigger, CALL, np.where(close > upper_trigger, PUT, FLAT)),
+        index=df.index,
+    )
+    return out
 
 
 def range_breakout(df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -232,43 +310,319 @@ def range_breakout(df: pd.DataFrame) -> dict[str, pd.Series]:
     prior_low = df["low_day"].astype(float).shift(1).rolling(20).min()
     sig = np.where(close > prior_high, CALL,
           np.where(close < prior_low, PUT, FLAT))
-    return {"strategy_RangeBreakout_signal": pd.Series(sig, index=df.index)}
+    atr_buffer = 0.20 * df["atr14"].astype(float)
+    context_sig = np.where(close > (prior_high - atr_buffer), CALL,
+                  np.where(close < (prior_low + atr_buffer), PUT, FLAT))
+    return {
+        "strategy_RangeBreakout_signal": pd.Series(sig, index=df.index),
+        "strategy_RangeBreakout_ATRBuffer_signal": pd.Series(context_sig, index=df.index),
+    }
 
 
-STRATEGY_FAMILIES = {
-    "OversoldBounceCall": oversold_bounce_call,
-    "DownMomentumPut": down_momentum_put,
-    "MomentumDirectional": momentum_directional,
-    "MAAlignmentRoom": ma_alignment_room,
-    "MeanReversion": mean_reversion,
-    "RangeBreakout": range_breakout,
+def calm_trend_call_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = calm_trend_call(df)
+    s20, rp, ma10, te = df["ma20_slope"], df["range_position_10d"], df["ma10d_slope"], df["trend_efficiency_10d"]
+    room = df["resistance_distance_10d"]
+    rsi = df["rsi14"]
+    room_floor = _dynamic_room_floor(df)
+    out["strategy_CalmTrendCall_ContextHeadroom_signal"] = _sig(
+        (s20 > 0) & (room >= room_floor) & (rsi <= _dynamic_call_rsi_cap(df)) & (ma10 <= _rolling_quantile(ma10, 0.60).fillna(0.002)),
+        CALL,
+    )
+    out["strategy_CalmTrendCall_RangeBand_signal"] = _sig(
+        (s20 > 0) & (rp <= np.where(te >= 0.35, 0.80, 0.50)) & (te >= 0.25) & (room >= room_floor),
+        CALL,
+    )
+    return out
+
+
+def calm_fade_put_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = calm_fade_put(df)
+    rsi, rsi5 = df["rsi14"], df["rsi5"]
+    rsi_floor = _rolling_quantile(rsi, 0.75).clip(lower=62.0, upper=70.0).fillna(65.0)
+    rsi5_floor = _rolling_quantile(rsi5, 0.80).clip(lower=72.0, upper=85.0).fillna(80.0)
+    out["strategy_CalmFadePut_ContextOverbought_signal"] = _sig((rsi >= rsi_floor) & (rsi5 >= rsi5_floor), PUT)
+    return out
+
+
+def calm_momentum_put_with_context(df: pd.DataFrame) -> dict[str, pd.Series]:
+    out = calm_momentum_put(df)
+    ret3 = df["ret_3d"]
+    dyn_ret_floor = _rolling_quantile(ret3, 0.35).clip(lower=-0.008, upper=-0.002).fillna(-0.003)
+    out["strategy_CalmMomentumPut_ContextContinuation_signal"] = _sig(ret3 <= dyn_ret_floor, PUT)
+    return out
+
+
+def _regional_agreement_masks(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return (call_agree, put_agree) from US/Europe/Asia mean returns.
+
+    Agreement means at least two of the three regional mean returns point in the
+    same direction as the trade side. Missing regional values count as neutral.
+    """
+    regional = df.reindex(columns=GLOBAL_REGION_COLS).apply(pd.to_numeric, errors="coerce")
+    positive_votes = (regional > 0).sum(axis=1)
+    negative_votes = (regional < 0).sum(axis=1)
+    return positive_votes >= 2, negative_votes >= 2
+
+
+def _regional_components(df: pd.DataFrame) -> dict[str, pd.Series]:
+    regional = df.reindex(columns=GLOBAL_REGION_COLS).apply(pd.to_numeric, errors="coerce")
+    positive_votes = (regional > 0).sum(axis=1)
+    negative_votes = (regional < 0).sum(axis=1)
+    weighted_mean = regional.mean(axis=1)
+    return {
+        "any_call_tailwind": positive_votes >= 1,
+        "any_put_tailwind": negative_votes >= 1,
+        "weighted_call_tilt": weighted_mean >= GLOBAL_WEIGHTED_TILT_THRESHOLD,
+        "weighted_put_tilt": weighted_mean <= -GLOBAL_WEIGHTED_TILT_THRESHOLD,
+    }
+
+
+def with_global_region_variants(df: pd.DataFrame, signals: dict[str, pd.Series]) -> dict[str, pd.Series]:
+    """Add global-region variants alongside the original strategy signals.
+
+    *_GlobalAgree keeps CALL only when at least two regional mean returns are
+    positive and PUT only when at least two are negative.
+    *_GlobalNoDisagree keeps neutral regional days but drops CALL when at least
+    two regions are negative, and drops PUT when at least two regions are positive.
+    """
+    call_agree, put_agree = _regional_agreement_masks(df)
+    regional = _regional_components(df)
+    out = dict(signals)
+    for col, sig in signals.items():
+        base_name = col.removesuffix("_signal")
+        agree = sig.where(
+            ~(((sig == CALL) & ~call_agree) | ((sig == PUT) & ~put_agree)),
+            FLAT,
+        )
+        no_disagree = sig.where(
+            ~(((sig == CALL) & put_agree) | ((sig == PUT) & call_agree)),
+            FLAT,
+        )
+        any_agree = sig.where(
+            ~(((sig == CALL) & ~regional["any_call_tailwind"])
+              | ((sig == PUT) & ~regional["any_put_tailwind"])),
+            FLAT,
+        )
+        weighted_tilt = sig.where(
+            ~(((sig == CALL) & ~regional["weighted_call_tilt"])
+              | ((sig == PUT) & ~regional["weighted_put_tilt"])),
+            FLAT,
+        )
+        out[f"{base_name}_GlobalAgree_signal"] = agree
+        out[f"{base_name}_GlobalNoDisagree_signal"] = no_disagree
+        out[f"{base_name}_GlobalAnyAgree_signal"] = any_agree
+        out[f"{base_name}_GlobalWeightedTilt_signal"] = weighted_tilt
+    return out
+
+
+def expand_regime_signals_with_global(
+    df: pd.DataFrame,
+    regime_signals: dict[str, dict[str, pd.Series]],
+) -> dict[str, dict[str, pd.Series]]:
+    """Add generated global-region variants to a cascade signal roster."""
+    out: dict[str, dict[str, pd.Series]] = {}
+    for regime, signals in regime_signals.items():
+        strategy_cols = {f"strategy_{name}_signal": sig for name, sig in signals.items()}
+        expanded = with_global_region_variants(df, strategy_cols)
+        out[regime] = {
+            col.replace("strategy_", "").replace("_signal", ""): sig
+            for col, sig in expanded.items()
+        }
+    return out
+
+
+GLOBAL_VARIANT_SUFFIXES = (
+    "_GlobalAgree",
+    "_GlobalNoDisagree",
+    "_GlobalAnyAgree",
+    "_GlobalWeightedTilt",
+)
+
+GLOBAL_VARIANT_TIE_PREFERENCE = {
+    "_GlobalAnyAgree": 0,
+    "_GlobalNoDisagree": 1,
+    "_GlobalAgree": 2,
+    "_GlobalWeightedTilt": 3,
 }
 
 
-# Human-readable definitions, keyed by metric name
-# (signal column without the strategy_ prefix and _signal suffix).
-STRATEGY_DEFINITIONS: dict[str, str] = {
-    "OversoldBounceCall_HighPrecision":
-        "CALL when range_position_10d <= 0.20 (close near the 10-day low) AND "
-        "vix_close >= 13. Oversold mean-reversion bounce, gated away from "
-        "dead low-volatility days.",
-    "OversoldBounceCall_MoreTrades":
-        "CALL when rsi14 <= 42 AND resistance_distance_10d >= 2.5% (oversold with "
-        "headroom to resistance) AND vix_close >= 13. Looser entry than the "
-        "HighPrecision variant, so it fires more often.",
-    "DownMomentumPut_HighPrecision":
-        "PUT when ma20_slope <= -0.003 (falling 20-day MA) AND volume_day >= 90,000 "
-        "AND vix_chg_1d > 0 (India VIX rising). Downside momentum continuation "
-        "confirmed by rising fear.",
-    "DownMomentumPut_MoreTrades":
-        "PUT when ma20_slope <= -0.003 AND volume_day >= 90,000 AND vix_close >= 13. "
-        "Same momentum core but a VIX level gate (instead of rising-VIX) to trade more.",
-    "MomentumDirectional":
-        "Two-sided. CALL on >=2 of {rsi14<=42, ret_5d<-1.2%, "
-        "resistance_distance_10d>=2.5%, range_position_10d<=0.25}. PUT on >=3 of "
-        "{ma20_slope<=-0.003 or ma10d_slope<=-0.004, ret_10d<=-0.5%, "
-        "volume_day>=88k, bb_width>=0.055, range_position_10d<=0.40}. When both "
-        "sides fire, the side with higher normalised vote strength wins.",
+REVIEW_EXCLUDED_VARIANTS = {
+    "OversoldBounceCall_ContextRoom_PrecisionGuard",
+    "MomentumDirectional_ContextVotes_CallExpansionGuard_GlobalAnyAgree",
+    "MomentumDirectional_ContextVotes_ExpansionGuard_GlobalAnyAgree",
+    "MomentumDirectional_ContextVotes_StrongExpansionGuard_GlobalNoDisagree",
+    "MomentumDirectional_ContextVotes_StrongExpansionGuard_GlobalAnyAgree",
+    "MomentumDirectional_ContextVotes_StrongExpansionGuard_GlobalWeightedTilt",
+    "MAAlignmentRoom_ContextBand_PutExpansionGuard",
+    "MAAlignmentRoom_GlobalAnyAgree",
+    "CalmTrendCall_RangeBand",
+    "CalmFadePut_ContextOverbought_GlobalAgree",
+    "CalmFadePut_ContextOverbought_GlobalNoDisagree",
+    "CalmMomentumPut_Continuation_GlobalAgree",
+    "CalmMomentumPut_Continuation_GlobalNoDisagree",
+}
+
+
+def _is_global_variant(name: str) -> bool:
+    return name.endswith(GLOBAL_VARIANT_SUFFIXES)
+
+
+def _unglobal_variant_name(name: str) -> str:
+    for suffix in GLOBAL_VARIANT_SUFFIXES:
+        if name.endswith(suffix):
+            return name.removesuffix(suffix)
+    return name
+
+
+def _global_tie_key(name: str) -> tuple[int, str]:
+    for suffix, rank in GLOBAL_VARIANT_TIE_PREFERENCE.items():
+        if name.endswith(suffix):
+            return rank, name.removesuffix(suffix)
+    return len(GLOBAL_VARIANT_TIE_PREFERENCE), name
+
+
+def _is_review_excluded(name: str) -> bool:
+    return name in REVIEW_EXCLUDED_VARIANTS or _unglobal_variant_name(name) in REVIEW_EXCLUDED_VARIANTS
+
+
+def _is_dominated(candidate: Metrics, others: list[Metrics]) -> bool:
+    """True when another variant is at least as good on precision and recall,
+    and strictly better on one of them. Global variants also drop when a
+    non-global family peer is equal-or-better on both precision and recall. NaN
+    precision/recall variants are pruned when any valid family peer exists."""
+    if candidate.precision != candidate.precision or candidate.recall != candidate.recall:
+        return any(m.precision == m.precision and m.recall == m.recall for m in others)
+
+    candidate_is_global = _is_global_variant(candidate.name)
+    for other in others:
+        if other.name == candidate.name:
+            continue
+        if other.precision != other.precision or other.recall != other.recall:
+            continue
+        precision_ok = other.precision >= candidate.precision
+        recall_ok = other.recall >= candidate.recall
+        strictly_better = other.precision > candidate.precision or other.recall > candidate.recall
+        equal_metrics = other.precision == candidate.precision and other.recall == candidate.recall
+        global_equal_or_worse = candidate_is_global and not _is_global_variant(other.name)
+        global_duplicate_tie = (
+            candidate_is_global
+            and _is_global_variant(other.name)
+            and equal_metrics
+            and _global_tie_key(other.name) < _global_tie_key(candidate.name)
+        )
+        if precision_ok and recall_ok and (strictly_better or global_equal_or_worse or global_duplicate_tie):
+            return True
+    return False
+
+
+def prune_dominated_family_variants(metrics: list[Metrics]) -> tuple[list[Metrics], set[str]]:
+    """Keep the precision/recall Pareto frontier within a strategy family."""
+    dropped = {m.name for m in metrics if _is_dominated(m, metrics)}
+    return [m for m in metrics if m.name not in dropped], dropped
+
+
+def _score_family_signals(
+    df: pd.DataFrame,
+    signals: dict[str, pd.Series],
+) -> tuple[dict[str, pd.Series], list[Metrics], set[str]]:
+    metrics: list[Metrics] = []
+    metric_to_col: dict[str, str] = {}
+    for col, sig in signals.items():
+        metric_name = col.replace("strategy_", "").replace("_signal", "")
+        metric_to_col[metric_name] = col
+        metrics.append(score_signal(df, sig.loc[df.index], metric_name))
+
+    review_dropped = {m.name for m in metrics if _is_review_excluded(m.name)}
+    metrics_for_pruning = [m for m in metrics if m.name not in review_dropped]
+    kept_metrics, dropped = prune_dominated_family_variants(metrics_for_pruning)
+    dropped |= review_dropped
+    kept_signals = {
+        metric_to_col[m.name]: signals[metric_to_col[m.name]]
+        for m in kept_metrics
+    }
+    return kept_signals, kept_metrics, dropped
+
+
+def gather_pruned_regime_signals(
+    df: pd.DataFrame,
+    regime_families: dict[str, dict],
+    *,
+    include_global: bool = False,
+) -> dict[str, dict[str, pd.Series]]:
+    """Build the cascade roster after dropping within-family variants dominated
+    on both precision and recall."""
+    out: dict[str, dict[str, pd.Series]] = {}
+    for regime, families in regime_families.items():
+        sub = regime_frame(df, regime)
+        regime_signals: dict[str, pd.Series] = {}
+        for fn in families.values():
+            signals = fn(df)
+            if include_global:
+                signals = with_global_region_variants(df, signals)
+            kept_signals, _, _ = _score_family_signals(sub, signals)
+            for col, sig in kept_signals.items():
+                regime_signals[col.replace("strategy_", "").replace("_signal", "")] = sig
+        out[regime] = regime_signals
+    return out
+
+
+# ───────────────────────── full experiment roster ─────────────────────────
+# Promoted families (imported from cascade.strategies) PLUS the experimental
+# families defined above. Order is preserved so the per-strategy output files and
+# comparison.txt ordering stay stable.
+STRATEGY_FAMILIES = {
+    "OversoldBounceCall": oversold_bounce_call_with_context,
+    "DownMomentumPut": down_momentum_put,
+    "MomentumDirectional": momentum_directional_with_context,
+    "MAAlignmentRoom": ma_alignment_room,      # experimental
+    "MeanReversion": mean_reversion_with_context,
+    "RangeBreakout": range_breakout,           # experimental
+}
+
+# Strategy families grouped by the volatility regime they are designed for.
+# The output files are named <regime>_strategy_<family>.{csv,txt}. base.csv,
+# base.txt and comparison.txt remain common across regimes.
+CALM_FAMILIES = {
+    "CalmTrendCall": calm_trend_call_with_context,
+    "CalmFadePut": calm_fade_put_with_context,
+    "CalmMomentumPut": calm_momentum_put_with_context,
+}
+
+REGIME_FAMILIES = {
+    REGIME_STRESS: STRATEGY_FAMILIES,
+    REGIME_CALM: CALM_FAMILIES,
+}
+
+
+# Human-readable definitions for the experimental-only strategies, keyed by metric
+# name (signal column without the strategy_ prefix and _signal suffix). The
+# promoted strategies' definitions are imported from cascade and merged in.
+_EXPERIMENTAL_DEFINITIONS: dict[str, str] = {
+    "OversoldBounceCall_ContextRoom":
+        "CALL when rsi14 is below a context-aware cap (rolling 70th percentile, clipped to "
+        "[50,62], with 58 allowed in strong trend context), resistance_distance_10d clears "
+        "the lower of a rolling 40th-percentile room floor and 0.25*ATR/close, and vix_close>=12.",
+    "OversoldBounceCall_ContextRoom_PrecisionGuard":
+        "ContextRoom with stress precision guards: vix_close>=15, bb_width>=5.5%, and rsi14<=52. "
+        "This keeps the dynamic RSI/room logic but requires volatility expansion and avoids hot RSI.",
+    "OversoldBounceCall_TrendBand":
+        "CALL continuation/bounce hybrid: strong trend context (ma20_slope>0, ma10d_slope>0, "
+        "trend_efficiency_10d>=0.30), rsi14 below the dynamic cap, dynamic room floor cleared, "
+        "range_position_10d<=0.90, and vix_close>=12.",
+    "MomentumDirectional_ContextVotes":
+        "Two-sided contextual vote model. CALL votes use dynamic RSI cap, rolling ret_5d band, "
+        "dynamic resistance room floor, trend-aware range-position band, and strong trend context. "
+        "PUT votes use rolling slope/return/Bollinger-width bands, adaptive volume floor, and "
+        "range_position_10d<=0.45. Fires when either side gets >=3 votes; conflicts use normalized votes.",
+    "MomentumDirectional_ContextVotes_CallExpansionGuard":
+        "CALL-only ContextVotes guard: keep CALLs when bb_width>=5.5%. This preserves expansion-continuation "
+        "setups while filtering lower-volatility context votes.",
+    "MomentumDirectional_ContextVotes_ExpansionGuard":
+        "ContextVotes kept only when bb_width>=5.5% and resistance_distance_10d>=1.5%, a volatility "
+        "expansion plus room guard chosen to lift stress precision while retaining some coverage.",
+    "MomentumDirectional_ContextVotes_StrongExpansionGuard":
+        "ContextVotes kept only when vix_close>=16 and bb_width>=6.5%, a stricter stress expansion guard.",
     "MAAlignmentRoom":
         "Two-sided MA alignment (CALL precedence). CALL when ma5>ma10, "
         "(ma10-ma20)/ma20>0, rsi14<50, resistance_distance_10d>0.5%. PUT when "
@@ -284,80 +638,62 @@ STRATEGY_DEFINITIONS: dict[str, str] = {
     "MaTrend_001":
         "CALL when (ma10-ma20)/ma20 > +0.1%; PUT when < -0.1%; else NO_POSITION. "
         "Pure MA10/MA20 trend with a 0.1% dead-band.",
-    "BollingerMeanReversion":
-        "CALL when close < lower Bollinger band (20-day mean - 2 sigma); "
-        "PUT when close > upper band (mean + 2 sigma).",
-    "RsiMeanReversion_6040":
-        "CALL when rsi14 <= 40; PUT when rsi14 >= 60; else NO_POSITION.",
+    "MAAlignmentRoom_ContextBand":
+        "Two-sided MA alignment with dynamic bands. CALL when ma5>ma10, spread>0, rsi14<=dynamic "
+        "context cap, and resistance_distance_10d clears a rolling/ATR-aware room floor. PUT when "
+        "ma5<ma10, spread is below its rolling median band, rsi14 is above a rolling lower band, "
+        "and support_distance_10d clears a rolling/ATR-aware floor.",
+    "MAAlignmentRoom_ContextBand_PutExpansionGuard":
+        "PUT-only precision guard for MAAlignmentRoom_ContextBand: keep its PUT only when bb_width>=5.5% "
+        "and resistance_distance_10d>=1.5%, the stress expansion/room profile that tested cleanly.",
+    "MAAlignmentRoom_TrendContinuationCall":
+        "CALL-only trend-continuation variant: ma5>ma10>ma20, positive ma20 and ma10 slopes, "
+        "trend_efficiency_10d>=0.30, rsi14<=dynamic cap, range_position_10d<=0.90, and dynamic "
+        "resistance room floor cleared.",
+    "RsiMeanReversion_ContextBand":
+        "Two-sided RSI mean reversion using rolling 60-day RSI bands: CALL when rsi14 is below "
+        "the clipped rolling 30th percentile; PUT when above the clipped rolling 70th percentile.",
+    "BollingerMeanReversion_ATRBand":
+        "Two-sided Bollinger mean reversion using ATR-adjusted triggers: CALL near/through the "
+        "lower band plus 0.15*ATR; PUT near/through the upper band minus 0.15*ATR.",
     "RangeBreakout":
         "Two-sided 20-day breakout. CALL when close > the prior-20-day high; "
         "PUT when close < the prior-20-day low. Merges the old TREND_UP/TREND_DOWN "
         "regime-gated breakouts into one ungated signal.",
+    "RangeBreakout_ATRBuffer":
+        "Two-sided breakout with an ATR buffer. CALL when close is within 0.20*ATR of the prior "
+        "20-day high; PUT when close is within 0.20*ATR of the prior 20-day low.",
+    "CalmTrendCall_ContextHeadroom":
+        "[calm regime, graded at 0.3%] CALL when quiet uptrend persists, dynamic resistance room "
+        "floor is cleared, rsi14 is below its dynamic cap, and ma10d_slope is not above its rolling "
+        "60th-percentile band.",
+    "CalmTrendCall_RangeBand":
+        "[calm regime, graded at 0.3%] CALL when quiet uptrend persists, trend_efficiency_10d>=0.25, "
+        "dynamic room floor is cleared, and range_position_10d can extend to 0.80 only when trend "
+        "efficiency is strong; otherwise it remains capped at 0.50.",
+    "CalmFadePut_ContextOverbought":
+        "[calm regime, graded at 0.3%] PUT when rsi14 and rsi5 exceed clipped rolling overbought "
+        "bands instead of fixed 65/80 levels.",
+    "CalmMomentumPut_ContextContinuation":
+        "[calm regime, graded at 0.3%] PUT when ret_3d is below a clipped rolling 35th-percentile "
+        "decline band instead of the fixed -0.3% threshold.",
 }
+
+# Merged definitions across promoted + experimental strategies.
+STRATEGY_DEFINITIONS: dict[str, str] = {**PROMOTED_DEFINITIONS, **_EXPERIMENTAL_DEFINITIONS}
 
 # Features profiled when characterising precision / recall misses.
 _PROFILE_FEATURES = [
-    "rsi14", "ma10d_slope", "ma20_slope", "ret_5d", "ret_10d", "bb_width",
+    "rsi14", "rsi5", "ma10d_slope", "ma5d_slope", "ma20_slope", "ret_2d", "ret_3d",
+    "ret_5d", "ret_10d", "bb_width",
     "volatility_10d", "trend_efficiency_10d", "range_position_10d",
     "resistance_distance_10d", "support_distance_10d", "volume_day", "atr14",
     "vix_close", "vix_chg_1d",
+    "global_us_return_mean", "global_europe_return_mean", "global_asia_return_mean",
 ]
 
 
-# ───────────────────────── metrics ─────────────────────────
-
-@dataclass
-class Metrics:
-    name: str
-    n_call: int
-    n_put: int
-    precision: float
-    recall: float
-    f1: float
-    call_precision: float
-    put_precision: float
-    coverage: float
-
-
-def score_signal(df: pd.DataFrame, signal: pd.Series, name: str) -> Metrics:
-    call_ok, put_ok = _call_ok(df), _put_ok(df)
-    fired_call = signal == CALL
-    fired_put = signal == PUT
-
-    correct_call = int((fired_call & call_ok).sum())
-    correct_put = int((fired_put & put_ok).sum())
-    n_call, n_put = int(fired_call.sum()), int(fired_put.sum())
-    n_fired = n_call + n_put
-    correct = correct_call + correct_put
-
-    # opportunities: CALL-eligible days for CALL signals, PUT-eligible for PUT,
-    # union for two-sided strategies.
-    opp = 0
-    if n_call:
-        opp += int(call_ok.sum())
-    if n_put:
-        opp += int(put_ok.sum())
-    if n_call and n_put:  # two-sided: opportunity is any day a move happened
-        opp = int((call_ok | put_ok).sum())
-
-    precision = correct / n_fired if n_fired else float("nan")
-    recall = correct / opp if opp else float("nan")
-    f1 = (2 * precision * recall / (precision + recall)
-          if n_fired and opp and (precision + recall) > 0 else float("nan"))
-    return Metrics(
-        name=name, n_call=n_call, n_put=n_put,
-        precision=precision, recall=recall, f1=f1,
-        call_precision=correct_call / n_call if n_call else float("nan"),
-        put_precision=correct_put / n_put if n_put else float("nan"),
-        coverage=n_fired / len(df),
-    )
-
-
-# ───────────────────────── file writers ─────────────────────────
-
-def _fmt(x: float) -> str:
-    return "  n/a" if x != x else f"{x:.3f}"
-
+# ───────────────────────── miss-pattern reporting ─────────────────────────
 
 def _discriminators(df: pd.DataFrame, mask_a: pd.Series, mask_b: pd.Series, k: int = 4):
     """Return the k features whose mean differs most between the two groups,
@@ -433,154 +769,7 @@ def miss_patterns(df: pd.DataFrame, signal: pd.Series, name: str) -> list[str]:
     return lines
 
 
-# ───────────────────────── final daily prediction (cascade) ─────────────────────────
-
-PRECISION_FLOOR = 0.70   # a variant only votes a side if that side's precision exceeds this
-MIN_FIRES = 5            # ...and it fired that side at least this many times (noise guard)
-TRAIN_FRAC = 0.60        # chronological train fraction for the out-of-sample readout
-WF_WINDOW = 120          # trailing-day lookback for walk-forward eligibility
-WF_MIN_FIRES = 4         # lighter fires guard inside the shorter walk-forward window
-
-
-def gather_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """All strategy variants flattened to {variant_name: signal Series}."""
-    signals: dict[str, pd.Series] = {}
-    for fn in STRATEGY_FAMILIES.values():
-        for col, sig in fn(df).items():
-            name = col.replace("strategy_", "").replace("_signal", "")
-            signals[name] = sig
-    return signals
-
-
-def _side_precisions(elig_df: pd.DataFrame, signals: dict[str, pd.Series]):
-    """Per-variant (call_precision, n_call, put_precision, n_put) measured on elig_df."""
-    call_ok, put_ok = _call_ok(elig_df), _put_ok(elig_df)
-    out = {}
-    for name, sig in signals.items():
-        s = sig.loc[elig_df.index]
-        fc, fp = s == CALL, s == PUT
-        nc, npp = int(fc.sum()), int(fp.sum())
-        cp = int((fc & call_ok).sum()) / nc if nc else float("nan")
-        pp = int((fp & put_ok).sum()) / npp if npp else float("nan")
-        out[name] = (cp, nc, pp, npp)
-    return out
-
-
-def build_cascade(df: pd.DataFrame, signals: dict[str, pd.Series], elig_df: pd.DataFrame):
-    """One prediction per day. A variant may cast a CALL vote only if its CALL
-    precision (measured on elig_df) > PRECISION_FLOOR with >= MIN_FIRES fires;
-    same for PUT. Each day we take the highest-precision eligible CALL vote vs the
-    highest-precision eligible PUT vote, and the higher precision wins; ties or no
-    eligible vote -> NO_POSITION.
-
-    Returns (prediction Series over df.index, call_eligibility dict, put_eligibility dict).
-    """
-    prec = _side_precisions(elig_df, signals)
-    call_elig = {n: cp for n, (cp, nc, pp, npp) in prec.items()
-                 if nc >= MIN_FIRES and cp > PRECISION_FLOOR}
-    put_elig = {n: pp for n, (cp, nc, pp, npp) in prec.items()
-                if npp >= MIN_FIRES and pp > PRECISION_FLOOR}
-
-    pred = pd.Series(FLAT, index=df.index)
-    for idx in df.index:
-        best_call = max((p for n, p in call_elig.items() if signals[n].loc[idx] == CALL),
-                        default=None)
-        best_put = max((p for n, p in put_elig.items() if signals[n].loc[idx] == PUT),
-                       default=None)
-        if best_call is not None and (best_put is None or best_call > best_put):
-            pred.loc[idx] = CALL
-        elif best_put is not None and (best_call is None or best_put > best_call):
-            pred.loc[idx] = PUT
-    return pred, call_elig, put_elig
-
-
-def walk_forward(df: pd.DataFrame, signals: dict[str, pd.Series], window: int = WF_WINDOW):
-    """Rolling out-of-sample prediction. For each day i (after a warm-up of
-    `window` days), eligibility is fit ONLY on the trailing `window` days
-    [i-window, i) and used to predict day i. Nothing from day i onward leaks in.
-
-    Returns (prediction Series aligned to df.index, n_call_voter_days,
-    n_put_voter_days) where the voter-day counts are how many predicted days had
-    at least one eligible CALL / PUT voter available.
-    """
-    call_ok_all, put_ok_all = _call_ok(df), _put_ok(df)
-    pred = pd.Series(FLAT, index=df.index)
-    call_voter_days = put_voter_days = 0
-
-    for pos in range(window, len(df)):
-        win = df.iloc[pos - window:pos]
-        cok, pok = call_ok_all.loc[win.index], put_ok_all.loc[win.index]
-        idx = df.index[pos]
-
-        call_elig, put_elig = {}, {}
-        for name, sig in signals.items():
-            w = sig.loc[win.index]
-            fc, fp = w == CALL, w == PUT
-            nc, npp = int(fc.sum()), int(fp.sum())
-            if nc >= WF_MIN_FIRES:
-                cp = int((fc & cok).sum()) / nc
-                if cp > PRECISION_FLOOR:
-                    call_elig[name] = cp
-            if npp >= WF_MIN_FIRES:
-                pp = int((fp & pok).sum()) / npp
-                if pp > PRECISION_FLOOR:
-                    put_elig[name] = pp
-
-        if call_elig:
-            call_voter_days += 1
-        if put_elig:
-            put_voter_days += 1
-
-        best_call = max((p for n, p in call_elig.items() if signals[n].loc[idx] == CALL),
-                        default=None)
-        best_put = max((p for n, p in put_elig.items() if signals[n].loc[idx] == PUT),
-                       default=None)
-        if best_call is not None and (best_put is None or best_call > best_put):
-            pred.loc[idx] = CALL
-        elif best_put is not None and (best_call is None or best_put > best_call):
-            pred.loc[idx] = PUT
-
-    return pred, call_voter_days, put_voter_days
-
-
-def score_final(df_sub: pd.DataFrame, pred: pd.Series) -> dict:
-    """Grade a final one-per-day prediction against actual_trade_label."""
-    call_ok, put_ok = _call_ok(df_sub), _put_ok(df_sub)
-    label = df_sub["actual_trade_label"]
-    move = call_ok | put_ok
-    fc, fp, ff = pred == CALL, pred == PUT, pred == FLAT
-    fired = fc | fp
-    correct = (fc & call_ok) | (fp & put_ok)
-    n_fired = int(fired.sum())
-    n_move = int(move.sum())
-    # wrong-way = took a side but the OPPOSITE exclusive move happened (the costly error)
-    wrong_way = int(((fc & (label == PUT)) | (fp & (label == CALL))).sum())
-    correct_flat = int((ff & (label == FLAT)).sum())
-    put_base = float(put_ok.mean())
-    dir_prec = int(correct.sum()) / n_fired if n_fired else float("nan")
-    return {
-        "n": len(df_sub),
-        "n_call": int(fc.sum()), "n_put": int(fp.sum()), "n_flat": int(ff.sum()),
-        "dir_precision": dir_prec,
-        "dir_recall": int(correct.sum()) / n_move if n_move else float("nan"),
-        "wrong_way_rate": wrong_way / n_fired if n_fired else float("nan"),
-        "overall_accuracy": (int(correct.sum()) + correct_flat) / len(df_sub),
-        "put_base": put_base,
-        "lift": dir_prec / put_base if put_base else float("nan"),
-    }
-
-
-def _confusion_lines(df_sub: pd.DataFrame, pred: pd.Series) -> list[str]:
-    label = df_sub["actual_trade_label"]
-    acts = [CALL, PUT, "BOTH", FLAT]
-    disp = {CALL: "CALL", PUT: "PUT", "BOTH": "BOTH", FLAT: "NONE"}
-    lines = [f"    {'pred \\ actual':<16}" + "".join(f"{disp[a]:>7}" for a in acts)]
-    for p in [CALL, PUT, FLAT]:
-        row = pred == p
-        cells = "".join(f"{int((row & (label == a)).sum()):>7}" for a in acts)
-        lines.append(f"    {disp[p]:<16}{cells}")
-    return lines
-
+# ───────────────────────── final daily prediction (cascade) report ─────────────────────────
 
 def _final_metric_block(title: str, m: dict) -> list[str]:
     return [
@@ -597,111 +786,175 @@ def _final_metric_block(title: str, m: dict) -> list[str]:
     ]
 
 
-def cascade_report(df: pd.DataFrame, signals: dict[str, pd.Series]):
-    """Build the base.txt cascade section and the per-row final_prediction
-    (in-sample eligibility). Also runs a 60/40 chronological out-of-sample readout."""
-    pred_full, call_elig, put_elig = build_cascade(df, signals, df)
+def cascade_report(df: pd.DataFrame):
+    """Build the base.txt 'Final daily prediction' section and the per-row
+    final_position (regime-aware, in-sample eligibility). Also reports a rolling
+    walk-forward as the honest out-of-sample number.
 
+    Returns (text lines, baseline final_position, global-expanded final_position)."""
+    regime_signals = gather_pruned_regime_signals(df, REGIME_FAMILIES)
+    global_regime_signals = gather_pruned_regime_signals(df, REGIME_FAMILIES, include_global=True)
+    elig_frames = {regime: regime_frame(df, regime) for regime in REGIME_FAMILIES}
+    final_pos, elig = build_regime_cascade(df, regime_signals, elig_frames)
+    final_pos_global, global_elig = build_regime_cascade(df, global_regime_signals, elig_frames)
+
+    m_in = score_final(df, final_pos)
+    m_global = score_final(df, final_pos_global)
+    st, cm = REGIME_THRESHOLD[REGIME_STRESS], REGIME_THRESHOLD[REGIME_CALM]
     lines = [
         "",
-        "Final daily prediction — precision cascade",
-        "------------------------------------------",
-        "One prediction per day, picked as follows:",
-        f"  - A variant may cast a CALL vote only if its CALL precision > "
-        f"{PRECISION_FLOOR:.0%} with >= {MIN_FIRES} fires; likewise for PUT.",
-        "  - Each day, the highest-precision eligible CALL vote competes with the",
-        "    highest-precision eligible PUT vote; the higher precision wins.",
-        "  - No eligible vote (or an exact tie) -> NO_POSITION.",
-        "  - Precisions are measured on the eligibility window noted in each block.",
+        "Final daily prediction — regime-aware precision cascade",
+        "-------------------------------------------------------",
+        "Each trade_date is routed to its volatility regime (calm/stress). Among",
+        "that regime's strategies, a side (CALL/PUT) may vote only if its precision",
+        "— measured on that regime at the regime threshold — clears the regime floor",
+        f"with >= {MIN_FIRES} fires; the highest-precision eligible vote wins (cascade).",
+        "Within each strategy family, reviewed exclusions and variants dominated on",
+        "precision/recall are pruned before the cascade and comparison reports are built.",
+        "The result is the final_position column in base.csv, graded against",
+        f"actual_trade_label (touch threshold: stress {st:.1%} / calm {cm:.1%}).",
+        f"Regime precision floors: stress > {REGIME_PRECISION_FLOOR[REGIME_STRESS]:.0%}, "
+        f"calm > {REGIME_PRECISION_FLOOR[REGIME_CALM]:.0%}.",
         "",
-        "  Eligible CALL voters (variant: in-sample CALL precision):",
+        "  ================  final_position — headline (in-sample)  ================",
+        f"    overall accuracy     : {_fmt(m_in['overall_accuracy'])}   "
+        f"(correct fires + correct NO_POSITION over all {m_in['n']} days)",
+        f"    directional recall   : {_fmt(m_in['dir_recall'])}   "
+        f"(correct fires over {m_in['n_move']} actual-move days)",
+        f"    directional precision: {_fmt(m_in['dir_precision'])}   "
+        f"(fires {m_in['n_call'] + m_in['n_put']}: CALL {m_in['n_call']}, PUT {m_in['n_put']}, "
+        f"FLAT {m_in['n_flat']})",
+        "  =========================================================================",
+        "",
+        "  ==========  final_position_global — global-expanded cascade  ==========",
+        f"    overall accuracy     : {_fmt(m_global['overall_accuracy'])}   "
+        f"(correct fires + correct NO_POSITION over all {m_global['n']} days)",
+        f"    directional recall   : {_fmt(m_global['dir_recall'])}   "
+        f"(correct fires over {m_global['n_move']} actual-move days)",
+        f"    directional precision: {_fmt(m_global['dir_precision'])}   "
+        f"(fires {m_global['n_call'] + m_global['n_put']}: CALL {m_global['n_call']}, "
+        f"PUT {m_global['n_put']}, FLAT {m_global['n_flat']})",
+        "  =========================================================================",
+        "",
+        "The global-expanded cascade uses the same precision-floor voting logic, but",
+        "its voter roster also includes GlobalAgree, GlobalNoDisagree, GlobalAnyAgree,",
+        "and GlobalWeightedTilt variants generated from",
+        "global_us_return_mean, global_europe_return_mean, and global_asia_return_mean.",
+        "",
     ]
-    if call_elig:
-        for n, p in sorted(call_elig.items(), key=lambda kv: kv[1], reverse=True):
-            lines.append(f"    {n:<42}{p:.3f}")
-    else:
-        lines.append("    (none cleared the precision floor)")
-    lines.append("  Eligible PUT voters (variant: in-sample PUT precision):")
-    if put_elig:
-        for n, p in sorted(put_elig.items(), key=lambda kv: kv[1], reverse=True):
-            lines.append(f"    {n:<42}{p:.3f}")
-    else:
-        lines.append("    (none cleared the precision floor)")
-    lines.append("")
 
-    # In-sample scorecard (eligibility + evaluation both on full data)
-    lines.append("In-sample (eligibility + evaluation on full data; optimistic)")
-    lines.append("-" * 60)
-    lines += _final_metric_block("Full-period cascade:", score_final(df, pred_full))
+    # Eligible voters per regime
+    for regime in (REGIME_STRESS, REGIME_CALM):
+        call_elig, put_elig = elig[regime]
+        floor = REGIME_PRECISION_FLOOR[regime]
+        n_reg = int((df["regime"] == regime).sum())
+        lines.append(f"  {regime.upper()} regime ({n_reg} days, floor > {floor:.0%}) — "
+                     f"eligible voters:")
+        if call_elig:
+            for n, p in sorted(call_elig.items(), key=lambda kv: kv[1], reverse=True):
+                lines.append(f"    CALL  {n:<58}{p:.3f}")
+        else:
+            lines.append("    CALL  (none cleared the floor)")
+        if put_elig:
+            for n, p in sorted(put_elig.items(), key=lambda kv: kv[1], reverse=True):
+                lines.append(f"    PUT   {n:<58}{p:.3f}")
+        else:
+            lines.append("    PUT   (none cleared the floor)")
+        lines.append("")
+
+    for regime in (REGIME_STRESS, REGIME_CALM):
+        call_elig, put_elig = global_elig[regime]
+        floor = REGIME_PRECISION_FLOOR[regime]
+        n_reg = int((df["regime"] == regime).sum())
+        lines.append(f"  {regime.upper()} regime GLOBAL-expanded ({n_reg} days, floor > {floor:.0%}) — "
+                     f"eligible voters:")
+        if call_elig:
+            for n, p in sorted(call_elig.items(), key=lambda kv: kv[1], reverse=True):
+                lines.append(f"    CALL  {n:<58}{p:.3f}")
+        else:
+            lines.append("    CALL  (none cleared the floor)")
+        if put_elig:
+            for n, p in sorted(put_elig.items(), key=lambda kv: kv[1], reverse=True):
+                lines.append(f"    PUT   {n:<58}{p:.3f}")
+        else:
+            lines.append("    PUT   (none cleared the floor)")
+        lines.append("")
+
+    # In-sample detail
+    lines.append("In-sample detail (eligibility + grading on full data; optimistic)")
+    lines.append("-" * 64)
+    lines += _final_metric_block("Regime-aware cascade:", m_in)
     lines.append("  Confusion matrix:")
-    lines += _confusion_lines(df, pred_full)
+    lines += _confusion_lines(df, final_pos)
+    lines.append("")
+    lines += _final_metric_block("Global-expanded regime-aware cascade:", m_global)
+    lines.append("  Confusion matrix:")
+    lines += _confusion_lines(df, final_pos_global)
     lines.append("")
 
-    # Out-of-sample 60/40 chronological split
-    cut = int(len(df) * TRAIN_FRAC)
-    train, test = df.iloc[:cut], df.iloc[cut:]
-    pred_oos, ce_t, pe_t = build_cascade(df, signals, train)  # eligibility from train only
-    lines.append(f"Out-of-sample 60/40 time split (eligibility from first {cut} days,")
-    lines.append(f"evaluated on the held-out last {len(test)} days)")
-    lines.append("-" * 60)
-    lines.append(f"  Train-period eligible CALL voters: "
-                 f"{', '.join(sorted(ce_t)) or '(none)'}")
-    lines.append(f"  Train-period eligible PUT voters : "
-                 f"{', '.join(sorted(pe_t)) or '(none)'}")
-    lines += _final_metric_block("Train slice (in-sample):",
-                                 score_final(train, pred_oos.loc[train.index]))
-    lines += _final_metric_block("Test slice (out-of-sample, the honest number):",
-                                 score_final(test, pred_oos.loc[test.index]))
-    lines.append("  Test confusion matrix:")
-    lines += _confusion_lines(test, pred_oos.loc[test.index])
-    lines.append("")
-
-    # Rolling walk-forward: trailing-window eligibility, predict the next day.
-    wf_pred, wf_call_days, wf_put_days = walk_forward(df, signals)
+    # Rolling walk-forward (honest out-of-sample)
+    wf_pred = walk_forward_regime(df, regime_signals)
+    wf_pred_global = walk_forward_regime(df, global_regime_signals)
     wf_eval = df.iloc[WF_WINDOW:]
-    lines.append(f"Walk-forward (rolling {WF_WINDOW}-day trailing eligibility, "
-                 f">={WF_MIN_FIRES} fires)")
-    lines.append("-" * 60)
-    lines.append("Each predicted day uses only the prior {0} days to decide which "
-                 "variants".format(WF_WINDOW))
-    lines.append("are eligible, then predicts that single day. No future data leaks in.")
-    lines.append(f"  days with >=1 eligible CALL voter: {wf_call_days} of {len(wf_eval)}")
-    lines.append(f"  days with >=1 eligible PUT voter : {wf_put_days} of {len(wf_eval)}")
-    lines += _final_metric_block("Walk-forward (out-of-sample, the most realistic number):",
+    lines.append(f"Walk-forward (rolling {WF_WINDOW}-day trailing eligibility, within regime)")
+    lines.append("-" * 64)
+    lines.append(f"Each predicted day uses only the prior {WF_WINDOW} days OF THE SAME "
+                 "REGIME to")
+    lines.append("decide eligibility, then predicts that single day. No future data leaks in.")
+    lines += _final_metric_block("Walk-forward (out-of-sample, the honest number):",
                                  score_final(wf_eval, wf_pred.loc[wf_eval.index]))
     lines.append("  Walk-forward confusion matrix:")
     lines += _confusion_lines(wf_eval, wf_pred.loc[wf_eval.index])
     lines.append("")
-    lines.append("Caveat: precision floors are fit on the same year they are graded on,")
-    lines.append("so the in-sample block is optimistic. The 60/40 split freezes eligibility")
-    lines.append("on the first half, which can starve a time-concentrated edge (e.g. the PUT")
-    lines.append("momentum leg). The walk-forward re-fits eligibility on a trailing window,")
-    lines.append("so a side activates once its recent precision earns it — the most honest")
-    lines.append("estimate here, though still thin on a single year of data.")
+    lines += _final_metric_block("Global-expanded walk-forward:",
+                                 score_final(wf_eval, wf_pred_global.loc[wf_eval.index]))
+    lines.append("  Global-expanded walk-forward confusion matrix:")
+    lines += _confusion_lines(wf_eval, wf_pred_global.loc[wf_eval.index])
+    lines.append("")
+    lines.append("Caveat: precision floors are fit on the same year they grade, so the")
+    lines.append("in-sample headline is optimistic. There is only one calm->stress")
+    lines.append("transition in this sample, so the walk-forward is thin; treat as")
+    lines.append("research, not a live signal.")
     lines.append("")
 
-    return lines, pred_full
+    return lines, final_pos, final_pos_global
 
+
+# ───────────────────────── file writers ─────────────────────────
 
 def write_base(df: pd.DataFrame, cascade_lines: list[str]) -> None:
     EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(BASE_CSV, index=False)
+    # Persist the feature store to its neutral location (shared with production);
+    # base.txt (the human-readable report) stays under the experiment dir.
+    FEATURE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_csv(FEATURE_STORE, index=False)
+    except PermissionError as exc:
+        print(f"[WARN] Feature store CSV write skipped: {exc}")
 
     bc = _call_ok(df).mean()
     bp = _put_ok(df).mean()
     label_counts = df["actual_trade_label"].value_counts().to_dict()
+    regime_counts = df["regime"].value_counts().to_dict()
+    st, cm = REGIME_THRESHOLD[REGIME_STRESS], REGIME_THRESHOLD[REGIME_CALM]
     txt = f"""NIFTY direction-prediction experiment — BASE dataset
 =====================================================
 rows: {len(df)}   date range: {df['trade_date'].min()} .. {df['trade_date'].max()}
+regime split: stress={regime_counts.get(REGIME_STRESS, 0)}   calm={regime_counts.get(REGIME_CALM, 0)}
 
-THRESHOLD = {THRESHOLD:.3%}  (next-day intraday move from next_open)
+Regime-aware threshold (next-day intraday move from next_open):
+  stress days: {st:.3%}    calm days: {cm:.3%}
+Each trade_date is first routed to a volatility regime — calm = India VIX <
+{REGIME_VIX_CUTOFF:g} AND volatility_10d < {REGIME_VOL_CUTOFF:g}; otherwise stress — then graded
+at that regime's threshold (calm days rarely print a 0.5% move).
 
 actual_trade_label
 ------------------
-For each trade_date, the realised next-day intraday move from next_open is checked:
-  CALL  : (next_high - next_open) / next_open >= {THRESHOLD:.3%}   (and PUT side did not)
-  PUT   : (next_open - next_low ) / next_open >= {THRESHOLD:.3%}   (and CALL side did not)
-  BOTH  : both the +{THRESHOLD:.1%} and -{THRESHOLD:.1%} moves were touched intraday
+For each trade_date, the realised next-day intraday move from next_open is checked
+against that day's regime threshold T (stress {st:.1%} / calm {cm:.1%}):
+  CALL  : (next_high - next_open) / next_open >= T   (and PUT side did not)
+  PUT   : (next_open - next_low ) / next_open >= T   (and CALL side did not)
+  BOTH  : both the +T and -T moves were touched intraday
   NO_POSITION : neither move reached the threshold
 label distribution: {label_counts}
 base CALL hit-rate (CALL or BOTH): {bc:.3f}   base PUT hit-rate (PUT or BOTH): {bp:.3f}
@@ -734,39 +987,62 @@ vix_chg_1d            : 1-day change in India VIX (today - yesterday).
 vix_chg_pct           : 1-day percentage change in India VIX.
 """
     footer = (
-        "\nExcluded from this file by design: *_regime columns, strategy_* signal "
-        "columns,\nand final_raw_signal. The final_prediction column in base.csv is the "
-        "cascade\noutput described above. Strategy signals live in the per-strategy CSVs.\n"
+        "\nExcluded from this file by design: strategy_* signal columns and "
+        "final_raw_signal.\nRetained: the regime column (calm/stress router) and "
+        "final_position / final_position_global (the regime-aware\ncascade outputs "
+        "described above). Per-regime "
+        "strategy signals live in the\n<regime>_strategy_<family> CSVs.\n"
     )
     full = txt + "\n".join(cascade_lines) + footer
     (EXPERIMENT_DIR / "base.txt").write_text(full, encoding="utf-8")
 
 
-def write_strategy(df: pd.DataFrame, family: str, signals: dict[str, pd.Series]) -> list[Metrics]:
-    out = df.drop(columns=["final_prediction"], errors="ignore").copy()
-    metrics: list[Metrics] = []
+def write_strategy(df: pd.DataFrame, regime: str, family: str,
+                   signals: dict[str, pd.Series]) -> list[Metrics]:
+    """Score a family within one volatility regime and write
+    <regime>_strategy_<family>.{csv,txt}. `df` is the regime-subset frame whose
+    actual_trade_label is already set at that regime's threshold."""
+    threshold = REGIME_THRESHOLD[regime]
+    signals = with_global_region_variants(df, signals)
+    signals, metrics, dropped = _score_family_signals(df, signals)
+    out = df.drop(columns=["final_position"], errors="ignore").copy()
     ordered_names: list[str] = []
     for col, sig in signals.items():
-        out[col] = sig
+        s = sig.loc[df.index]
+        out[col] = s
         metric_name = col.replace("strategy_", "").replace("_signal", "")
         ordered_names.append(metric_name)
-        metrics.append(score_signal(df, sig, metric_name))
 
-    csv_path = EXPERIMENT_DIR / f"strategy_{family}.csv"
+    csv_path = EXPERIMENT_DIR / f"{regime}_strategy_{family}.csv"
     out.to_csv(csv_path, index=False)
 
     bc, bp = _call_ok(df).mean(), _put_ok(df).mean()
+    title = f"[{regime} regime] Strategy family: {family}"
     lines = [
-        f"Strategy family: {family}",
-        "=" * (17 + len(family)),
-        f"rows: {len(df)}   THRESHOLD = {THRESHOLD:.3%}",
+        title,
+        "=" * len(title),
+        f"rows: {len(df)} ({regime} regime)   THRESHOLD = {threshold:.3%}",
         f"base CALL precision (random): {bc:.3f}   base PUT precision (random): {bp:.3f}",
         "",
+    ]
+    if dropped:
+        lines += [
+            "Pruning",
+            "-------",
+            "Dropped variants: either explicitly excluded after research review, strictly dominated",
+            "within this family on precision/recall, or global variants equal-or-worse than a",
+            "non-global family peer on both precision and recall.",
+        ]
+        for name in sorted(dropped):
+            lines.append(f"  {name}")
+        lines.append("")
+
+    lines += [
         "Definitions",
         "-----------",
     ]
     for nm in ordered_names:
-        definition = STRATEGY_DEFINITIONS.get(nm, "(definition not recorded)")
+        definition = _strategy_definition(nm)
         lines.append(f"  {nm}:")
         for chunk in textwrap.wrap(definition, width=88):
             lines.append(f"    {chunk}")
@@ -788,103 +1064,144 @@ def write_strategy(df: pd.DataFrame, family: str, signals: dict[str, pd.Series])
               ""]
     for col, sig in signals.items():
         metric_name = col.replace("strategy_", "").replace("_signal", "")
-        lines += miss_patterns(df, sig, metric_name)
+        lines += miss_patterns(df, sig.loc[df.index], metric_name)
 
     lines += ["Notes",
               "-----",
+              f"Scored on the {regime} regime only ({len(df)} of the full sample), at that",
+              f"regime's {threshold:.3%} threshold.",
               "precision = correct fires / total fires.",
               "recall    = correct fires / days the threshold move actually occurred.",
-              "f1        = harmonic mean of precision and recall.",
-              "Add tweaked variants as new strategy_<family>_<variant>_signal columns to",
-              "this same CSV to compare against the existing variants here.", ""]
-    (EXPERIMENT_DIR / f"strategy_{family}.txt").write_text("\n".join(lines), encoding="utf-8")
+              "f1        = harmonic mean of precision and recall.", ""]
+    (EXPERIMENT_DIR / f"{regime}_strategy_{family}.txt").write_text(
+        "\n".join(lines), encoding="utf-8")
     return metrics
 
 
-def write_comparison(df: pd.DataFrame, all_metrics: list[Metrics]) -> None:
-    bc, bp = _call_ok(df).mean(), _put_ok(df).mean()
-    lines = [
-        "NIFTY direction-prediction — strategy comparison",
-        "================================================",
-        f"rows: {len(df)}   THRESHOLD = {THRESHOLD:.3%}",
-        f"base CALL precision (random): {bc:.3f}   base PUT precision (random): {bp:.3f}",
-        "",
-        f"{'strategy':<42}{'side':>6}{'n':>6}{'prec':>8}{'recall':>8}{'f1':>8}{'cov':>7}",
-        "-" * 91,
-    ]
-    for m in all_metrics:
-        side = "BOTH" if (m.n_call and m.n_put) else ("CALL" if m.n_call else "PUT")
-        lines.append(
-            f"{m.name:<42}{side:>6}{m.n_call + m.n_put:>6}"
-            f"{_fmt(m.precision):>8}{_fmt(m.recall):>8}{_fmt(m.f1):>8}{m.coverage:>7.3f}"
-        )
-    lines += [
-        "",
-        "Observations",
-        "------------",
-        "1. CALL edge is mean-reversion: NIFTY tends to bounce >=0.5% the day after",
-        "   an oversold/low-in-range close. OversoldBounceCall_HighPrecision is the",
-        "   sharpest CALL (fewest trades, highest precision); _MoreTrades trades more",
-        "   often at slightly lower precision.",
-        "2. PUT edge is momentum continuation: down-trending, high-volume days tend to",
-        "   extend >=0.5% lower next day. DownMomentumPut_HighPrecision adds 'VIX rising'",
-        "   for the highest precision but few trades; _MoreTrades swaps that for a VIX",
-        "   level gate to fire more often.",
-        "3. India VIX is a confirmation/gate, not a standalone trigger. A VIX level gate",
-        "   (>=13) removes dead low-volatility days where 0.5% rarely prints; 'VIX rising'",
-        "   specifically sharpens PUT precision.",
-        "4. MomentumDirectional merges the best-balanced CALL and PUT into one",
-        "   two-sided signal. NOTE the two sides use OPPOSITE logic (CALL =",
-        "   mean-reversion, PUT = momentum-continuation) and overlap on ~60 of the",
-        "   falling/oversold days, so conflicts are common. They are resolved by",
-        "   normalised vote strength (the more strongly confirmed side wins), which",
-        "   gives the best precision/recall balance; dropping conflicts instead",
-        "   collapses the signal. It trades per-trade precision for the highest recall.",
-        "5. Precision and recall trade off: sniper variants sit at ~7-15% coverage with",
-        "   high precision; the balanced directional sits near ~30-40% coverage. Choose",
-        "   by desired trade frequency vs hit-rate.",
-        "",
-        "Legacy strategies (reproduced from the previously-dropped strategy_* columns)",
-        "----------------------------------------------------------------------------",
-        "6. MAAlignmentRoom family (MAAlignmentRoom, _PutGuarded, _ReboundCall) plus",
-        "   MaTrend_001 are MA-alignment / MA-trend rules. They are ungated here (the",
-        "   regime columns are excluded from base.csv).",
-        "7. MeanReversion merges BollingerMeanReversion and RsiMeanReversion_6040 — both",
-        "   are mean-reversion rules, so they share one family file.",
-        "8. RangeBreakout merges trendUpRangeBreakout and trendDownRangeBreakout into one",
-        "   two-sided 20-day breakout (CALL above prior-20d high, PUT below prior-20d low).",
-        "   Originally these were the same breakout gated on TREND_UP vs TREND_DOWN; with",
-        "   regime excluded they collapse to a single signal. In this ~95% RANGE sample,",
-        "   breakouts are rare and tend to be false (mean-reverting tape), so expect low",
-        "   precision relative to the mean-reversion CALL and momentum PUT rules.",
-        "",
-        "Caveat: single year of data (~95% RANGE regime). The CALL mean-reversion bet",
-        "weakens in a sustained downtrend; re-validate as more data accrues.",
-        "",
-    ]
-    (EXPERIMENT_DIR / "comparison.txt").write_text("\n".join(lines), encoding="utf-8")
+def _strategy_definition(name: str) -> str:
+    generated_suffixes = {
+        "_GlobalAgree": (
+            "GlobalAgree variant: keep CALL only when at least two of "
+            "global_us_return_mean, global_europe_return_mean, and global_asia_return_mean "
+            "are positive; keep PUT only when at least two are negative."
+        ),
+        "_GlobalNoDisagree": (
+            "GlobalNoDisagree variant: keep neutral regional-tone days, but drop CALL when "
+            "at least two regional means are negative and drop PUT when at least two regional "
+            "means are positive."
+        ),
+        "_GlobalAnyAgree": (
+            "GlobalAnyAgree variant: keep CALL when at least one of the three regional means "
+            "is positive; keep PUT when at least one is negative. This is the loosest regional "
+            "tailwind add-on."
+        ),
+        "_GlobalWeightedTilt": (
+            f"GlobalWeightedTilt variant: keep CALL when the average of the three regional "
+            f"means is at least {GLOBAL_WEIGHTED_TILT_THRESHOLD:.3%}; keep PUT when that "
+            f"average is at most {-GLOBAL_WEIGHTED_TILT_THRESHOLD:.3%}. This uses magnitude, "
+            "not just vote count."
+        ),
+    }
+    for suffix, explanation in generated_suffixes.items():
+        if name.endswith(suffix):
+            base = name.removesuffix(suffix)
+            return f"{STRATEGY_DEFINITIONS.get(base, base)} {explanation}"
+    return STRATEGY_DEFINITIONS.get(name, "(definition not recorded)")
+
+
+def write_comparison(df: pd.DataFrame,
+                     regime_metrics: dict[str, list[Metrics]]) -> None:
+    baseline_final = score_final(df, df["final_position"])
+    global_final = score_final(df, df["final_position_global"])
+    rows: list[dict[str, object]] = []
+
+    for label, metrics, scope in (
+        ("baseline", baseline_final, "pruned_research_roster"),
+        ("global", global_final, "pruned_global_expanded_roster"),
+    ):
+        rows.append({
+            "row_type": "final_cascade",
+            "regime": "all",
+            "strategy": label,
+            "side": "BOTH",
+            "scope": scope,
+            "n": metrics["n"],
+            "n_call": metrics["n_call"],
+            "n_put": metrics["n_put"],
+            "n_flat": metrics["n_flat"],
+            "precision": metrics["dir_precision"],
+            "recall": metrics["dir_recall"],
+            "f1": np.nan,
+            "coverage": (metrics["n_call"] + metrics["n_put"]) / metrics["n"],
+            "wrong_way_rate": metrics["wrong_way_rate"],
+            "overall_accuracy": metrics["overall_accuracy"],
+            "base_call_precision": _call_ok(df).mean(),
+            "base_put_precision": _put_ok(df).mean(),
+            "threshold": np.nan,
+            "notes": "review exclusions plus within-family dominated/equal-or-worse global variants are pruned",
+        })
+
+    for regime in (REGIME_STRESS, REGIME_CALM):
+        sub = regime_frame(df, regime)
+        bc, bp = _call_ok(sub).mean(), _put_ok(sub).mean()
+        for m in regime_metrics.get(regime, []):
+            side = "BOTH" if (m.n_call and m.n_put) else ("CALL" if m.n_call else "PUT")
+            rows.append({
+                "row_type": "strategy",
+                "regime": regime,
+                "strategy": m.name,
+                "side": side,
+                "scope": "pruned_family_variant",
+                "n": len(sub),
+                "n_call": m.n_call,
+                "n_put": m.n_put,
+                "n_flat": len(sub) - m.n_call - m.n_put,
+                "precision": m.precision,
+                "recall": m.recall,
+                "f1": m.f1,
+                "coverage": m.coverage,
+                "wrong_way_rate": np.nan,
+                "overall_accuracy": np.nan,
+                "base_call_precision": bc,
+                "base_put_precision": bp,
+                "threshold": REGIME_THRESHOLD[regime],
+                "notes": "",
+            })
+
+    pd.DataFrame(rows).to_csv(EXPERIMENT_DIR / "comparison.csv", index=False)
+    old_txt = EXPERIMENT_DIR / "comparison.txt"
+    if old_txt.exists():
+        old_txt.unlink()
 
 
 def main() -> None:
     df = build_base()
-    signals = gather_signals(df)
-    cascade_lines, final_pred = cascade_report(df, signals)
-    df["final_prediction"] = final_pred
+    cascade_lines, final_position, final_position_global = cascade_report(df)
+    df["final_position"] = final_position
+    df["final_position_global"] = final_position_global
     write_base(df, cascade_lines)
     print(f"wrote base.csv ({len(df)} rows) + base.txt")
 
-    all_metrics: list[Metrics] = []
-    for family, fn in STRATEGY_FAMILIES.items():
-        fam_signals = fn(df)
-        metrics = write_strategy(df, family, fam_signals)
-        all_metrics.extend(metrics)
-        print(f"wrote strategy_{family}.csv + .txt ({len(fam_signals)} variant(s))")
+    regime_metrics: dict[str, list[Metrics]] = {}
+    for regime, families in REGIME_FAMILIES.items():
+        sub = regime_frame(df, regime)
+        metrics_for_regime: list[Metrics] = []
+        for family, fn in families.items():
+            fam_signals = fn(df)  # compute on full frame, score on the regime slice
+            metrics = write_strategy(sub, regime, family, fam_signals)
+            metrics_for_regime.extend(metrics)
+            print(f"wrote {regime}_strategy_{family}.csv + .txt "
+                f"({len(metrics)} variant(s))")
+        regime_metrics[regime] = metrics_for_regime
 
-    write_comparison(df, all_metrics)
-    print("wrote comparison.txt")
-    print("\nSummary:")
-    for m in all_metrics:
-        print(f"  {m.name:<42} prec={_fmt(m.precision)} recall={_fmt(m.recall)} f1={_fmt(m.f1)}")
+    write_comparison(df, regime_metrics)
+    print("wrote comparison.csv")
+    print("\nSummary (per regime, regime-specific threshold):")
+    for regime in (REGIME_STRESS, REGIME_CALM):
+        print(f"  [{regime}] threshold {REGIME_THRESHOLD[regime]:.2%}")
+        for m in regime_metrics.get(regime, []):
+            print(f"    {m.name:<42} prec={_fmt(m.precision)} "
+                  f"recall={_fmt(m.recall)} f1={_fmt(m.f1)}")
 
 
 if __name__ == "__main__":

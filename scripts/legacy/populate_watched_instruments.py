@@ -6,9 +6,9 @@ resolved directly from Kite's NSE instruments dump and upserted via the
 configured database (Supabase or Azure SQL).
 
 Usage:
-    python scripts/populate_watched_instruments.py
-    python scripts/populate_watched_instruments.py --symbols NIFTY,BANKNIFTY
-    python scripts/populate_watched_instruments.py --list
+    python scripts/legacy/populate_watched_instruments.py
+    python scripts/legacy/populate_watched_instruments.py --symbols NIFTY,BANKNIFTY
+    python scripts/legacy/populate_watched_instruments.py --list
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import logging
 import sys
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv

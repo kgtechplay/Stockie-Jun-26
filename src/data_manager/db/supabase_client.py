@@ -427,9 +427,9 @@ class SupabaseDatabaseClient:
             "signal_date", "symbol", "feature_version",
             "close_1515", "open_915", "high_day", "low_day", "volume_day",
             "ma10", "ma20", "ma50", "ma90",
-            "rsi14", "atr14",
+            "rsi14", "rsi5", "atr14",
             "bb_upper", "bb_middle", "bb_lower", "bb_width",
-            "ret_5d", "ret_10d", "ret_20d", "ret_60d",
+            "ret_2d", "ret_3d", "ret_5d", "ret_10d", "ret_20d", "ret_60d",
             "volatility_10d", "volatility_20d", "volume_10d", "volume_20d",
             "trend_efficiency_5d", "trend_efficiency_10d",
             "trend_efficiency_20d", "trend_efficiency_60d",
@@ -448,6 +448,9 @@ class SupabaseDatabaseClient:
             cur.execute("""
                 ALTER TABLE "SignalFeatureDaily"
                     ADD COLUMN IF NOT EXISTS ret_10d double precision,
+                    ADD COLUMN IF NOT EXISTS rsi5 double precision,
+                    ADD COLUMN IF NOT EXISTS ret_2d double precision,
+                    ADD COLUMN IF NOT EXISTS ret_3d double precision,
                     ADD COLUMN IF NOT EXISTS volatility_10d double precision,
                     ADD COLUMN IF NOT EXISTS volume_10d double precision,
                     ADD COLUMN IF NOT EXISTS volume_20d double precision,
@@ -479,6 +482,358 @@ class SupabaseDatabaseClient:
             )
         self.conn.commit()
         return len(rows)
+
+    def upsert_nifty_predictions(self, rows: list[dict]) -> int:
+        """
+        Persist daily final-prediction rows to "NiftyPrediction".
+
+        Each dict mirrors the production prediction CSV. Required: trade_date.
+        Upsert key: (symbol, trade_date, model_version). The table is created on
+        first use, so a missing migration does not break the daily job.
+        """
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "symbol", "trade_date", "model_version", "next_trade_date",
+            "open_915", "high_day", "low_day", "close_1515", "volume_day",
+            "vix_close", "vix_chg_1d", "vix_chg_pct", "regime",
+            "next_open", "next_high", "next_low", "next_close", "next_return_pct",
+            "final_prediction", "direction", "volatility_regime", "primary_strategy",
+            "strategy_precision", "signal_style", "strength_score", "strength_label",
+            "confidence_level", "actual_trade_label",
+        ]
+        key_cols = ("symbol", "trade_date", "model_version")
+        update_cols = [c for c in cols if c not in key_cols]
+        set_clause = ",\n                        ".join(
+            f"{c} = EXCLUDED.{c}" for c in update_cols
+        )
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "NiftyPrediction" (
+                    symbol             varchar(50)  NOT NULL DEFAULT 'NIFTY',
+                    trade_date         date         NOT NULL,
+                    model_version      varchar(50)  NOT NULL DEFAULT 'cascade_v1',
+                    next_trade_date    date,
+                    open_915           double precision,
+                    high_day           double precision,
+                    low_day            double precision,
+                    close_1515         double precision,
+                    volume_day         double precision,
+                    vix_close          double precision,
+                    vix_chg_1d         double precision,
+                    vix_chg_pct        double precision,
+                    regime             varchar(20),
+                    next_open          double precision,
+                    next_high          double precision,
+                    next_low           double precision,
+                    next_close         double precision,
+                    next_return_pct    double precision,
+                    final_prediction   varchar(20),
+                    direction          varchar(20),
+                    volatility_regime  varchar(20),
+                    primary_strategy   varchar(120),
+                    strategy_precision double precision,
+                    signal_style       varchar(50),
+                    strength_score     double precision,
+                    strength_label     varchar(20),
+                    confidence_level   double precision,
+                    actual_trade_label varchar(20),
+                    created_at         timestamptz NOT NULL DEFAULT now(),
+                    updated_at         timestamptz NOT NULL DEFAULT now(),
+                    CONSTRAINT pk_nifty_prediction PRIMARY KEY (symbol, trade_date, model_version)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS ix_nifty_prediction_date
+                    ON "NiftyPrediction" (trade_date);
+            """)
+            for ddl in (
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS direction varchar(20)',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS volatility_regime varchar(20)',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS primary_strategy varchar(120)',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS strategy_precision double precision',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS signal_style varchar(50)',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS strength_score double precision',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS strength_label varchar(20)',
+                'ALTER TABLE "NiftyPrediction" ADD COLUMN IF NOT EXISTS confidence_level double precision',
+            ):
+                cur.execute(ddl)
+            values = [
+                tuple(
+                    r.get(c, "NIFTY" if c == "symbol"
+                          else "cascade_v1" if c == "model_version" else None)
+                    for c in cols
+                )
+                for r in rows
+            ]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "NiftyPrediction" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT ON CONSTRAINT pk_nifty_prediction DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_nifty_option_selections(self, rows: list[dict]) -> int:
+        """Persist daily option-selection rows to "NiftyOptionSelection"."""
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "symbol", "trade_date", "model_version", "next_trade_date",
+            "final_prediction", "prediction_direction", "volatility_regime",
+            "primary_strategy", "strategy_precision", "signal_style",
+            "strength_score", "strength_label", "confidence_level",
+            "spot_price", "as_of_time", "selected_strategy", "option_bias_selected",
+            "no_trade_reason", "evaluated_candidate_count", "strategy_direction",
+            "entry_debit_or_credit", "max_profit", "max_loss", "breakeven",
+            "reward_risk", "selection_score", "selection_confidence",
+            "total_delta", "total_gamma", "total_theta", "total_vega",
+            "legs_summary", "primary_buy_token", "primary_buy_symbol",
+            "primary_buy_strike", "primary_buy_expiry", "primary_buy_option_type",
+            "primary_buy_entry_price", "primary_buy_iv", "primary_buy_delta",
+            "target_1_pct", "target_1_price", "target_2_pct", "target_2_price",
+            "stop_loss_enabled", "stop_loss_pct", "stop_loss_price",
+        ]
+        key_cols = ("symbol", "trade_date", "model_version")
+        update_cols = [c for c in cols if c not in key_cols]
+        set_clause = ",\n                        ".join(
+            f"{c} = EXCLUDED.{c}" for c in update_cols
+        )
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "NiftyOptionSelection" (
+                    symbol                    varchar(50) NOT NULL DEFAULT 'NIFTY',
+                    trade_date                date        NOT NULL,
+                    model_version             varchar(50) NOT NULL DEFAULT 'cascade_v1',
+                    next_trade_date           date,
+                    final_prediction          varchar(20),
+                    prediction_direction      varchar(20),
+                    volatility_regime         varchar(20),
+                    primary_strategy          varchar(120),
+                    strategy_precision        double precision,
+                    signal_style              varchar(50),
+                    strength_score            double precision,
+                    strength_label            varchar(20),
+                    confidence_level          double precision,
+                    spot_price                double precision,
+                    as_of_time                timestamp,
+                    selected_strategy         varchar(50),
+                    option_bias_selected      varchar(50),
+                    no_trade_reason           text,
+                    evaluated_candidate_count integer,
+                    strategy_direction        varchar(20),
+                    entry_debit_or_credit     double precision,
+                    max_profit                double precision,
+                    max_loss                  double precision,
+                    breakeven                 double precision,
+                    reward_risk               double precision,
+                    selection_score           double precision,
+                    selection_confidence      varchar(20),
+                    total_delta               double precision,
+                    total_gamma               double precision,
+                    total_theta               double precision,
+                    total_vega                double precision,
+                    legs_summary              text,
+                    primary_buy_token         bigint,
+                    primary_buy_symbol        varchar(120),
+                    primary_buy_strike        double precision,
+                    primary_buy_expiry        date,
+                    primary_buy_option_type   varchar(10),
+                    primary_buy_entry_price   double precision,
+                    primary_buy_iv            double precision,
+                    primary_buy_delta         double precision,
+                    target_1_pct              double precision,
+                    target_1_price            double precision,
+                    target_2_pct              double precision,
+                    target_2_price            double precision,
+                    stop_loss_enabled         boolean NOT NULL DEFAULT false,
+                    stop_loss_pct             double precision,
+                    stop_loss_price           double precision,
+                    created_at                timestamptz NOT NULL DEFAULT now(),
+                    updated_at                timestamptz NOT NULL DEFAULT now(),
+                    CONSTRAINT pk_nifty_option_selection PRIMARY KEY (symbol, trade_date, model_version)
+                );
+            """)
+            for ddl in (
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS target_1_pct double precision',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS target_1_price double precision',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS target_2_pct double precision',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS target_2_price double precision',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS stop_loss_enabled boolean NOT NULL DEFAULT false',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS stop_loss_pct double precision',
+                'ALTER TABLE "NiftyOptionSelection" ADD COLUMN IF NOT EXISTS stop_loss_price double precision',
+            ):
+                cur.execute(ddl)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS ix_nifty_option_selection_date
+                    ON "NiftyOptionSelection" (trade_date);
+            """)
+            values = [
+                tuple(
+                    r.get(c, "NIFTY" if c == "symbol"
+                          else "cascade_v1" if c == "model_version" else None)
+                    for c in cols
+                )
+                for r in rows
+            ]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "NiftyOptionSelection" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT ON CONSTRAINT pk_nifty_option_selection DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_news_articles(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "article_id", "source", "url", "title", "summary", "published_at",
+            "fetched_at", "region", "provider",
+        ]
+        with self.conn.cursor() as cur:
+            cur.execute(SUPABASE_NEWS_SENTIMENT_SCHEMA_SQL)
+            values = [tuple(r.get(c) for c in cols) for r in rows]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "NewsArticle" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT (article_id) DO UPDATE SET
+                    source = EXCLUDED.source,
+                    url = EXCLUDED.url,
+                    title = EXCLUDED.title,
+                    summary = EXCLUDED.summary,
+                    published_at = EXCLUDED.published_at,
+                    fetched_at = EXCLUDED.fetched_at,
+                    region = EXCLUDED.region,
+                    provider = EXCLUDED.provider,
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_news_article_sentiments(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "target_date", "article_id", "window_start", "window_end",
+            "sentiment_label", "sentiment_score", "sentiment_confidence",
+            "sentiment_model", "sectors", "sector_confidences", "sector_weight",
+            "weighted_sentiment",
+        ]
+        update_cols = [c for c in cols if c not in ("target_date", "article_id")]
+        set_clause = ",\n                    ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+        with self.conn.cursor() as cur:
+            cur.execute(SUPABASE_NEWS_SENTIMENT_SCHEMA_SQL)
+            values = [tuple(r.get(c) for c in cols) for r in rows]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "NewsArticleSentiment" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT (target_date, article_id) DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_nifty_market_sentiments(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "target_date", "window_start", "window_end", "article_count",
+            "usable_article_count", "composite_score", "composite_label",
+            "mean_confidence", "positive_count", "neutral_count", "negative_count",
+            "weighted_signal_sum", "normalization_denominator", "source_mix",
+            "generated_at",
+        ]
+        update_cols = [c for c in cols if c != "target_date"]
+        set_clause = ",\n                    ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+        with self.conn.cursor() as cur:
+            cur.execute(SUPABASE_NEWS_SENTIMENT_SCHEMA_SQL)
+            values = [tuple(r.get(c) for c in cols) for r in rows]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "NiftyMarketSentiment" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT (target_date) DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def upsert_global_index_ohlc(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        from psycopg2.extras import execute_values
+
+        cols = [
+            "index_code", "index_name", "yahoo_symbol", "region", "currency",
+            "trade_date", "open_price", "high_price", "low_price", "close_price",
+            "adj_close", "volume", "source", "fetched_at",
+        ]
+        key_cols = ("index_code", "trade_date", "source")
+        update_cols = [c for c in cols if c not in key_cols]
+        set_clause = ",\n                    ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+        with self.conn.cursor() as cur:
+            cur.execute(SUPABASE_GLOBAL_INDEX_SCHEMA_SQL)
+            values = [tuple(r.get(c) for c in cols) for r in rows]
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO "GlobalIndexOhlc" ({", ".join(cols)})
+                VALUES %s
+                ON CONFLICT ON CONSTRAINT pk_global_index_ohlc DO UPDATE SET
+                    {set_clause},
+                    updated_at = now()
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def get_latest_global_index_trade_date(self) -> date | None:
+        with self.conn.cursor() as cur:
+            cur.execute(SUPABASE_GLOBAL_INDEX_SCHEMA_SQL)
+            cur.execute('SELECT max(trade_date) FROM "GlobalIndexOhlc"')
+            row = cur.fetchone()
+        self.conn.commit()
+        return row[0] if row and row[0] else None
 
     def get_kite_access_token(self) -> str | None:
         with self.conn.cursor() as cur:
@@ -659,4 +1014,103 @@ CREATE INDEX IF NOT EXISTS ix_signal_feature_daily_symbol_date
     ON "SignalFeatureDaily" (symbol, signal_date);
 CREATE INDEX IF NOT EXISTS ix_signal_feature_daily_regime
     ON "SignalFeatureDaily" (signal_date, regime);
+"""
+
+
+SUPABASE_NEWS_SENTIMENT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS "NewsArticle" (
+    article_id   varchar(64) PRIMARY KEY,
+    source       varchar(200),
+    url          text,
+    title        text,
+    summary      text,
+    published_at timestamptz,
+    fetched_at   timestamptz,
+    region       varchar(50),
+    provider     varchar(50),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_news_article_published_at
+    ON "NewsArticle" (published_at);
+CREATE INDEX IF NOT EXISTS ix_news_article_provider_region
+    ON "NewsArticle" (provider, region);
+
+CREATE TABLE IF NOT EXISTS "NewsArticleSentiment" (
+    target_date               date NOT NULL,
+    article_id                varchar(64) NOT NULL,
+    window_start              timestamptz,
+    window_end                timestamptz,
+    sentiment_label           varchar(20),
+    sentiment_score           double precision,
+    sentiment_confidence      double precision,
+    sentiment_model           varchar(100),
+    sectors                   text,
+    sector_confidences        text,
+    sector_weight             double precision,
+    weighted_sentiment        double precision,
+    created_at                timestamptz NOT NULL DEFAULT now(),
+    updated_at                timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_news_article_sentiment PRIMARY KEY (target_date, article_id),
+    CONSTRAINT fk_news_article_sentiment_article
+        FOREIGN KEY (article_id) REFERENCES "NewsArticle"(article_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_news_article_sentiment_target_date
+    ON "NewsArticleSentiment" (target_date);
+CREATE INDEX IF NOT EXISTS ix_news_article_sentiment_label
+    ON "NewsArticleSentiment" (target_date, sentiment_label);
+
+CREATE TABLE IF NOT EXISTS "NiftyMarketSentiment" (
+    target_date                date PRIMARY KEY,
+    window_start               timestamptz,
+    window_end                 timestamptz,
+    article_count              integer,
+    usable_article_count       integer,
+    composite_score            double precision,
+    composite_label            varchar(20),
+    mean_confidence            double precision,
+    positive_count             integer,
+    neutral_count              integer,
+    negative_count             integer,
+    weighted_signal_sum        double precision,
+    normalization_denominator  double precision,
+    source_mix                 text,
+    generated_at               timestamptz,
+    created_at                 timestamptz NOT NULL DEFAULT now(),
+    updated_at                 timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_nifty_market_sentiment_label
+    ON "NiftyMarketSentiment" (target_date, composite_label);
+"""
+
+
+SUPABASE_GLOBAL_INDEX_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS "GlobalIndexOhlc" (
+    index_code    varchar(50) NOT NULL,
+    index_name    varchar(120) NOT NULL,
+    yahoo_symbol  varchar(50) NOT NULL,
+    region        varchar(50),
+    currency      varchar(10),
+    trade_date    date NOT NULL,
+    open_price    double precision,
+    high_price    double precision,
+    low_price     double precision,
+    close_price   double precision,
+    adj_close     double precision,
+    volume        bigint,
+    source        varchar(50) NOT NULL DEFAULT 'yfinance',
+    fetched_at    timestamptz NOT NULL DEFAULT now(),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_global_index_ohlc PRIMARY KEY (index_code, trade_date, source)
+);
+
+CREATE INDEX IF NOT EXISTS ix_global_index_ohlc_date
+    ON "GlobalIndexOhlc" (trade_date);
+CREATE INDEX IF NOT EXISTS ix_global_index_ohlc_symbol_date
+    ON "GlobalIndexOhlc" (index_code, trade_date);
 """

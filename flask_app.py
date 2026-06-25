@@ -1,395 +1,294 @@
 from __future__ import annotations
 
-from datetime import date
-from pathlib import Path
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
-from flask import Flask, abort, render_template_string, request, send_file, url_for
+from flask import Flask, render_template_string, request
 
-from backtest.legacy.historical_underlying_backtest import (
-    HistoricalUnderlyingBacktestRequest,
-    run_historical_underlying_backtest,
-)
-PROJECT_ROOT = Path(__file__).resolve().parent
+from src.common.config import get_settings
+
 NIFTY_SYMBOL = "NIFTY"
+NIFTY_DISPLAY = "NIFTY 50"
+MODEL_VERSION = "cascade_v1"
+
 app = Flask(__name__)
 
 
 @app.get("/")
 def index():
-    dashboard = load_nifty_dashboard()
+    stocks, load_error = load_stock_options()
+    selected = request.args.get("symbol", NIFTY_SYMBOL).strip().upper() or NIFTY_SYMBOL
+    if selected not in {stock["symbol"] for stock in stocks}:
+        selected = NIFTY_SYMBOL
+
+    rows, table_error = load_june_signal_rows(selected)
+    banner = "" if selected == NIFTY_SYMBOL else "Production prediction and option-selection rows are currently available for NIFTY 50 only."
+
     context = {
         "today": date.today().isoformat(),
-        "selected": NIFTY_SYMBOL,
-        "underlyings": [NIFTY_SYMBOL],
-        "load_error": "",
-        "result": None,
-        "csv_rows": dashboard["preview_rows"],
-        "csv_columns": dashboard["preview_columns"],
-        "csv_download_url": dashboard["download_url"],
-        "active_path": "technical",
-        "dashboard": dashboard,
-    }
-    return render_template_string(PAGE_TEMPLATE, **context)
-
-
-@app.post("/technical/predict")
-def technical_predict():
-    underlying = NIFTY_SYMBOL
-
-    dashboard = load_nifty_dashboard()
-    result: dict[str, Any] = {
-        "underlying": underlying,
-        "dashboard_file": dashboard["path"],
-        "rows": dashboard["row_count"],
-        "latest": dashboard["latest"],
-        "summary": dashboard["summary"],
-    }
-    csv_path = Path(dashboard["path"]) if dashboard["has_file"] else None
-    status = "success"
-
-    return render_result(
-        result=result,
-        csv_path=csv_path,
-        selected=underlying,
-        active_path="technical",
-        banner="NIFTY dashboard refreshed.",
-        status=status,
-    )
-
-
-@app.post("/technical/backtest")
-def technical_backtest():
-    underlying = NIFTY_SYMBOL
-
-    result: dict[str, Any]
-    csv_path: Path | None = None
-    try:
-        backtest_result = run_historical_underlying_backtest(
-            HistoricalUnderlyingBacktestRequest(underlying=underlying)
-        )
-        result = {
-            "backtest": backtest_result,
-        }
-        output_file = backtest_result.get("prediction_file")
-        csv_path = Path(str(output_file)) if output_file else None
-        status = "success"
-    except Exception as exc:
-        result = {"error": str(exc)}
-        status = "error"
-
-    return render_result(
-        result=result,
-        csv_path=csv_path,
-        selected=underlying,
-        active_path="technical",
-        banner=("Historical prediction and backtest completed." if status == "success" else "Backtest failed."),
-        status=status,
-    )
-
-
-def render_result(
-    result: dict[str, Any],
-    csv_path: Path | None,
-    selected: str,
-    active_path: str,
-    banner: str,
-    status: str,
-    published_date: str | None = None,
-):
-    context = {
-        "today": date.today().isoformat(),
+        "stocks": stocks,
         "selected": selected,
-        "underlyings": [NIFTY_SYMBOL],
-        "load_error": "",
-        "result": json_safe(result),
-        "headline": extract_headline(result),
-        "csv_rows": [],
-        "csv_columns": [],
-        "csv_download_url": "",
-        "active_path": "technical",
+        "selected_label": display_symbol(selected),
+        "rows": rows,
+        "load_error": table_error or load_error,
         "banner": banner,
-        "status": status,
-        "published_date": published_date or date.today().isoformat(),
-        "dashboard": load_nifty_dashboard(),
+        "summary": summarize_rows(rows),
     }
-
-    if csv_path:
-        rows, columns = read_csv_preview(csv_path)
-        context["csv_rows"] = rows
-        context["csv_columns"] = columns
-        context["csv_download_url"] = build_download_url(csv_path)
     return render_template_string(PAGE_TEMPLATE, **context)
 
 
-@app.get("/download/csv")
-def download_csv():
-    requested = request.args.get("path", "")
-    path = resolve_output_csv_path(requested)
-    if path is None or not path.exists() or path.suffix.lower() != ".csv":
-        abort(404)
-    return send_file(path, as_attachment=True, download_name=path.name, mimetype="text/csv")
+def load_stock_options() -> tuple[list[dict[str, str]], str]:
+    fallback = [{"symbol": NIFTY_SYMBOL, "label": NIFTY_DISPLAY}]
+    settings = get_settings()
+    if not settings.supabase_conn_str:
+        return fallback, "SUPABASE_CONN_STR is not configured, so only the NIFTY 50 option is shown."
+
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        with psycopg2.connect(settings.supabase_conn_str) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT tradingsymbol, COALESCE(NULLIF(name, ''), tradingsymbol) AS label
+                    FROM "WatchedInstrument"
+                    WHERE is_active = true
+                    ORDER BY CASE WHEN tradingsymbol = 'NIFTY' THEN 0 ELSE 1 END, tradingsymbol
+                    """
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        return fallback, f"Could not load stock list from Supabase: {exc}"
+
+    options = [
+        {"symbol": str(row["tradingsymbol"]), "label": display_symbol(str(row["tradingsymbol"]), str(row["label"]))}
+        for row in rows
+        if row.get("tradingsymbol")
+    ]
+    if not any(option["symbol"] == NIFTY_SYMBOL for option in options):
+        options.insert(0, fallback[0])
+    return options or fallback, ""
 
 
-def read_csv_preview(path: Path, limit: int = 50) -> tuple[list[dict[str, Any]], list[str]]:
-    if not path.exists():
-        return [], []
-    df = pd.read_csv(path).head(limit)
-    return df.fillna("").to_dict(orient="records"), list(df.columns)
+def load_june_signal_rows(symbol: str) -> tuple[list[dict[str, Any]], str]:
+    if symbol != NIFTY_SYMBOL:
+        return [], ""
+
+    settings = get_settings()
+    if not settings.supabase_conn_str:
+        return [], "SUPABASE_CONN_STR is missing. Set it to load June prediction, option-selection, and P&L rows."
+
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        with psycopg2.connect(settings.supabase_conn_str) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(JUNE_SIGNAL_SQL, {"symbol": symbol, "model_version": MODEL_VERSION})
+                db_rows = cur.fetchall()
+    except Exception as exc:
+        return [], f"Could not load June signal rows: {exc}"
+
+    return [format_signal_row(dict(row)) for row in db_rows], ""
 
 
-def load_nifty_dashboard() -> dict[str, Any]:
-    path = PROJECT_ROOT / "output" / "backtest" / NIFTY_SYMBOL / "production" / f"{NIFTY_SYMBOL}_prediction.csv"
-    dashboard: dict[str, Any] = {
-        "has_file": path.exists(),
-        "path": str(path),
-        "download_url": "",
-        "row_count": 0,
-        "latest": {},
-        "summary": {},
-        "trend_rows": [],
-        "preview_rows": [],
-        "preview_columns": [],
+JUNE_SIGNAL_SQL = """
+WITH june_predictions AS (
+    SELECT *
+    FROM "NiftyPrediction"
+    WHERE symbol = %(symbol)s
+      AND model_version = %(model_version)s
+      AND EXTRACT(MONTH FROM trade_date) = 6
+), option_rows AS (
+    SELECT *
+    FROM "NiftyOptionSelection"
+    WHERE symbol = %(symbol)s
+      AND model_version = %(model_version)s
+      AND EXTRACT(MONTH FROM trade_date) = 6
+), selected AS (
+    SELECT
+        p.trade_date,
+        p.next_trade_date,
+        p.final_prediction,
+        p.direction,
+        p.actual_trade_label,
+        p.regime,
+        p.primary_strategy AS prediction_strategy,
+        p.strength_score,
+        p.confidence_level,
+        o.selected_strategy,
+        o.primary_buy_symbol,
+        o.primary_buy_token,
+        o.primary_buy_strike,
+        o.primary_buy_expiry,
+        o.primary_buy_option_type,
+        o.primary_buy_entry_price,
+        o.target_1_price,
+        o.target_2_price,
+        o.stop_loss_enabled,
+        o.stop_loss_price,
+        o.no_trade_reason
+    FROM june_predictions p
+    LEFT JOIN option_rows o
+      ON o.symbol = p.symbol
+     AND o.trade_date = p.trade_date
+     AND o.model_version = p.model_version
+)
+SELECT
+    s.*,
+    stats.first_snapshot_time,
+    stats.last_snapshot_time,
+    stats.max_option_price,
+    stats.latest_option_price,
+    stats.snapshot_count,
+  CASE
+    WHEN s.target_2_price IS NOT NULL AND stats.max_option_price >= s.target_2_price THEN s.target_2_price
+    WHEN s.target_1_price IS NOT NULL AND stats.max_option_price >= s.target_1_price THEN s.target_1_price
+    ELSE stats.latest_option_price
+  END AS pnl_exit_price,
+    CASE
+    WHEN s.primary_buy_entry_price IS NULL OR stats.latest_option_price IS NULL THEN NULL
+    ELSE ROUND(((
+      CASE
+        WHEN s.target_2_price IS NOT NULL AND stats.max_option_price >= s.target_2_price THEN s.target_2_price
+        WHEN s.target_1_price IS NOT NULL AND stats.max_option_price >= s.target_1_price THEN s.target_1_price
+        ELSE stats.latest_option_price
+      END - s.primary_buy_entry_price
+    ) / NULLIF(s.primary_buy_entry_price, 0) * 100)::numeric, 2)
+    END AS latest_pnl_pct,
+    CASE
+        WHEN s.primary_buy_entry_price IS NULL OR stats.latest_option_price IS NULL THEN NULL
+    ELSE ROUND((
+      CASE
+        WHEN s.target_2_price IS NOT NULL AND stats.max_option_price >= s.target_2_price THEN s.target_2_price
+        WHEN s.target_1_price IS NOT NULL AND stats.max_option_price >= s.target_1_price THEN s.target_1_price
+        ELSE stats.latest_option_price
+      END - s.primary_buy_entry_price
+    )::numeric, 2)
+    END AS latest_pnl_points,
+    CASE
+        WHEN s.target_2_price IS NOT NULL AND stats.max_option_price >= s.target_2_price THEN 'TARGET_2_HIT'
+        WHEN s.target_1_price IS NOT NULL AND stats.max_option_price >= s.target_1_price THEN 'TARGET_1_HIT'
+        WHEN s.primary_buy_symbol IS NULL THEN COALESCE(s.no_trade_reason, 'NO_OPTION_SELECTED')
+        WHEN COALESCE(stats.snapshot_count, 0) = 0 THEN 'NO_NEXT_DAY_SNAPSHOT'
+        ELSE 'OPEN_OR_NOT_HIT'
+    END AS pnl_status
+FROM selected s
+LEFT JOIN LATERAL (
+    SELECT
+        MIN(os.snapshot_time) AS first_snapshot_time,
+        MAX(os.snapshot_time) AS last_snapshot_time,
+        MAX(os.last_price) AS max_option_price,
+        (ARRAY_AGG(os.last_price ORDER BY os.snapshot_time DESC))[1] AS latest_option_price,
+        COUNT(*) AS snapshot_count
+    FROM "OptionSnapshot" os
+    JOIN "OptionInstrument" oi ON oi.id = os.option_instrument_id
+    WHERE oi.instrument_token = s.primary_buy_token
+      AND os.trade_date = s.next_trade_date
+      AND os.last_price IS NOT NULL
+) stats ON true
+ORDER BY s.trade_date;
+"""
+
+
+def format_signal_row(row: dict[str, Any]) -> dict[str, Any]:
+    entry = as_float(row.get("primary_buy_entry_price"))
+    latest = as_float(row.get("latest_option_price"))
+    max_price = as_float(row.get("max_option_price"))
+    target_1 = as_float(row.get("target_1_price"))
+    target_2 = as_float(row.get("target_2_price"))
+
+    return {
+        "trade_date": fmt_date(row.get("trade_date")),
+        "next_trade_date": fmt_date(row.get("next_trade_date")),
+        "predicted_direction": row.get("direction") or row.get("final_prediction") or "",
+        "actual_trade_label": row.get("actual_trade_label") or "Pending",
+        "regime": row.get("regime") or "",
+        "prediction_strategy": row.get("prediction_strategy") or "",
+        "strength_score": fmt_number(row.get("strength_score")),
+        "confidence_level": fmt_pct(row.get("confidence_level")),
+        "option_selection": row.get("selected_strategy") or row.get("no_trade_reason") or "No selection",
+        "option_symbol": row.get("primary_buy_symbol") or "",
+        "option_type": row.get("primary_buy_option_type") or "",
+        "strike": fmt_number(row.get("primary_buy_strike")),
+        "expiry": fmt_date(row.get("primary_buy_expiry")),
+        "entry_price": fmt_money(entry),
+        "target_1": fmt_money(target_1),
+        "target_2": fmt_money(target_2),
+        "latest_price": fmt_money(latest),
+        "max_price": fmt_money(max_price),
+        "pnl_pct": fmt_pct(row.get("latest_pnl_pct")),
+        "pnl_points": fmt_money(row.get("latest_pnl_points")),
+        "pnl_status": row.get("pnl_status") or "",
+        "snapshot_count": int(row.get("snapshot_count") or 0),
+        "last_snapshot_time": fmt_datetime(row.get("last_snapshot_time")),
     }
-    if not path.exists():
-        return dashboard
 
-    df = pd.read_csv(path)
-    if df.empty:
-        return dashboard
 
-    dashboard["row_count"] = int(len(df))
-    dashboard["download_url"] = build_download_url(path)
-    preview_rows, preview_columns = read_csv_preview(path)
-    dashboard["preview_rows"] = preview_rows
-    dashboard["preview_columns"] = preview_columns
-
-    date_col = "date" if "date" in df.columns else None
-    if date_col:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.sort_values(date_col)
-
-    latest = df.iloc[-1].to_dict()
-    latest_fields = [
-        "date",
-        "aggregate_decision",
-        "underlying_raw_signal",
-        "underlying_direction",
-        "underlying_strength_score",
-        "underlying_confidence",
-        "detected_regime",
-        "actual_move",
-        "aggregate_decision_result",
-    ]
-    dashboard["latest"] = _pick_fields(latest, latest_fields)
-
-    result_cols = [c for c in df.columns if c.endswith("_result")]
-    correct = int((df[result_cols] == "CORRECT").sum().sum()) if result_cols else 0
-    wrong = int((df[result_cols] == "WRONG").sum().sum()) if result_cols else 0
-    total = correct + wrong
-    dashboard["summary"] = {
-        "rows": int(len(df)),
-        "result_columns": len(result_cols),
-        "correct": correct,
-        "wrong": wrong,
-        "accuracy_pct": round((correct / total) * 100, 2) if total else None,
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"June rows": 0, "Option selections": 0, "Target hits": 0, "Pending labels": 0}
+    return {
+        "June rows": len(rows),
+        "Option selections": sum(1 for row in rows if row["option_symbol"]),
+        "Target hits": sum(1 for row in rows if "TARGET" in row["pnl_status"]),
+        "Pending labels": sum(1 for row in rows if row["actual_trade_label"] == "Pending"),
     }
 
-    trend_fields = [
-        "date",
-        "aggregate_decision",
-        "underlying_raw_signal",
-        "underlying_direction",
-        "underlying_strength_score",
-        "detected_regime",
-        "actual_move",
-        "aggregate_decision_result",
-    ]
-    dashboard["trend_rows"] = [
-        _pick_fields(row, trend_fields)
-        for row in df.tail(10).fillna("").to_dict(orient="records")
-    ]
-    return dashboard
+
+def display_symbol(symbol: str, label: str | None = None) -> str:
+    if symbol == NIFTY_SYMBOL:
+        return NIFTY_DISPLAY
+    if label and label != symbol:
+        return f"{label} ({symbol})"
+    return symbol
 
 
-def _pick_fields(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for field in fields:
-        if field in row:
-            value = row[field]
-            if hasattr(value, "date"):
-                value = value.date().isoformat()
-            out[field] = json_safe(value)
-    return out
+def fmt_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value or "")
 
 
-def build_download_url(path: Path) -> str:
-    resolved = resolve_output_csv_path(str(path))
-    if resolved is None or not resolved.exists():
+def fmt_datetime(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value or "")
+
+
+def fmt_number(value: Any) -> str:
+    number = as_float(value)
+    if number is None:
         return ""
-    relative = resolved.relative_to(PROJECT_ROOT)
-    return url_for("download_csv", path=relative.as_posix())
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.2f}"
 
 
-def resolve_output_csv_path(value: str) -> Path | None:
-    if not value:
-        return None
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = PROJECT_ROOT / candidate
+def fmt_money(value: Any) -> str:
+    number = as_float(value)
+    return "" if number is None else f"{number:.2f}"
+
+
+def fmt_pct(value: Any) -> str:
+    number = as_float(value)
+    return "" if number is None else f"{number:.2f}%"
+
+
+def as_float(value: Any) -> float | None:
     try:
-        resolved = candidate.resolve()
-        output_root = (PROJECT_ROOT / "output").resolve()
-        if resolved == output_root or output_root not in resolved.parents:
+        if value is None or pd.isna(value):
             return None
-        return resolved
-    except OSError:
+        return float(value)
+    except (TypeError, ValueError):
         return None
-
-
-def extract_headline(result: dict[str, Any]) -> dict[str, Any]:
-    backtest = result.get("backtest") if isinstance(result.get("backtest"), dict) else result
-    summary = backtest.get("summary", {}) if isinstance(backtest, dict) else {}
-    keys = [
-        "days_backtested",
-        "actionable_predictions",
-        "approved_signals_backtested",
-        "profit_hits",
-        "stop_hits",
-        "accuracy_pct",
-        "profit_hit_rate_pct",
-        "recall_pct",
-    ]
-    return {key: summary[key] for key in keys if key in summary}
-
-
-def json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [json_safe(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    try:
-        if pd.isna(value):
-            return None
-    except TypeError:
-        pass
-    return value
 
 
 PAGE_TEMPLATE = r"""
-{% macro dashboard_panel(dashboard) -%}
-  <div class="dashboard">
-    <div class="dashboard-head">
-      <div>
-        <strong>NIFTY Data And Trends</strong>
-        <span>
-          {% if dashboard.has_file %}
-            Source: output/backtest/NIFTY/production/NIFTY_prediction.csv
-          {% else %}
-            No NIFTY historical output found yet.
-          {% endif %}
-        </span>
-      </div>
-      {% if dashboard.download_url %}
-        <a class="download-button" href="{{ dashboard.download_url }}">Download NIFTY CSV</a>
-      {% endif %}
-    </div>
-    {% if dashboard.has_file %}
-      <div class="metric-grid">
-        {% for key, value in dashboard.summary.items() %}
-          <div class="metric"><span>{{ key.replace('_', ' ') }}</span><strong>{{ value if value is not none else 'N/A' }}</strong></div>
-        {% endfor %}
-      </div>
-      {% if dashboard.latest %}
-        <div class="compact-panel">
-          <strong>Latest Signal</strong>
-          <div class="kv-grid">
-            {% for key, value in dashboard.latest.items() %}
-              <span>{{ key.replace('_', ' ') }}</span><b>{{ value }}</b>
-            {% endfor %}
-          </div>
-        </div>
-      {% endif %}
-      {% if dashboard.trend_rows %}
-        <div class="compact-panel">
-          <strong>Recent Trend Rows</strong>
-          <div class="table-wrap compact">
-            <table>
-              <thead>
-                <tr>{% for column in dashboard.trend_rows[0].keys() %}<th>{{ column.replace('_', ' ') }}</th>{% endfor %}</tr>
-              </thead>
-              <tbody>
-                {% for row in dashboard.trend_rows %}
-                  <tr>{% for value in row.values() %}<td>{{ value }}</td>{% endfor %}</tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      {% endif %}
-    {% else %}
-      <div class="notice">Run the NIFTY prediction or backtest to generate the dashboard CSV.</div>
-    {% endif %}
-  </div>
-{%- endmacro %}
-
-{% macro result_panel(headline, csv_rows, csv_columns, result, csv_download_url) -%}
-  {% set error_message = result.get('error') if result and result.get('error') else '' %}
-  {% if error_message %}
-    <div class="notice error">
-      <strong>Run failed.</strong><br>
-      {{ error_message }}
-    </div>
-  {% endif %}
-  {% if headline %}
-    <div class="metric-grid">
-      {% for key, value in headline.items() %}
-        <div class="metric"><span>{{ key.replace('_', ' ') }}</span><strong>{{ value }}</strong></div>
-      {% endfor %}
-    </div>
-  {% endif %}
-  {% if csv_rows and not error_message %}
-    <div class="result-toolbar">
-      <div>
-        <strong>CSV Preview</strong>
-        <span>Showing first 50 rows.</span>
-      </div>
-      {% if csv_download_url %}
-        <a class="download-button" href="{{ csv_download_url }}">Download CSV</a>
-      {% endif %}
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>{% for column in csv_columns %}<th>{{ column }}</th>{% endfor %}</tr>
-        </thead>
-        <tbody>
-          {% for row in csv_rows %}
-            <tr>{% for column in csv_columns %}<td>{{ row[column] }}</td>{% endfor %}</tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  {% elif result and not error_message %}
-    <div class="notice">No CSV preview available for this run.</div>
-  {% else %}
-    <div class="empty-state">
-      <div>
-        <strong>Ready when you are</strong>
-        <span>Run Predict or Backtest to fill this workspace with strategy output, metrics, and CSV rows.</span>
-      </div>
-    </div>
-  {% endif %}
-  {% if result %}
-    <details>
-      <summary>Raw result dictionary</summary>
-      <pre>{{ result | tojson(indent=2) }}</pre>
-    </details>
-  {% endif %}
-{%- endmacro %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -398,253 +297,123 @@ PAGE_TEMPLATE = r"""
   <title>Stockie26</title>
   <style>
     :root {
-      --bg: #f6f7f9;
+      --bg: #f7f8fa;
       --panel: #ffffff;
-      --text: #1e252f;
-      --muted: #697386;
+      --text: #1f2933;
+      --muted: #667085;
       --line: #d9dee7;
       --accent: #1f7a68;
       --accent-dark: #155a4d;
-      --warn: #a96012;
       --error: #b42318;
-      --shadow: 0 16px 40px rgba(32, 42, 57, 0.09);
+      --warn-bg: #fff8eb;
+      --shadow: 0 14px 34px rgba(32, 42, 57, 0.08);
     }
     * { box-sizing: border-box; }
-    html { min-height: 100%; }
     body {
       margin: 0;
       min-height: 100vh;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
-      background:
-        linear-gradient(180deg, rgba(31, 122, 104, 0.13), rgba(246, 247, 249, 0) 280px),
-        var(--bg);
+      background: linear-gradient(180deg, rgba(31, 122, 104, 0.12), rgba(247, 248, 250, 0) 260px), var(--bg);
     }
     header {
-      width: 100%;
       padding: 22px 32px 14px;
       display: flex;
       justify-content: space-between;
-      gap: 20px;
+      gap: 18px;
       align-items: end;
-      border-bottom: 1px solid rgba(217, 222, 231, 0.75);
-      background: rgba(255, 255, 255, 0.42);
+      border-bottom: 1px solid rgba(217, 222, 231, 0.8);
+      background: rgba(255, 255, 255, 0.5);
       backdrop-filter: blur(10px);
     }
-    h1 { margin: 0; font-size: 32px; letter-spacing: 0; line-height: 1.05; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.1; letter-spacing: 0; }
     .subtitle { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
-    main { width: 100%; padding: 20px 32px 32px; }
-    .tabs { display: flex; gap: 10px; margin: 0 0 16px; }
-    .tab {
-      padding: 11px 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      text-decoration: none;
-      background: rgba(255, 255, 255, 0.65);
-      font-weight: 650;
-      font-size: 14px;
-    }
-    .tab.active { color: var(--text); background: var(--panel); box-shadow: 0 8px 24px rgba(32, 42, 57, 0.08); }
+    main { padding: 20px 32px 32px; }
     .surface {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 10px;
       box-shadow: var(--shadow);
       overflow: hidden;
-      min-height: calc(100vh - 160px);
+      min-height: calc(100vh - 150px);
     }
-    .path { display: none; padding: 22px; }
-    .path.active { display: block; }
-    .grid {
-      display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
-      gap: 22px;
-      align-items: start;
-    }
-    form {
-      position: sticky;
-      top: 20px;
-      align-self: start;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 22px;
+    .toolbar {
+      padding: 18px 20px;
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: end;
+      border-bottom: 1px solid var(--line);
       background: #fbfcfe;
     }
-    .result-pane {
-      min-width: 0;
-      min-height: calc(100vh - 220px);
-    }
-    .section-title { margin: 0 0 8px; font-size: 22px; }
-    .hint { color: var(--muted); margin: 0 0 24px; font-size: 14px; line-height: 1.6; }
-    label { display: block; color: #334155; font-weight: 700; font-size: 13px; margin-bottom: 8px; }
-    select, input[type="date"], textarea {
+    .title h2 { margin: 0; font-size: 22px; letter-spacing: 0; }
+    .title p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+    form { min-width: 260px; }
+    label { display: block; color: #344054; font-weight: 700; font-size: 13px; margin-bottom: 7px; }
+    select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 7px;
-      padding: 13px 12px;
+      padding: 11px 12px;
       font: inherit;
       color: var(--text);
       background: #fff;
       outline: none;
     }
-    select:focus, input[type="date"]:focus, textarea:focus {
-      border-color: rgba(31, 122, 104, 0.55);
-      box-shadow: 0 0 0 3px rgba(31, 122, 104, 0.12);
-    }
-    textarea { min-height: 220px; resize: vertical; }
-    .field { margin-bottom: 18px; }
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
-    button {
-      border: 0;
-      border-radius: 7px;
-      padding: 12px 17px;
-      font: inherit;
-      font-weight: 750;
-      cursor: pointer;
-      background: var(--accent);
-      color: white;
-    }
-    button:hover { background: var(--accent-dark); }
-    button.secondary { background: #eef2f6; color: #263241; }
-    button:disabled { background: #cbd5e1; cursor: not-allowed; }
+    select:focus { border-color: rgba(31, 122, 104, 0.55); box-shadow: 0 0 0 3px rgba(31, 122, 104, 0.12); }
     .notice {
-      padding: 14px 16px;
+      margin: 16px 20px 0;
+      padding: 13px 15px;
       border-radius: 8px;
-      margin-bottom: 16px;
       border: 1px solid var(--line);
       background: #f8fafc;
-      color: #334155;
+      color: #344054;
+      font-size: 14px;
     }
     .notice.error { border-color: rgba(180, 35, 24, 0.25); background: #fff5f5; color: var(--error); }
-    .notice.success { border-color: rgba(31, 122, 104, 0.28); background: #f1fbf8; color: #145b4f; }
-    .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      background: #fbfcfe;
+    .notice.warn { background: var(--warn-bg); }
+    .metric-grid {
+      padding: 16px 20px 0;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
     }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; }
     .metric span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    .metric strong { font-size: 26px; }
-    .result-toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 12px;
-    }
-    .result-toolbar strong { display: block; font-size: 15px; }
-    .result-toolbar span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
-    .download-button {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 40px;
-      padding: 0 14px;
-      border-radius: 7px;
-      background: var(--accent);
-      color: #fff;
-      text-decoration: none;
-      font-weight: 750;
-      white-space: nowrap;
-    }
-    .download-button:hover { background: var(--accent-dark); }
+    .metric strong { font-size: 24px; }
     .table-wrap {
+      margin: 16px 20px 20px;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 8px;
-      max-height: calc(100vh - 300px);
-      min-height: 520px;
+      max-height: calc(100vh - 310px);
+      min-height: 480px;
       background: #fff;
     }
     table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 13px; }
     th, td { padding: 10px 12px; border-bottom: 1px solid #edf0f5; text-align: left; white-space: nowrap; }
-    th { position: sticky; top: 0; background: #f8fafc; z-index: 1; color: #475569; }
-    details { margin-top: 16px; }
-    pre {
-      overflow: auto;
-      padding: 14px;
-      border-radius: 8px;
-      background: #111827;
-      color: #e5e7eb;
-      font-size: 12px;
-      line-height: 1.5;
-      max-height: 360px;
-    }
-    .check { display: flex; align-items: center; gap: 8px; color: #334155; font-size: 14px; }
-    .readonly-symbol {
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      padding: 13px 12px;
-      background: #fff;
-      font-weight: 800;
-      letter-spacing: 0;
-    }
-    .dashboard {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 18px;
-      background: #fbfcfe;
-    }
-    .dashboard-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 14px;
-    }
-    .dashboard-head strong,
-    .compact-panel strong { display: block; font-size: 15px; margin-bottom: 3px; }
-    .dashboard-head span { color: var(--muted); font-size: 12px; }
-    .compact-panel {
-      border-top: 1px solid #edf0f5;
-      padding-top: 14px;
-      margin-top: 14px;
-    }
-    .kv-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 8px 16px;
-      font-size: 13px;
-    }
-    .kv-grid span { color: var(--muted); }
-    .kv-grid b { color: var(--text); font-weight: 750; }
-    .table-wrap.compact {
-      max-height: 260px;
-      min-height: 0;
-      margin-top: 10px;
-    }
+    th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; font-size: 12px; text-transform: uppercase; }
+    tbody tr:hover { background: #fbfcfe; }
     .empty-state {
-      min-height: calc(100vh - 220px);
+      margin: 16px 20px 20px;
+      min-height: 340px;
       display: grid;
       place-items: center;
       border: 1px dashed #cbd5e1;
       border-radius: 10px;
-      background:
-        linear-gradient(135deg, rgba(31, 122, 104, 0.08), rgba(255, 255, 255, 0.6)),
-        #fbfcfe;
-      color: #334155;
+      background: #fbfcfe;
+      color: #344054;
       text-align: center;
       padding: 32px;
     }
-    .empty-state strong { display: block; font-size: 22px; margin-bottom: 8px; }
+    .empty-state strong { display: block; font-size: 21px; margin-bottom: 8px; }
     .empty-state span { color: var(--muted); font-size: 14px; }
     @media (max-width: 900px) {
-      header { padding: 18px 16px 12px; }
+      header { padding: 18px 16px 12px; align-items: start; flex-direction: column; }
       main { padding: 16px; }
-      header { align-items: start; flex-direction: column; }
-      .grid { grid-template-columns: 1fr; }
-      form { position: static; }
-      .surface { min-height: auto; }
-      .result-pane { min-height: auto; }
-      .empty-state { min-height: 260px; }
-      .table-wrap { max-height: 520px; min-height: 260px; }
-      .result-toolbar { align-items: stretch; flex-direction: column; }
-      .download-button { width: 100%; }
-      .tabs { flex-wrap: wrap; }
-      .dashboard-head { align-items: stretch; flex-direction: column; }
+      .toolbar { align-items: stretch; flex-direction: column; }
+      form { min-width: 0; }
+      .table-wrap { min-height: 320px; max-height: 560px; }
     }
   </style>
 </head>
@@ -652,40 +421,106 @@ PAGE_TEMPLATE = r"""
   <header>
     <div>
       <h1>Stockie26</h1>
-      <p class="subtitle">NIFTY technical data, trend signals, and backtesting results.</p>
+      <p class="subtitle">Prediction accuracy, option selection, and June P&amp;L by signal date.</p>
     </div>
     <div class="subtitle">Today: {{ today }}</div>
   </header>
 
   <main>
-    {% if banner %}
-      <div class="notice {{ status }}">{{ banner }}</div>
-    {% endif %}
-    {% if load_error %}
-      <div class="notice error">Could not load watched instruments: {{ load_error }}</div>
-    {% endif %}
-
     <section class="surface">
-      <div class="path {{ 'active' if active_path == 'technical' else '' }}">
-        <div class="grid">
-          <form method="post">
-            <h2 class="section-title">NIFTY Technical Analysis</h2>
-            <p class="hint">This app is intentionally NIFTY-only. Predict runs the latest signal view; Backtest regenerates the legacy CSV backtest for NIFTY only.</p>
-            <div class="field">
-              <label>Underlying</label>
-              <div class="readonly-symbol">NIFTY</div>
-            </div>
-            <div class="actions">
-              <button type="submit" formaction="{{ url_for('technical_predict') }}">Predict</button>
-              <button type="submit" formaction="{{ url_for('technical_backtest') }}" class="secondary">Backtest</button>
-            </div>
-          </form>
-          <div class="result-pane">
-            {{ dashboard_panel(dashboard) }}
-            {{ result_panel(headline, csv_rows, csv_columns, result, csv_download_url) }}
+      <div class="toolbar">
+        <div class="title">
+          <h2>{{ selected_label }} June Signal Review</h2>
+          <p>Predicted direction, realized trade label, selected option, target plan, and option P&amp;L.</p>
+        </div>
+        <form method="get" action="/">
+          <label for="symbol">Stock</label>
+          <select id="symbol" name="symbol" onchange="this.form.submit()">
+            {% for stock in stocks %}
+              <option value="{{ stock.symbol }}" {{ 'selected' if stock.symbol == selected else '' }}>{{ stock.label }}</option>
+            {% endfor %}
+          </select>
+        </form>
+      </div>
+
+      {% if banner %}<div class="notice warn">{{ banner }}</div>{% endif %}
+      {% if load_error %}<div class="notice error">{{ load_error }}</div>{% endif %}
+
+      <div class="metric-grid">
+        {% for key, value in summary.items() %}
+          <div class="metric"><span>{{ key }}</span><strong>{{ value }}</strong></div>
+        {% endfor %}
+      </div>
+
+      {% if rows %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Signal date</th>
+                <th>Trade date</th>
+                <th>Predicted</th>
+                <th>Actual label</th>
+                <th>Regime</th>
+                <th>Prediction strategy</th>
+                <th>Strength</th>
+                <th>Confidence</th>
+                <th>Option selection</th>
+                <th>Option symbol</th>
+                <th>Type</th>
+                <th>Strike</th>
+                <th>Expiry</th>
+                <th>Entry</th>
+                <th>Target 1</th>
+                <th>Target 2</th>
+                <th>Latest</th>
+                <th>Max</th>
+                <th>P&amp;L %</th>
+                <th>P&amp;L points</th>
+                <th>Status</th>
+                <th>Snapshots</th>
+                <th>Last snapshot</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in rows %}
+                <tr>
+                  <td>{{ row.trade_date }}</td>
+                  <td>{{ row.next_trade_date }}</td>
+                  <td>{{ row.predicted_direction }}</td>
+                  <td>{{ row.actual_trade_label }}</td>
+                  <td>{{ row.regime }}</td>
+                  <td>{{ row.prediction_strategy }}</td>
+                  <td>{{ row.strength_score }}</td>
+                  <td>{{ row.confidence_level }}</td>
+                  <td>{{ row.option_selection }}</td>
+                  <td>{{ row.option_symbol }}</td>
+                  <td>{{ row.option_type }}</td>
+                  <td>{{ row.strike }}</td>
+                  <td>{{ row.expiry }}</td>
+                  <td>{{ row.entry_price }}</td>
+                  <td>{{ row.target_1 }}</td>
+                  <td>{{ row.target_2 }}</td>
+                  <td>{{ row.latest_price }}</td>
+                  <td>{{ row.max_price }}</td>
+                  <td>{{ row.pnl_pct }}</td>
+                  <td>{{ row.pnl_points }}</td>
+                  <td>{{ row.pnl_status }}</td>
+                  <td>{{ row.snapshot_count }}</td>
+                  <td>{{ row.last_snapshot_time }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state">
+          <div>
+            <strong>No June rows found</strong>
+            <span>Run the daily prediction and option-selection pipeline for NIFTY 50, then refresh this page.</span>
           </div>
         </div>
-      </div>
+      {% endif %}
     </section>
   </main>
 </body>

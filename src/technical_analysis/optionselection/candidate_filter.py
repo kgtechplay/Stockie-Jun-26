@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from .schema import OptionContract, OptionFeatures
 
-PREFERRED_LONG_MIN_DTE = 5
-PREFERRED_LONG_MAX_DTE = 21
+PREFERRED_LONG_MIN_DTE = 20
+PREFERRED_LONG_MAX_DTE = 60
 PREFERRED_SPREAD_MIN_DTE = 7
 PREFERRED_SPREAD_MAX_DTE = 30
 MAX_LONG_OPTION_SPREAD_PCT = 0.05
 MIN_LIQUIDITY_SCORE = 60
 MIN_SELL_LEG_LIQUIDITY_SCORE = 50
-LONG_OPTION_MIN_DELTA = 0.35
-LONG_OPTION_MAX_DELTA = 0.65
+LONG_CALL_MIN_DELTA = 0.70
+LONG_CALL_MAX_DELTA = 0.90
+LONG_PUT_MIN_DELTA = -0.90
+LONG_PUT_MAX_DELTA = -0.70
 SPREAD_BUY_LEG_MIN_DELTA = 0.45
 SPREAD_BUY_LEG_MAX_DELTA = 0.65
 SPREAD_SELL_LEG_MIN_DELTA = 0.20
@@ -25,7 +27,7 @@ def filter_long_call_candidates(
     return [
         contract
         for contract in contracts
-        if contract.option_type == "CE" and _long_candidate_ok(contract, features, signed_delta=True)
+        if contract.option_type == "CE" and _long_candidate_ok(contract, features)
     ]
 
 
@@ -36,7 +38,7 @@ def filter_long_put_candidates(
     return [
         contract
         for contract in contracts
-        if contract.option_type == "PE" and _long_candidate_ok(contract, features, signed_delta=False)
+        if contract.option_type == "PE" and _long_candidate_ok(contract, features)
     ]
 
 
@@ -91,15 +93,21 @@ def filter_spread_sell_leg_candidates(
 def _long_candidate_ok(
     contract: OptionContract,
     features: dict[str, OptionFeatures],
-    signed_delta: bool,
 ) -> bool:
     f = features.get(contract.tradingsymbol)
     if f is None or not f.is_tradeable:
         return False
-    delta = contract.delta if signed_delta else abs(contract.delta) if contract.delta is not None else None
+    delta = contract.delta
+    moneyness = f.moneyness_pct
+    if contract.option_type == "CE":
+        delta_ok = delta is not None and LONG_CALL_MIN_DELTA <= delta <= LONG_CALL_MAX_DELTA
+        itm_ok = moneyness is not None and moneyness < 0
+    else:
+        delta_ok = delta is not None and LONG_PUT_MIN_DELTA <= delta <= LONG_PUT_MAX_DELTA
+        itm_ok = moneyness is not None and moneyness > 0
     return (
-        delta is not None
-        and LONG_OPTION_MIN_DELTA <= delta <= LONG_OPTION_MAX_DELTA
+        delta_ok
+        and itm_ok
         and PREFERRED_LONG_MIN_DTE <= f.days_to_expiry <= PREFERRED_LONG_MAX_DTE
         and (f.spread_pct is None or f.spread_pct <= MAX_LONG_OPTION_SPREAD_PCT)
         and f.liquidity_score >= MIN_LIQUIDITY_SCORE

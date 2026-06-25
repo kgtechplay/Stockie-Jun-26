@@ -1,4 +1,4 @@
-﻿# scripts/build_trading_calendar.py
+﻿# scripts/legacy/build_trading_calendar.py
 """
 Populate dbo.TradingCalendar for NSE using the exchange_calendars library,
 which ships with the full NSE holiday schedule (proactive, not reactive).
@@ -15,8 +15,8 @@ Monthly expiry flag:
   - If last Thursday is a holiday, uses the preceding Thursday.
 
 Usage:
-    python scripts/build_trading_calendar.py
-    python scripts/build_trading_calendar.py --start 2025-01-01 --end 2026-12-31
+    python scripts/legacy/build_trading_calendar.py
+    python scripts/legacy/build_trading_calendar.py --start 2025-01-01 --end 2026-12-31
 """
 
 import sys
@@ -26,7 +26,7 @@ from typing import Set
 
 from dotenv import load_dotenv
 
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from src.common.config import get_settings

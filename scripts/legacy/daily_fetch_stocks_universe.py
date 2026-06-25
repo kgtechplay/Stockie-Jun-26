@@ -1,4 +1,4 @@
-# scripts/daily_fetch_stocks_universe.py
+# scripts/legacy/daily_fetch_stocks_universe.py
 """
 Build / refresh stocks_universe.csv from Kite + NSE constituent lists.
 
@@ -28,11 +28,11 @@ Run order each trading day:
   4. daily_market_refresh.py
 
 Usage:
-    python scripts/daily_fetch_stocks_universe.py              # NSE only (fast, ~30s)
-    python scripts/daily_fetch_stocks_universe.py --yfinance   # also enrich via Yahoo Finance
-    python scripts/daily_fetch_stocks_universe.py --fo-only
-    python scripts/daily_fetch_stocks_universe.py --output path/to/file.csv
-    python scripts/daily_fetch_stocks_universe.py --yf-delay 0.6
+    python scripts/legacy/daily_fetch_stocks_universe.py              # NSE only (fast, ~30s)
+    python scripts/legacy/daily_fetch_stocks_universe.py --yfinance   # also enrich via Yahoo Finance
+    python scripts/legacy/daily_fetch_stocks_universe.py --fo-only
+    python scripts/legacy/daily_fetch_stocks_universe.py --output path/to/file.csv
+    python scripts/legacy/daily_fetch_stocks_universe.py --yf-delay 0.6
 """
 
 from __future__ import annotations
