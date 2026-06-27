@@ -13,6 +13,8 @@ Active NIFTY pipeline scripts are split into daily jobs, backfill jobs, and shar
   - `python scripts/daily_NIFTY/daily_optionInstrument_refresh.py --underlying NIFTY`
 - `daily_NIFTY/daily_NIFTYoption_snapshot.py` - fetch live NIFTY option snapshots and calculate greeks.
   - `python scripts/daily_NIFTY/daily_NIFTYoption_snapshot.py`
+- `daily_NIFTY/daily_NIFTYoption_OHLC.py` - fetch live Kite quote OHLC for active NIFTY options into `OptionOhlc` after market close.
+  - `python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY`
 - `daily_NIFTY/daily_news_sentiment.py` - generate pre-market news sentiment for research and persist article/market sentiment rows. Not consumed by production prediction yet.
   - `python scripts/daily_NIFTY/daily_news_sentiment.py --sector-classifier keyword`
 - `daily_NIFTY/daily_nifty_prediction.py` - run the production cascade prediction and persist `NiftyPrediction` rows.
@@ -31,6 +33,8 @@ Active NIFTY pipeline scripts are split into daily jobs, backfill jobs, and shar
   - `python scripts/backfill_NIFTY/backfill_underlying.py --underlying NIFTY --start 2026-01-01 --end 2026-06-16`
 - `backfill_NIFTY/backfill_NIFTYoptions_from_historical.py` - backfill NIFTY option snapshots from Kite historical candles and calculate greeks.
   - `python scripts/backfill_NIFTY/backfill_NIFTYoptions_from_historical.py --underlying NIFTY --start 2026-01-01 --end 2026-06-16`
+- `backfill_NIFTY/backfill_NIFTYoptions_OHLC.py` - backfill daily-grain NIFTY option OHLC into `OptionOhlc` from Kite historical daily candles.
+  - `python scripts/backfill_NIFTY/backfill_NIFTYoptions_OHLC.py --from-date 2026-04-01 --to-date 2026-06-26 --underlying NIFTY`
 - `backfill_NIFTY/backfill_nifty_volume.py` - backfill NIFTY near-month futures volume from NSE FO bhavcopy into `UnderlyingSnapshot` and recompute `SignalFeatureDaily` volume windows.
   - `python scripts/backfill_NIFTY/backfill_nifty_volume.py --start 2026-01-01 --end 2026-06-17`
 - `backfill_NIFTY/backfill_india_vix.py` - backfill India VIX into `MacroFactorDaily`.
@@ -53,3 +57,18 @@ Active NIFTY pipeline scripts are split into daily jobs, backfill jobs, and shar
 ## Legacy
 
 `legacy/` contains setup, broader-universe, and ad-hoc utilities. It is not required for the NIFTY production cron pipeline.
+
+## Render Cron Notes
+
+Render runs from the repository root on Linux, so script paths and casing must
+match exactly. Use these commands for cron jobs:
+
+```bash
+python scripts/Common/load_daily_index_data.py --no-local-output
+python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY
+```
+
+For the option OHLC daily job, schedule around 15:40 to 15:45 IST after market
+close, which is 10:10 to 10:15 UTC on Render. Required environment variables
+are `DATABASE_PROVIDER`, `SUPABASE_CONN_STR`, `KITE_API_KEY`,
+`KITE_API_SECRET`, and a valid Kite access token source.

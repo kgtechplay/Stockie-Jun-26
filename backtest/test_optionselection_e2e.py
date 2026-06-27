@@ -14,7 +14,8 @@ write output/backtest/NIFTY/production/NIFTY_optionSelection.csv:
 P&L methodology:
     - as_of_time = signal_date 15:15:00 (EOD chain used for option selection)
     - Entry price = first OptionSnapshot price on the NEXT trading day
-    - Exit scan = subsequent intraday snapshots; exit when +2% profit OR -1% stop loss
+    - Optional premium-gap filter compares next-day entry vs signal-time reference
+    - Targets are calculated from actual next-day entry price
     - Entry/exit uses the primary BUY leg of the selected strategy
     - Rows with is_option_eligible=False skip option selection (tagged NO_TRADE)
 """
@@ -257,6 +258,7 @@ DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "production" / "NIFTY_o
 
 _PROFIT_TARGET_PCT = 0.02
 _PNL_SCAN_DAYS = 5
+_DEFAULT_MAX_PREMIUM_GAP_PCT = 0.10
 
 
 def _f(val: Any) -> float | None:
@@ -434,17 +436,37 @@ def _fetch_option_snapshots_for_dates(
 
 
 def _calculate_pnl(all_snaps: pd.DataFrame, next_day: date) -> dict[str, Any]:
+    return _calculate_pnl_with_execution_rule(all_snaps, next_day)
+
+
+def _calculate_pnl_with_execution_rule(
+    all_snaps: pd.DataFrame,
+    next_day: date,
+    signal_entry_ref: float | None = None,
+    max_premium_gap_pct: float | None = None,
+    target_pct: float = _PROFIT_TARGET_PCT,
+    gap_action: str = "skip",
+) -> dict[str, Any]:
     """
-    Entry  = first snapshot on next_day (open proxy).
-    Exit   = last  snapshot on next_day (EOD close proxy).
-    P&L    = exit − entry.
-    5d scan: first time across all_snaps where price >= entry * 1.02.
+    Entry = first snapshot on next_day (open proxy) unless a premium-gap rule is
+    configured. If the open premium is above signal_ref * (1 + max_gap):
+      - gap_action=skip: no trade.
+      - gap_action=limit: scan next_day for the first snapshot at/below the max
+        allowed entry and use that snapshot as entry.
+    Exit = first target hit after entry on next_day, otherwise next_day close.
     """
     empty: dict[str, Any] = {
         "entry_price": None, "entry_time": None,
         "exit_price": None, "exit_time": None,
         "lot_size": None, "pnl_per_unit": None, "pnl_per_lot": None,
         "return_pct": None, "option_result": None,
+        "target_pct": target_pct,
+        "target_price": None,
+        "target_hit_time": None,
+        "exit_reason": None,
+        "premium_gap_pct": None,
+        "premium_gap_allowed": None,
+        "entry_skip_reason": None,
         "first_2pct_profit_datetime": None,
     }
     if all_snaps.empty:
@@ -458,8 +480,48 @@ def _calculate_pnl(all_snaps: pd.DataFrame, next_day: date) -> dict[str, Any]:
     if next_day_snaps.empty:
         return empty
 
-    entry_row = next_day_snaps.iloc[0]
-    exit_row = next_day_snaps.iloc[-1]
+    open_row = next_day_snaps.iloc[0]
+    open_price = float(open_row["option_price"])
+    entry_row = open_row
+
+    premium_gap_pct: float | None = None
+    premium_gap_allowed: bool | None = None
+    max_allowed_entry: float | None = None
+    if signal_entry_ref is not None and signal_entry_ref > 0 and max_premium_gap_pct is not None:
+        premium_gap_pct = (open_price - signal_entry_ref) / signal_entry_ref
+        max_allowed_entry = signal_entry_ref * (1 + max_premium_gap_pct)
+        premium_gap_allowed = premium_gap_pct <= max_premium_gap_pct
+        if not premium_gap_allowed:
+            if gap_action == "skip":
+                empty.update({
+                    "entry_time": str(open_row["snapshot_time"])[:19],
+                    "entry_price": round(open_price, 2),
+                    "premium_gap_pct": round(premium_gap_pct * 100, 2),
+                    "premium_gap_allowed": False,
+                    "entry_skip_reason": (
+                        f"Open premium gap {premium_gap_pct:.2%} exceeded "
+                        f"max {max_premium_gap_pct:.2%}"
+                    ),
+                    "option_result": "SKIPPED",
+                })
+                return empty
+            if gap_action == "limit":
+                fillable = next_day_snaps[next_day_snaps["option_price"].astype(float) <= max_allowed_entry]
+                if fillable.empty:
+                    empty.update({
+                        "entry_time": str(open_row["snapshot_time"])[:19],
+                        "entry_price": round(open_price, 2),
+                        "premium_gap_pct": round(premium_gap_pct * 100, 2),
+                        "premium_gap_allowed": False,
+                        "entry_skip_reason": (
+                            f"Limit {max_allowed_entry:.2f} not reached after "
+                            f"open gap {premium_gap_pct:.2%}"
+                        ),
+                        "option_result": "SKIPPED",
+                    })
+                    return empty
+                entry_row = fillable.iloc[0]
+
     entry_price = float(entry_row["option_price"])
     if entry_price <= 0:
         return empty
@@ -467,18 +529,23 @@ def _calculate_pnl(all_snaps: pd.DataFrame, next_day: date) -> dict[str, Any]:
     lot_size_raw = entry_row.get("lot_size")
     lot_size = int(lot_size_raw) if lot_size_raw is not None and not pd.isna(lot_size_raw) else None
 
+    entry_time = entry_row["snapshot_time"]
+    post_entry_snaps = next_day_snaps[next_day_snaps["snapshot_time"] >= entry_time]
+    target_price = entry_price * (1 + target_pct)
+    target_hits = post_entry_snaps[post_entry_snaps["option_price"].astype(float) >= target_price]
+    if not target_hits.empty:
+        exit_row = target_hits.iloc[0]
+        exit_reason = "TARGET_HIT"
+        target_hit_time = str(exit_row["snapshot_time"])[:19]
+    else:
+        exit_row = post_entry_snaps.iloc[-1]
+        exit_reason = "EOD_MARK"
+        target_hit_time = None
+
     exit_price = float(exit_row["option_price"])
     pnl_per_unit = exit_price - entry_price
     pnl_per_lot = pnl_per_unit * lot_size if lot_size else None
     return_pct = pnl_per_unit / entry_price
-
-    # 5-day scan for first 2% profit
-    profit_target = entry_price * (1 + _PROFIT_TARGET_PCT)
-    first_2pct: str | None = None
-    for _, row in all_snaps.iterrows():
-        if float(row["option_price"]) >= profit_target:
-            first_2pct = str(row["snapshot_time"])[:19]
-            break
 
     return {
         "entry_time": str(entry_row["snapshot_time"])[:19],
@@ -490,7 +557,14 @@ def _calculate_pnl(all_snaps: pd.DataFrame, next_day: date) -> dict[str, Any]:
         "pnl_per_lot": round(pnl_per_lot, 2) if pnl_per_lot is not None else None,
         "return_pct": round(return_pct * 100, 2),
         "option_result": "PROFIT" if pnl_per_unit > 0 else ("LOSS" if pnl_per_unit < 0 else "BREAKEVEN"),
-        "first_2pct_profit_datetime": first_2pct,
+        "target_pct": target_pct,
+        "target_price": round(target_price, 2),
+        "target_hit_time": target_hit_time,
+        "exit_reason": exit_reason,
+        "premium_gap_pct": round(premium_gap_pct * 100, 2) if premium_gap_pct is not None else None,
+        "premium_gap_allowed": premium_gap_allowed,
+        "entry_skip_reason": None,
+        "first_2pct_profit_datetime": target_hit_time if abs(target_pct - 0.02) < 1e-9 else None,
     }
 
 
@@ -537,6 +611,9 @@ def generate_option_selection_csv(
     underlying: str = "NIFTY",
     prediction_source: str = "csv",
     model_version: str = "cascade_v1",
+    max_premium_gap_pct: float | None = _DEFAULT_MAX_PREMIUM_GAP_PCT,
+    gap_action: str = "skip",
+    target_pct: float = _PROFIT_TARGET_PCT,
 ) -> dict[str, Any]:
     settings = get_settings()
     db = get_database_client(settings)
@@ -606,6 +683,9 @@ def generate_option_selection_csv(
                     "exit_time": None, "exit_price": None,
                     "lot_size": None, "pnl_per_unit": None, "pnl_per_lot": None,
                     "return_pct": None, "option_result": None,
+                    "target_pct": target_pct, "target_price": None, "target_hit_time": None,
+                    "exit_reason": None, "premium_gap_pct": None,
+                    "premium_gap_allowed": None, "entry_skip_reason": None,
                     "first_2pct_profit_datetime": None,
                 })
                 output_rows.append(base)
@@ -653,6 +733,9 @@ def generate_option_selection_csv(
                 "exit_time": None, "exit_price": None,
                 "lot_size": None, "pnl_per_unit": None, "pnl_per_lot": None,
                 "return_pct": None, "option_result": None,
+                "target_pct": target_pct, "target_price": None, "target_hit_time": None,
+                "exit_reason": None, "premium_gap_pct": None,
+                "premium_gap_allowed": None, "entry_skip_reason": None,
                 "first_2pct_profit_datetime": None,
             }
             buy_token = flat.get("primary_buy_token")
@@ -663,7 +746,14 @@ def generate_option_selection_csv(
                     pnl["next_trading_day"] = str(next_day) if next_day else None
                     if next_day and trading_days:
                         snaps = _fetch_option_snapshots_for_dates(db.conn, int(buy_token), trading_days)
-                        pnl.update(_calculate_pnl(snaps, next_day))
+                        pnl.update(_calculate_pnl_with_execution_rule(
+                            snaps,
+                            next_day,
+                            signal_entry_ref=_f(flat.get("primary_buy_entry_price_signal")),
+                            max_premium_gap_pct=max_premium_gap_pct,
+                            target_pct=target_pct,
+                            gap_action=gap_action,
+                        ))
                 except Exception as exc:
                     print(f"  {signal_date_str}: P&L scan failed — {exc}")
 
@@ -671,8 +761,13 @@ def generate_option_selection_csv(
             base.update(pnl)
             output_rows.append(base)
             strategy = flat.get("selected_strategy", "NO_TRADE")
-            target_hit = pnl.get("first_2pct_profit_datetime") or ""
-            print(f"  {signal_date_str}: {strategy} — pnl={pnl.get('pnl_per_unit')!s:>8}  2%@{target_hit or 'N/A'}")
+            target_hit = pnl.get("target_hit_time") or ""
+            skip = pnl.get("entry_skip_reason") or ""
+            print(
+                f"  {signal_date_str}: {strategy} — pnl={pnl.get('pnl_per_unit')!s:>8}  "
+                f"target@{target_hit or 'N/A'}"
+                + (f"  SKIP: {skip}" if skip else "")
+            )
 
     finally:
         db.close()
@@ -719,6 +814,29 @@ def main() -> None:
         "--model-version", default="cascade_v1",
         help="NiftyPrediction model_version when --prediction-source=db. Default: cascade_v1",
     )
+    parser.add_argument(
+        "--max-premium-gap-pct",
+        type=float,
+        default=_DEFAULT_MAX_PREMIUM_GAP_PCT,
+        help="Skip/limit entries when next-day open premium exceeds signal reference by this decimal pct. Default: 0.10",
+    )
+    parser.add_argument(
+        "--no-premium-gap-filter",
+        action="store_true",
+        help="Disable the premium-gap entry filter.",
+    )
+    parser.add_argument(
+        "--gap-action",
+        choices=("skip", "limit"),
+        default="skip",
+        help="When premium gap is too high: skip the trade or wait for a limit fill. Default: skip",
+    )
+    parser.add_argument(
+        "--target-pct",
+        type=float,
+        default=_PROFIT_TARGET_PCT,
+        help="Profit target as decimal, calculated from actual entry price. Default: 0.02",
+    )
     args = parser.parse_args()
 
     result = generate_option_selection_csv(
@@ -727,6 +845,9 @@ def main() -> None:
         underlying=args.underlying.upper(),
         prediction_source=args.prediction_source,
         model_version=args.model_version,
+        max_premium_gap_pct=None if args.no_premium_gap_filter else args.max_premium_gap_pct,
+        gap_action=args.gap_action,
+        target_pct=args.target_pct,
     )
     print(result)
 

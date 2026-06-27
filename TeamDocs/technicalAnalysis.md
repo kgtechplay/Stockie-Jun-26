@@ -8,6 +8,8 @@ Current scope: DB-backed NIFTY direction prediction, followed by DB-backed optio
 UnderlyingSnapshot + MacroFactorDaily + GlobalIndexOhlc
   -> scripts/Common/calculate_underlying_features.py
   -> SignalFeatureDaily
+OptionInstrument + OptionSnapshot + OptionSnapshotCalc
+OptionInstrument + OptionOhlc
   -> src/technical_analysis/cascade
   -> NiftyPrediction
   -> src/technical_analysis/optionselection
@@ -21,7 +23,10 @@ Cron wrapper:
 python scripts/daily_NIFTY/daily_nifty_signal.py --model-version cascade_v1
 ```
 
-It assumes market refresh, global index refresh, option instrument refresh, and option snapshot/Greek calculation have already completed.
+It assumes market refresh, global index refresh, option instrument refresh, and
+option snapshot/Greek calculation have already completed. `OptionOhlc` is a
+separate daily-grain option OHLC store for research and diagnostics; it does not
+replace `OptionSnapshot` or `OptionSnapshotCalc` in production option selection.
 
 ## Prediction Layer
 
@@ -70,6 +75,34 @@ python scripts/daily_NIFTY/daily_option_selection.py --trade-date 2026-06-25 --m
 ```
 
 The persisted row includes the selected buy-leg token/symbol, entry reference, two target prices, and optional stop-loss fields. Stop loss is disabled unless `--stop-loss-pct` is supplied.
+
+## Option OHLC
+
+Daily option OHLC is stored in `OptionOhlc`, separate from snapshot and Greek
+tables. Use it when daily candle context is enough; use `OptionSnapshot` and
+`OptionSnapshotCalc` when bid/ask spread, intraday labels, or IV/Greeks are
+required.
+
+Historical daily option OHLC backfill:
+
+```powershell
+python scripts/backfill_NIFTY/backfill_NIFTYoptions_OHLC.py --from-date 2026-04-01 --to-date 2026-06-26 --underlying NIFTY
+```
+
+Daily live quote OHLC capture, intended for cron after market close:
+
+```powershell
+python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY
+```
+
+Recommended schedule for the daily job is after NSE close, around 15:40 to
+15:45 IST. On Render cron, that is 10:10 to 10:15 UTC. Kite access token refresh
+must run earlier in the day.
+
+Kite historical option OHLC is not guaranteed for expired contracts. During the
+April-June 2026 backfill, Kite returned usable daily OHLC only for a subset of
+June dates/contracts, while many expired option tokens returned no candles or
+`invalid token`.
 
 ## Flask Dashboard
 

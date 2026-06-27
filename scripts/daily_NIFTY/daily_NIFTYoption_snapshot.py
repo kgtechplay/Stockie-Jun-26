@@ -55,7 +55,9 @@ load_dotenv(project_root / ".env")
 
 IST = ZoneInfo("Asia/Kolkata")
 DATA_SOURCE = "KITE_QUOTE_LIVE"
-DEFAULT_SCHEDULE_TOLERANCE_SECONDS = 120
+DEFAULT_SCHEDULE_TOLERANCE_SECONDS = 300
+SNAPSHOT_LABEL_MODE_SCHEDULED = "scheduled"
+SNAPSHOT_LABEL_MODE_5M = "m5"
 
 SCHEDULED_SNAPSHOTS = {
     "OPEN_0915": time(9, 15),
@@ -80,15 +82,27 @@ def seconds_from_clock_time(value: datetime, target: time) -> int:
     return int((value - target_dt).total_seconds())
 
 
+def five_minute_snapshot_label(snapshot_time: datetime) -> str:
+    """Map a capture timestamp to the stable 5-minute bucket it belongs to."""
+    slot_minute = snapshot_time.minute - (snapshot_time.minute % 5)
+    slot_time = snapshot_time.replace(minute=slot_minute, second=0, microsecond=0)
+    for scheduled_label, scheduled_time in SCHEDULED_SNAPSHOTS.items():
+        if slot_time.time() == scheduled_time:
+            return scheduled_label
+    return f"M5_{slot_time:%H%M}"
+
+
 def resolve_scheduled_snapshot_label(
     snapshot_time: datetime,
     explicit_label: str | None = None,
     schedule_tolerance_seconds: int | None = DEFAULT_SCHEDULE_TOLERANCE_SECONDS,
     allow_outside_window: bool = False,
+    snapshot_label_mode: str = SNAPSHOT_LABEL_MODE_SCHEDULED,
 ) -> tuple[str, str, int, bool]:
     """
     Pick the snapshot label for a scheduler run.
 
+    In 5-minute mode, use a stable M5_HHMM label based on the current IST slot.
     If the run is inside a configured schedule window, use that scheduled label.
     If it fires outside the window, write an ad-hoc LIVE_HHMM label instead of
     failing or polluting the scheduled OPEN_0915/CLOSE_1515 rows.
@@ -98,6 +112,8 @@ def resolve_scheduled_snapshot_label(
         if target is None:
             return explicit_label, "", 0, True
         label = explicit_label
+    elif snapshot_label_mode == SNAPSHOT_LABEL_MODE_5M:
+        return five_minute_snapshot_label(snapshot_time), "5m", 0, True
     else:
         label, target = min(
             SCHEDULED_SNAPSHOTS.items(),
@@ -763,8 +779,10 @@ def capture_all_option_instruments_snapshot(
     debug_missing_quotes: bool = False,
     schedule_tolerance_seconds: int | None = DEFAULT_SCHEDULE_TOLERANCE_SECONDS,
     allow_outside_window: bool = False,
+    snapshot_label_mode: str = SNAPSHOT_LABEL_MODE_SCHEDULED,
 ) -> dict[str, Any]:
     underlying = underlying.upper()
+    manual_snapshot_label = snapshot_label is not None
     run_started_at = now_ist_naive()
     resolved_label, scheduled_target_time, schedule_delta_seconds, within_schedule_tolerance = (
         resolve_scheduled_snapshot_label(
@@ -772,6 +790,7 @@ def capture_all_option_instruments_snapshot(
             explicit_label=snapshot_label,
             schedule_tolerance_seconds=schedule_tolerance_seconds,
             allow_outside_window=allow_outside_window,
+            snapshot_label_mode=snapshot_label_mode,
         )
     )
     snapshot_label = resolved_label
@@ -820,13 +839,24 @@ def capture_all_option_instruments_snapshot(
             )
 
         snapshot_time = now_ist_naive()
-        if snapshot_label in SCHEDULED_SNAPSHOTS:
+        if snapshot_label_mode == SNAPSHOT_LABEL_MODE_5M and not manual_snapshot_label:
+            snapshot_label, scheduled_target_time, schedule_delta_seconds, within_schedule_tolerance = (
+                resolve_scheduled_snapshot_label(
+                    snapshot_time=snapshot_time,
+                    explicit_label=None,
+                    schedule_tolerance_seconds=schedule_tolerance_seconds,
+                    allow_outside_window=allow_outside_window,
+                    snapshot_label_mode=snapshot_label_mode,
+                )
+            )
+        elif snapshot_label in SCHEDULED_SNAPSHOTS:
             snapshot_label, scheduled_target_time, schedule_delta_seconds, within_schedule_tolerance = (
                 resolve_scheduled_snapshot_label(
                     snapshot_time=snapshot_time,
                     explicit_label=snapshot_label,
                     schedule_tolerance_seconds=schedule_tolerance_seconds,
                     allow_outside_window=allow_outside_window,
+                    snapshot_label_mode=snapshot_label_mode,
                 )
             )
         spot = get_spot_quote(kite_client, underlying, spot_key)
@@ -904,6 +934,7 @@ def capture_all_option_instruments_snapshot(
         "scheduled_target_time_ist": scheduled_target_time,
         "schedule_delta_seconds": schedule_delta_seconds,
         "within_schedule_tolerance": within_schedule_tolerance,
+        "snapshot_label_mode": snapshot_label_mode,
         "spot": spot,
         "mode": "ALL_LIVE_OPTION_INSTRUMENTS_NO_CHAIN_SELECTION",
         "option_type": option_type or "CE + PE",
@@ -942,8 +973,14 @@ def main() -> None:
         default=None,
         help=(
             "Optional manual snapshot label. If omitted, the script infers the "
-            "nearest IST schedule label: OPEN_0915 or CLOSE_1515."
+            "label from --snapshot-label-mode."
         ),
+    )
+    parser.add_argument(
+        "--snapshot-label-mode",
+        choices=(SNAPSHOT_LABEL_MODE_SCHEDULED, SNAPSHOT_LABEL_MODE_5M),
+        default=SNAPSHOT_LABEL_MODE_SCHEDULED,
+        help="scheduled keeps OPEN_0915/CLOSE_1515 behavior; m5 writes stable M5_HHMM labels for 5-minute cron runs.",
     )
 
     parser.add_argument("--underlying", default="NIFTY", help="Underlying symbol. Default: NIFTY")
@@ -983,7 +1020,7 @@ def main() -> None:
         default=DEFAULT_SCHEDULE_TOLERANCE_SECONDS,
         help=(
             "Maximum seconds away from the scheduled IST time before the run is "
-            "rejected. Default: 120. Use a negative value to disable validation."
+            "rejected. Default: 300. Use a negative value to disable validation."
         ),
     )
     parser.add_argument(
@@ -1015,6 +1052,7 @@ def main() -> None:
         debug_missing_quotes=args.debug_missing_quotes,
         schedule_tolerance_seconds=schedule_tolerance_seconds,
         allow_outside_window=args.allow_outside_window,
+        snapshot_label_mode=args.snapshot_label_mode,
     )
 
 

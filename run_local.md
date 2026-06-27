@@ -9,7 +9,7 @@ are developer artifacts only and are ignored by git.
 - `.env` present at repo root.
 - Supabase reachable through `SUPABASE_CONN_STR`.
 - Kite access token refreshed for the trading day if running market or option
-  snapshot jobs.
+  snapshot/OHLC jobs.
 
 Required production environment variables:
 
@@ -29,6 +29,7 @@ python scripts/daily_NIFTY/daily_market_refresh.py --underlying NIFTY
 python scripts/Common/load_daily_index_data.py --no-local-output
 python scripts/daily_NIFTY/daily_optionInstrument_refresh.py --underlying NIFTY
 python scripts/daily_NIFTY/daily_NIFTYoption_snapshot.py
+python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY
 ```
 
 If the option snapshot job did not calculate IV/Greeks in the deployed flow,
@@ -76,6 +77,30 @@ Option selection only:
 python scripts/daily_NIFTY/daily_option_selection.py --trade-date 2026-06-25 --model-version cascade_v1
 ```
 
+Option daily OHLC only:
+
+```powershell
+python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY
+```
+
+Historical option daily OHLC backfill:
+
+```powershell
+python scripts/backfill_NIFTY/backfill_NIFTYoptions_OHLC.py --from-date 2026-04-01 --to-date 2026-06-26 --underlying NIFTY
+```
+
+`OptionOhlc` is intentionally separate from `OptionSnapshot` and
+`OptionSnapshotCalc`. Historical option OHLC depends on what Kite returns for
+expired option tokens; missing older contracts can be a Kite availability limit,
+not necessarily a database issue.
+
+Render cron commands must use repository-relative paths exactly:
+
+```bash
+python scripts/Common/load_daily_index_data.py --no-local-output
+python scripts/daily_NIFTY/daily_NIFTYoption_OHLC.py --underlying NIFTY
+```
+
 News sentiment is intentionally not wired into production NIFTY prediction yet.
 Run it only for research or if a separate cron needs to maintain sentiment data:
 
@@ -113,4 +138,5 @@ Stop-Process -Id <PID> -Force
 
 Missing option selection usually means one of these is absent for the signal
 date: `NiftyPrediction`, `OptionInstrument`, `OptionSnapshot`, or
-`OptionSnapshotCalc`.
+`OptionSnapshotCalc`. Missing daily OHLC rows live in `OptionOhlc` and do not by
+themselves block production option selection.

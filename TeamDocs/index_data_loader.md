@@ -77,6 +77,10 @@ Run from Render without local CSV output:
 python scripts/Common/load_daily_index_data.py --no-local-output
 ```
 
+Do not shorten the Render command to `python load_daily_index_data.py`; the file
+lives under `scripts/Common/`, and Render runs from the repository root on a
+case-sensitive Linux filesystem.
+
 ## Recommended Cron Schedule (IST)
 
 Run multiple times per day so each region has time to settle:

@@ -39,6 +39,10 @@ Run the test/backtest surface:
 python backtest/test_optionselection_e2e.py --prediction-source db --model-version cascade_v1
 ```
 
+For daily-grain option OHLC, use `OptionOhlc` instead of adding rows to
+`OptionSnapshot`. The OHLC table is populated by the historical and daily option
+OHLC scripts and is separate from IV/Greek calculations.
+
 Current production option-selection rules choose long ITM calls/puts only:
 
 - Bullish CALL: ITM CE, delta 0.70 to 0.90, 20 to 60 DTE.

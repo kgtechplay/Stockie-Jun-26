@@ -13,6 +13,7 @@ Current DB-backed NIFTY pipeline tables.
 | `OptionInstrument` | NIFTY option contract master rows from Kite instruments. |
 | `OptionSnapshot` | Raw option quote/candle snapshots by contract and snapshot label. |
 | `OptionSnapshotCalc` | IV and Greeks calculated from option snapshots. |
+| `OptionOhlc` | Daily-grain option OHLC rows, kept separate from quote snapshots and Greeks. |
 | `NiftyPrediction` | Production cascade predictions keyed by symbol, trade date, and model version. |
 | `NiftyOptionSelection` | Persisted option selection and trade-plan levels for each prediction row. |
 | `NewsArticle` | Raw news articles for sentiment research. |
@@ -47,6 +48,27 @@ target_2_price, stop_loss_enabled, stop_loss_pct, stop_loss_price
 The runtime Supabase client defensively creates or upgrades these production
 tables, but migration files under `src/data_manager/db/migrations/` remain the
 reproducible schema contract.
+
+`OptionOhlc` stores option daily OHLC data independently from `OptionSnapshot`
+and `OptionSnapshotCalc`. It is keyed by option instrument, trade date, candle
+interval, and data source so historical daily candles and live quote OHLC can
+coexist without overwriting snapshot rows:
+
+```text
+option_instrument_id, underlying, trade_date, candle_time, candle_interval,
+open_price, high_price, low_price, close_price, volume, open_interest,
+last_price, exchange_timestamp, data_source, loaded_at
+```
+
+Current sources:
+
+- `KITE_HISTORICAL_DAY_OHLC` from Kite historical daily candles.
+- `KITE_QUOTE_LIVE_OHLC` from live Kite quote OHLC for the current trading day.
+
+Historical Kite option OHLC availability is limited for expired contracts. In
+the June 2026 load, Kite returned rows only for a subset of active/near-active
+contracts, so `OptionOhlc` should be treated as a best-available daily OHLC
+store rather than a complete historical option universe.
 
 ## Research Tables
 
