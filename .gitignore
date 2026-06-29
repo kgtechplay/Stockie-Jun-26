@@ -13,6 +13,7 @@ env/
 build/
 dist/
 *.egg-info/
+models/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -29,6 +30,7 @@ kite_access_token.json
 # Runtime / generated data
 # =========================
 .claude/
+output/
 tmp/
 temp/
 *.tmp

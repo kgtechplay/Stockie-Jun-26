@@ -12,7 +12,7 @@ This version intentionally removes selected-chain logic:
 It:
   - reads option contracts from dbo.OptionInstrument
   - filters only by underlying, option type, expiry >= trade_date, and optional CLI filters
-  - fetches only the 09:15 and 15:10 5-minute candles
+    - fetches scheduled snapshots by default, or every 5-minute candle with --snapshot-label-mode m5
   - stores candle close as last_price
   - keeps bid/ask quote-only fields NULL
   - sets data_source = KITE_HISTORICAL_5M_CLOSE_PROXY
@@ -50,6 +50,8 @@ from scripts.Common.calculate_option_snapshot_calc import calculate_snapshot_ids
 load_dotenv(project_root / ".env")
 
 DATA_SOURCE = "KITE_HISTORICAL_5M_CLOSE_PROXY"
+SNAPSHOT_LABEL_MODE_SCHEDULED = "scheduled"
+SNAPSHOT_LABEL_MODE_5M = "m5"
 
 KITE_TO_CANONICAL_INDEX = {
     "NIFTY 50": "NIFTY",
@@ -67,6 +69,9 @@ SNAPSHOT_WINDOWS: dict[str, tuple[time, time]] = {
     "CLOSE_1515": (time(15, 10), time(15, 15)),
 }
 
+MARKET_5M_START = time(9, 15)
+MARKET_5M_END = time(15, 10)
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -80,6 +85,54 @@ class HistoricalAllOptionsBackfillSettings:
     calc_batch_size: int = 500
     log_every: int = 25
     debug_no_candle: bool = False
+
+
+def m5_snapshot_label(value: time) -> str:
+    anchor_date = date(2000, 1, 1)
+    value_dt = datetime.combine(anchor_date, value)
+    slot_minute = value_dt.minute - (value_dt.minute % 5)
+    slot_time = value_dt.replace(minute=slot_minute, second=0, microsecond=0).time()
+    for scheduled_label, (candle_start, _snapshot_clock_time) in SNAPSHOT_WINDOWS.items():
+        if slot_time == candle_start:
+            return scheduled_label
+    return f"M5_{slot_time:%H%M}"
+
+
+def snapshot_label_for_candle_time(value: time, snapshot_label_mode: str) -> str | None:
+    if snapshot_label_mode == SNAPSHOT_LABEL_MODE_5M:
+        if value < MARKET_5M_START or value > time(15, 14, 59):
+            return None
+        return m5_snapshot_label(value)
+
+    anchor_date = date(2000, 1, 1)
+    value_dt = datetime.combine(anchor_date, value)
+    for snapshot_label, (candle_start, _snapshot_clock_time) in SNAPSHOT_WINDOWS.items():
+        candle_dt = datetime.combine(anchor_date, candle_start)
+        delta_seconds = (value_dt - candle_dt).total_seconds()
+        if 0 <= delta_seconds < 300:
+            return snapshot_label
+    return None
+
+
+def iter_5m_snapshot_windows(
+    start: time = MARKET_5M_START,
+    end: time = MARKET_5M_END,
+) -> dict[str, tuple[time, time]]:
+    anchor_date = date(2000, 1, 1)
+    cursor = datetime.combine(anchor_date, start)
+    end_dt = datetime.combine(anchor_date, end)
+    windows: dict[str, tuple[time, time]] = {}
+    while cursor <= end_dt:
+        slot_time = cursor.time()
+        windows[m5_snapshot_label(slot_time)] = (slot_time, slot_time)
+        cursor += timedelta(minutes=5)
+    return windows
+
+
+def snapshot_windows_for_mode(snapshot_label_mode: str) -> dict[str, tuple[time, time]]:
+    if snapshot_label_mode == SNAPSHOT_LABEL_MODE_5M:
+        return iter_5m_snapshot_windows()
+    return SNAPSHOT_WINDOWS
 
 
 def safe_table_name(name: str) -> str:
@@ -338,11 +391,8 @@ def build_underlying_price_map_from_range(
     candles: list[dict[str, Any]],
     from_date: date,
     to_date: date,
+    snapshot_label_mode: str = SNAPSHOT_LABEL_MODE_SCHEDULED,
 ) -> dict[tuple[date, str], float]:
-    wanted_times = {
-        candle_start: snapshot_label
-        for snapshot_label, (candle_start, _snapshot_clock_time) in SNAPSHOT_WINDOWS.items()
-    }
     prices: dict[tuple[date, str], float] = {}
 
     for candle in candles:
@@ -355,7 +405,7 @@ def build_underlying_price_map_from_range(
         if trade_dt < from_date or trade_dt > to_date or trade_dt.weekday() >= 5:
             continue
 
-        snapshot_label = wanted_times.get(candle_dt.time())
+        snapshot_label = snapshot_label_for_candle_time(candle_dt.time(), snapshot_label_mode)
         if not snapshot_label:
             continue
 
@@ -538,6 +588,104 @@ def load_all_option_instruments_for_range(
 
     instruments: list[dict[str, Any]] = []
 
+    for row in rows:
+        if is_postgres:
+            instrument_id, instrument_token, row_underlying, tradingsymbol, strike, expiry, instrument_type = row
+        else:
+            instrument_id = row.id
+            instrument_token = row.instrument_token
+            row_underlying = row.underlying
+            tradingsymbol = row.tradingsymbol
+            strike = row.strike
+            expiry = row.expiry
+            instrument_type = row.instrument_type
+
+        if instrument_token is None:
+            continue
+
+        instruments.append({
+            "id": int(instrument_id),
+            "instrument_token": int(instrument_token),
+            "underlying": row_underlying,
+            "tradingsymbol": tradingsymbol,
+            "strike": float(strike),
+            "expiry": _to_date(expiry),
+            "instrument_type": instrument_type,
+        })
+
+        if max_instruments is not None and len(instruments) >= max_instruments:
+            break
+
+    return instruments
+
+
+def load_existing_snapshot_instruments_for_range(
+    db: DatabaseClient,
+    settings: HistoricalAllOptionsBackfillSettings,
+    underlying: str,
+    from_date: date,
+    to_date: date,
+    option_type: str | None = None,
+    expiry_from: date | None = None,
+    expiry_to: date | None = None,
+    strike_min: float | None = None,
+    strike_max: float | None = None,
+    max_instruments: int | None = None,
+) -> list[dict[str, Any]]:
+    """Load only contracts that already have scheduled snapshots in the range."""
+    is_postgres = getattr(db, "db_kind", "") == "postgres"
+    instrument_table = pg_table_name(settings.option_instrument_table) if is_postgres else safe_table_name(settings.option_instrument_table)
+    snapshot_table = pg_table_name(settings.option_snapshot_table) if is_postgres else safe_table_name(settings.option_snapshot_table)
+    placeholder = "%s" if is_postgres else "?"
+
+    sql = f"""
+        SELECT DISTINCT
+            oi.id,
+            oi.instrument_token,
+            oi.underlying,
+            oi.tradingsymbol,
+            oi.strike,
+            CAST(oi.expiry AS date) AS expiry,
+            oi.instrument_type
+        FROM {instrument_table} oi
+        JOIN {snapshot_table} os ON os.option_instrument_id = oi.id
+        WHERE oi.underlying = {placeholder}
+          AND oi.instrument_token IS NOT NULL
+          AND oi.instrument_type IN ('CE', 'PE')
+          AND os.trade_date BETWEEN {placeholder} AND {placeholder}
+          AND os.snapshot_label IN ('OPEN_0915', 'CLOSE_1515')
+    """
+
+    params: list[Any] = [underlying, from_date, to_date]
+
+    if option_type:
+        sql += f" AND oi.instrument_type = {placeholder}"
+        params.append(option_type)
+
+    if expiry_from:
+        sql += f" AND CAST(oi.expiry AS date) >= {placeholder}"
+        params.append(expiry_from)
+
+    if expiry_to:
+        sql += f" AND CAST(oi.expiry AS date) <= {placeholder}"
+        params.append(expiry_to)
+
+    if strike_min is not None:
+        sql += f" AND oi.strike >= {placeholder}"
+        params.append(strike_min)
+
+    if strike_max is not None:
+        sql += f" AND oi.strike <= {placeholder}"
+        params.append(strike_max)
+
+    sql += " ORDER BY CAST(oi.expiry AS date), oi.strike, oi.instrument_type"
+
+    cursor = db.conn.cursor()
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    instruments: list[dict[str, Any]] = []
     for row in rows:
         if is_postgres:
             instrument_id, instrument_token, row_underlying, tradingsymbol, strike, expiry, instrument_type = row
@@ -899,7 +1047,10 @@ def run_backfill_all_options_from_historical_range(
     strike_min: float | None = None,
     strike_max: float | None = None,
     max_instruments_per_snapshot: int | None = None,
+    instrument_offset: int = 0,
     debug_no_candle: bool = False,
+    snapshot_label_mode: str = SNAPSHOT_LABEL_MODE_SCHEDULED,
+    seed_from_existing_snapshots: bool = False,
 ) -> dict[str, Any]:
     settings = HistoricalAllOptionsBackfillSettings(
         option_instrument_table=instrument_table,
@@ -954,11 +1105,16 @@ def run_backfill_all_options_from_historical_range(
         print(f"Strike min                 : {strike_min if strike_min is not None else 'not set'}")
         print(f"Strike max                 : {strike_max if strike_max is not None else 'not set'}")
         print(f"Max instruments/range      : {max_instruments_per_snapshot or 'not set'}")
+        print(f"Instrument offset/range    : {instrument_offset}")
+        print(f"Seed from existing snapshots: {seed_from_existing_snapshots}")
         print(f"Option batch size          : {settings.option_batch_size}")
         print(f"Batch sleep seconds        : {settings.batch_sleep_seconds}")
         print(f"Skip calc                  : {skip_calc}")
+        print(f"Snapshot label mode        : {snapshot_label_mode}")
         print(f"Data source                : {DATA_SOURCE}")
         print("")
+
+        snapshot_windows = snapshot_windows_for_mode(snapshot_label_mode)
 
         for underlying in target_underlyings:
             token = underlying_tokens.get(underlying)
@@ -980,31 +1136,60 @@ def run_backfill_all_options_from_historical_range(
                 candles=underlying_candles,
                 from_date=global_start,
                 to_date=global_end,
+                snapshot_label_mode=snapshot_label_mode,
             )
 
-            instruments = load_all_option_instruments_for_range(
-                db=db,
-                settings=settings,
-                underlying=underlying,
-                from_date=global_start,
-                option_type=option_type,
-                expiry_from=expiry_from,
-                expiry_to=expiry_to,
-                strike_min=strike_min,
-                strike_max=strike_max,
-                max_instruments=max_instruments_per_snapshot,
-            )
+            if seed_from_existing_snapshots:
+                instruments = load_existing_snapshot_instruments_for_range(
+                    db=db,
+                    settings=settings,
+                    underlying=underlying,
+                    from_date=global_start,
+                    to_date=global_end,
+                    option_type=option_type,
+                    expiry_from=expiry_from,
+                    expiry_to=expiry_to,
+                    strike_min=strike_min,
+                    strike_max=strike_max,
+                    max_instruments=max_instruments_per_snapshot,
+                )
+            else:
+                instruments = load_all_option_instruments_for_range(
+                    db=db,
+                    settings=settings,
+                    underlying=underlying,
+                    from_date=global_start,
+                    option_type=option_type,
+                    expiry_from=expiry_from,
+                    expiry_to=expiry_to,
+                    strike_min=strike_min,
+                    strike_max=strike_max,
+                    max_instruments=max_instruments_per_snapshot,
+                )
 
             if not instruments:
                 totals["skipped_no_instruments"] += 1
                 print(f"SKIP {underlying}: no option instruments")
                 continue
 
+            if instrument_offset > 0:
+                before_offset = len(instruments)
+                instruments = instruments[instrument_offset:]
+                print(
+                    f"RESUME {underlying}: skipped first {min(instrument_offset, before_offset)} "
+                    f"of {before_offset} instruments"
+                )
+
+            if not instruments:
+                totals["skipped_no_instruments"] += 1
+                print(f"SKIP {underlying}: no option instruments after offset")
+                continue
+
             active_snapshot_keys = [
                 (trade_dt, snapshot_label)
                 for trade_dt in iter_dates(global_start, global_end)
                 if trade_dt.weekday() < 5
-                for snapshot_label in SNAPSHOT_WINDOWS
+                for snapshot_label in snapshot_windows
             ]
             totals["snapshots_attempted"] += len(active_snapshot_keys)
 
@@ -1016,7 +1201,7 @@ def run_backfill_all_options_from_historical_range(
 
             candle_start_to_label = {
                 candle_start: (snapshot_label, snapshot_clock_time)
-                for snapshot_label, (candle_start, snapshot_clock_time) in SNAPSHOT_WINDOWS.items()
+                for snapshot_label, (candle_start, snapshot_clock_time) in snapshot_windows.items()
             }
             all_snapshot_ids: list[int] = []
             instrument_batches = list(chunked(instruments, settings.option_batch_size))
@@ -1171,6 +1356,8 @@ def run_backfill_all_options_from_historical_range(
         "end_date": global_end.isoformat(),
         "data_source": DATA_SOURCE,
         "mode": "RANGE_OPTION_INSTRUMENTS_NO_CHAIN_SELECTION",
+        "snapshot_label_mode": snapshot_label_mode,
+        "seed_from_existing_snapshots": seed_from_existing_snapshots,
         **totals,
     }
 
@@ -1200,6 +1387,7 @@ def run_backfill_all_options_from_historical(
     strike_max: float | None = None,
     max_instruments_per_snapshot: int | None = None,
     debug_no_candle: bool = False,
+    snapshot_label_mode: str = SNAPSHOT_LABEL_MODE_SCHEDULED,
 ) -> dict[str, Any]:
     settings = HistoricalAllOptionsBackfillSettings(
         option_instrument_table=instrument_table,
@@ -1258,8 +1446,11 @@ def run_backfill_all_options_from_historical(
         print(f"Option batch size          : {settings.option_batch_size}")
         print(f"Batch sleep seconds        : {settings.batch_sleep_seconds}")
         print(f"Skip calc                  : {skip_calc}")
+        print(f"Snapshot label mode        : {snapshot_label_mode}")
         print(f"Data source                : {DATA_SOURCE}")
         print("")
+
+        snapshot_windows = snapshot_windows_for_mode(snapshot_label_mode)
 
         for underlying in target_underlyings:
             token = underlying_tokens.get(underlying)
@@ -1273,7 +1464,7 @@ def run_backfill_all_options_from_historical(
                 if trade_dt.weekday() >= 5:
                     continue
 
-                for snapshot_label, (candle_start, snapshot_clock_time) in SNAPSHOT_WINDOWS.items():
+                for snapshot_label, (candle_start, snapshot_clock_time) in snapshot_windows.items():
                     totals["snapshots_attempted"] += 1
 
                     try:
@@ -1451,6 +1642,7 @@ def run_backfill_all_options_from_historical(
         "end_date": global_end.isoformat(),
         "data_source": DATA_SOURCE,
         "mode": "ALL_OPTION_INSTRUMENTS_NO_CHAIN_SELECTION",
+        "snapshot_label_mode": snapshot_label_mode,
         **totals,
     }
 
@@ -1511,6 +1703,12 @@ def main() -> None:
         default=None,
         help="Optional safety cap for testing. Do not use for full production backfill.",
     )
+    parser.add_argument(
+        "--instrument-offset",
+        type=int,
+        default=0,
+        help="For --range-fetch resume runs, skip this many loaded instruments before processing.",
+    )
 
     parser.add_argument("--sleep-seconds", type=float, default=0.35)
     parser.add_argument(
@@ -1532,6 +1730,17 @@ def main() -> None:
         "--range-fetch",
         action="store_true",
         help="Fetch each instrument's 5-minute history once for the full date range.",
+    )
+    parser.add_argument(
+        "--snapshot-label-mode",
+        choices=(SNAPSHOT_LABEL_MODE_SCHEDULED, SNAPSHOT_LABEL_MODE_5M),
+        default=SNAPSHOT_LABEL_MODE_SCHEDULED,
+        help="scheduled writes OPEN_0915/CLOSE_1515; m5 writes every 5-minute slot as M5_HHMM.",
+    )
+    parser.add_argument(
+        "--seed-from-existing-snapshots",
+        action="store_true",
+        help="For --range-fetch, backfill only contracts that already have OPEN_0915/CLOSE_1515 snapshots in the date range.",
     )
 
     args = parser.parse_args()
@@ -1560,7 +1769,10 @@ def main() -> None:
         strike_min=args.strike_min,
         strike_max=args.strike_max,
         max_instruments_per_snapshot=args.max_instruments_per_snapshot,
+        instrument_offset=max(0, args.instrument_offset),
         debug_no_candle=args.debug_no_candle,
+        snapshot_label_mode=args.snapshot_label_mode,
+        seed_from_existing_snapshots=args.seed_from_existing_snapshots,
     )
 
 

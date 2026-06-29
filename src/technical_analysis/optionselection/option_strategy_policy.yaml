@@ -1,0 +1,156 @@
+version: 1
+status: draft_not_wired
+selector_wiring_enabled: false
+notes:
+  - This file documents the intended option strategy matrix for upstream NIFTY prediction signals.
+  - It is not imported by the current selector; existing LONG_CALL/LONG_PUT selection remains active.
+  - strength_label comes from the production prediction strength model: STRONG, MODERATE, WEAK.
+  - confidence_level is the upstream cascaded-strategy accuracy/precision score on a 0-1 scale.
+  - high_or_medium_confidence means confidence_bucket in [HIGH, MEDIUM].
+  - low_confidence means confidence_bucket == LOW.
+confidence_buckets:
+  HIGH:
+    min_confidence_level: 0.80
+  MEDIUM:
+    min_confidence_level: 0.65
+    max_confidence_level_lt: 0.80
+  LOW:
+    max_confidence_level_lt: 0.65
+implemented_today:
+  - LONG_CALL
+  - LONG_PUT
+  - BULL_CALL_SPREAD
+  - BEAR_PUT_SPREAD
+planned_not_implemented:
+  - BULL_PUT_SPREAD
+  - BEAR_CALL_SPREAD
+contract_templates:
+  LONG_CALL_ITM:
+    strategy_type: LONG_CALL
+    option_type: CE
+    side: BUY
+    moneyness: ITM
+    delta_min: 0.70
+    delta_max: 0.90
+    dte_min: 20
+    dte_max: 60
+  LONG_PUT_ITM:
+    strategy_type: LONG_PUT
+    option_type: PE
+    side: BUY
+    moneyness: ITM
+    delta_min: -0.90
+    delta_max: -0.70
+    dte_min: 20
+    dte_max: 60
+  BULL_CALL_SPREAD:
+    strategy_type: BULL_CALL_SPREAD
+    direction: BULLISH
+    structure: debit_spread
+    buy_leg:
+      option_type: CE
+      delta_min: 0.45
+      delta_max: 0.65
+    sell_leg:
+      option_type: CE
+      delta_min: 0.20
+      delta_max: 0.40
+    dte_min: 7
+    dte_max: 30
+  BEAR_PUT_SPREAD:
+    strategy_type: BEAR_PUT_SPREAD
+    direction: BEARISH
+    structure: debit_spread
+    buy_leg:
+      option_type: PE
+      delta_min: -0.65
+      delta_max: -0.45
+    sell_leg:
+      option_type: PE
+      delta_min: -0.40
+      delta_max: -0.20
+    dte_min: 7
+    dte_max: 30
+  BULL_PUT_SPREAD:
+    strategy_type: BULL_PUT_SPREAD
+    direction: BULLISH
+    structure: credit_spread
+    implementation_status: planned_not_implemented
+  BEAR_CALL_SPREAD:
+    strategy_type: BEAR_CALL_SPREAD
+    direction: BEARISH
+    structure: credit_spread
+    implementation_status: planned_not_implemented
+rules:
+  - id: bullish_strong_high_or_medium_confidence
+    prediction_direction: CALL
+    market_view: BULLISH
+    strength_label: STRONG
+    confidence_bucket_in: [HIGH, MEDIUM]
+    selected_template: LONG_CALL_ITM
+    rationale: Strong bullish setup with historically acceptable voter accuracy can justify outright long call convexity.
+  - id: bullish_moderate_high_confidence
+    prediction_direction: CALL
+    market_view: BULLISH
+    strength_label: MODERATE
+    confidence_bucket_in: [HIGH]
+    selected_template: BULL_CALL_SPREAD
+    rationale: Moderate bullish force with high confidence favors a defined-risk debit spread over full long premium.
+  - id: bullish_weak_or_low_confidence
+    prediction_direction: CALL
+    market_view: BULLISH
+    any_of:
+      - strength_label: WEAK
+      - confidence_bucket_in: [LOW]
+    unless_all:
+      strength_label: WEAK
+      confidence_bucket_in: [LOW]
+    selected_template: BULL_PUT_SPREAD
+    rationale: Weak bullish or low-confidence bullish view would favor a lower-conviction bullish credit structure once implemented.
+  - id: bullish_weak_and_low_confidence
+    prediction_direction: CALL
+    market_view: BULLISH
+    strength_label: WEAK
+    confidence_bucket_in: [LOW]
+    selected_template: NO_TRADE
+    rationale: Weak setup plus low historical confidence should not open bullish option exposure.
+  - id: bearish_strong_high_or_medium_confidence
+    prediction_direction: PUT
+    market_view: BEARISH
+    strength_label: STRONG
+    confidence_bucket_in: [HIGH, MEDIUM]
+    selected_template: LONG_PUT_ITM
+    rationale: Strong bearish setup with historically acceptable voter accuracy can justify outright long put convexity.
+  - id: bearish_moderate_high_confidence
+    prediction_direction: PUT
+    market_view: BEARISH
+    strength_label: MODERATE
+    confidence_bucket_in: [HIGH]
+    selected_template: BEAR_PUT_SPREAD
+    rationale: Moderate bearish force with high confidence favors a defined-risk debit spread over full long premium.
+  - id: bearish_weak_or_low_confidence
+    prediction_direction: PUT
+    market_view: BEARISH
+    any_of:
+      - strength_label: WEAK
+      - confidence_bucket_in: [LOW]
+    unless_all:
+      strength_label: WEAK
+      confidence_bucket_in: [LOW]
+    selected_template: BEAR_CALL_SPREAD
+    rationale: Weak bearish or low-confidence bearish view would favor a lower-conviction bearish credit structure once implemented.
+  - id: bearish_weak_and_low_confidence
+    prediction_direction: PUT
+    market_view: BEARISH
+    strength_label: WEAK
+    confidence_bucket_in: [LOW]
+    selected_template: NO_TRADE
+    rationale: Weak setup plus low historical confidence should not open bearish option exposure.
+current_active_selector:
+  source_file: src/technical_analysis/optionselection/strategy_rules.py
+  behavior:
+    BULLISH_STRONG: LONG_CALL
+    BULLISH_MODERATE: LONG_CALL
+    BEARISH_STRONG: LONG_PUT
+    BEARISH_MODERATE: LONG_PUT
+    NEUTRAL: NO_TRADE

@@ -6,14 +6,13 @@ from .schema import OptionBias
 
 
 def derive_option_bias(view: UnderlyingView) -> OptionBias:
-    if view.raw_signal == "NO_POSITION" or view.direction == "NEUTRAL" or view.strength_score < 65:
-        return "NEUTRAL"
-    if view.stock_regime == "CHOPPY":
+    prediction_side = _prediction_side(view)
+    if prediction_side == "NO_POSITION" or view.strength_score < 65:
         return "NEUTRAL"
 
-    if view.raw_signal == "CALL":
+    if prediction_side == "CALL":
         bias: OptionBias = "BULLISH_STRONG" if view.strength_score >= 80 else "BULLISH_MODERATE"
-    elif view.raw_signal == "PUT":
+    elif prediction_side == "PUT":
         bias = "BEARISH_STRONG" if view.strength_score >= 80 else "BEARISH_MODERATE"
     else:
         return "NEUTRAL"
@@ -42,3 +41,17 @@ def _downgrade(bias: OptionBias) -> OptionBias:
         "NEUTRAL": "NEUTRAL",
     }
     return mapping[bias]
+
+
+def _prediction_side(view: UnderlyingView) -> str:
+    direction = str(view.direction)
+    if direction in {"CALL", "PUT", "NO_POSITION"}:
+        return direction
+    raw_signal = str(view.raw_signal)
+    if raw_signal in {"CALL", "PUT"}:
+        return raw_signal
+    if direction == "BULLISH":
+        return "CALL"
+    if direction == "BEARISH":
+        return "PUT"
+    return "NO_POSITION"

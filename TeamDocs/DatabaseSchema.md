@@ -1,17 +1,58 @@
-# Supabase Database Schema
+# Database Schema
 
-Current NIFTY pipeline tables only.
+Supabase is the durable source for the NIFTY pipeline.
+
+## Core Tables
 
 | Table | Contains |
 |---|---|
-| `WatchedInstrument` | Active underlyings/instruments to track, including NIFTY and metadata such as token, type, lot size, and active flag. |
-| `UnderlyingSnapshot` | Daily OHLCV rows per underlying and trade date. |
-| `UnderlyingCandle5m` | Optional 5-minute underlying candles used by legacy/backtest helpers and intraday context. |
-| `OptionInstrument` | NIFTY option contract master rows from Kite NFO instruments. |
-| `OptionSnapshot` | Raw option quote/candle snapshots by option instrument, trade date, and snapshot label. |
-| `OptionSnapshotCalc` | Calculated IV, Greeks, spread, time value, and valuation fields for each option snapshot. |
-| `SignalFeatureDaily` | Daily technical features computed from `UnderlyingSnapshot`, such as MA, RSI, ATR, Bollinger, returns, volatility, and regime. |
-| `TradingCalendar` | NSE trading-day/expiry calendar, used for date-aware jobs when populated. |
-| `KiteAccessToken` | Latest Kite access token used by API jobs. |
+| `WatchedInstrument` | Active instruments to track. |
+| `TradingCalendar` | Valid NSE sessions and expiry flags. |
+| `KiteAccessToken` | Latest Kite access token for cron jobs. |
+| `UnderlyingSnapshot` | Daily underlying OHLCV. |
+| `UnderlyingCandle5m` | Optional 5-minute underlying candles. |
+| `SignalFeatureDaily` | Daily NIFTY technical features. |
+| `MacroFactorDaily` | Macro factors, currently India VIX. |
+| `GlobalIndexOhlc` | Global index OHLC for risk context. |
 
-Predictions and option selection are computed in-memory from `SignalFeatureDaily` and are not persisted. Strategy logic is still being finalised; see `tests/` for the exercisable entry points.
+## Options
+
+| Table | Contains |
+|---|---|
+| `OptionInstrument` | Active option contract master rows. |
+| `OptionSnapshot` | Raw option quote/snapshot prices. |
+| `OptionSnapshotCalc` | IV and Greeks from snapshots. |
+| `OptionOhlc` | Daily-grain option OHLC rows. |
+
+## Production
+
+| Table | Contains |
+|---|---|
+| `NiftyPrediction` | Daily production direction: `CALL`, `PUT`, `NO_POSITION`. |
+| `NiftyOptionSelection` | Selected option contract, entry reference, target/stop levels. |
+
+## News Sentiment
+
+| Table | Contains |
+|---|---|
+| `NewsArticle` | Raw fetched articles. |
+| `NewsArticleSentiment` | Per-article sentiment and sector weights. |
+| `NiftyMarketSentiment` | Daily pre-market sentiment composite. |
+
+## Paper Trading
+
+| Table | Contains |
+|---|---|
+| `PaperExecutionSignal` | Option-selection row prepared for paper execution. |
+| `PaperOrder` | Simulated entry/exit order records. |
+| `PaperTradeResult` | Open/closed paper trade state and P&L. |
+| `PaperTradeEvent` | Append-only paper lifecycle events. |
+
+## Migrations
+
+```powershell
+Get-ChildItem src/data_manager/db/migrations
+```
+
+Most daily jobs defensively create/upgrade required tables through
+`src/data_manager/db/supabase_client.py`, but migrations are the schema contract.

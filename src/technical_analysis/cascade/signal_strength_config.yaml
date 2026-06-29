@@ -1,0 +1,206 @@
+version: 1
+labels:
+  strong_min: 80
+  moderate_min: 65
+adjustment_sets:
+  call_headroom:
+    - column: resistance_distance_10d
+      lt_regime_threshold_multiple: 1.0
+      add: -14
+    - column: resistance_distance_10d
+      lt_regime_threshold_multiple: 1.5
+      add: -7
+    - column: resistance_distance_10d
+      gte_regime_threshold_multiple: 3.0
+      add: 5
+  put_room:
+    - column: support_distance_10d
+      lt_regime_threshold_multiple: 1.0
+      add: -14
+    - column: support_distance_10d
+      lt_regime_threshold_multiple: 1.5
+      add: -7
+    - column: support_distance_10d
+      gte_regime_threshold_multiple: 3.0
+      add: 5
+  expansion:
+    - column: bb_width
+      gte: 0.065
+      add: 5
+    - column: bb_width
+      gte: 0.055
+      add: 3
+    - column: bb_width
+      lt: 0.04
+      add: -5
+  high_vix:
+    - column: vix_close
+      gte: 16
+      add: 4
+    - column: vix_close
+      lt: 12
+      add: -6
+  calm_low_vol:
+    - column: vix_close
+      lt: 13
+      add: 3
+  call_rebound_confirmation:
+    - column: ret_5d
+      gt_column: ret_10d
+      add: 4
+    - column: rsi14
+      lt: 30
+      add: 3
+  put_momentum_confirmation:
+    - column: ret_3d
+      lte: -0.005
+      add: 4
+    - column: ret_10d
+      lte: -0.01
+      add: 3
+  overbought_exhaustion:
+    - column: rsi14
+      gte: 70
+      add: 4
+    - column: rsi5
+      gte: 85
+      add: 3
+strategies:
+  BollingerMeanReversion:
+    style: bounce
+    base_score: 67
+    adjustments: [call_headroom, put_room]
+  BollingerMeanReversion_GlobalAnyAgree:
+    style: bounce
+    base_score: 71
+    adjustments: [call_headroom, put_room]
+  RsiMeanReversion_6040:
+    style: bounce
+    base_score: 65
+    adjustments: [call_headroom, put_room]
+  RsiMeanReversion_6040_GlobalAnyAgree:
+    style: bounce
+    base_score: 69
+    adjustments: [call_headroom, put_room]
+
+  OversoldBounceCall_HighPrecision:
+    style: bounce
+    base_score: 70
+    adjustments: [call_headroom, high_vix]
+  OversoldBounceCall_HighPrecision_GlobalAnyAgree:
+    style: bounce
+    base_score: 74
+    adjustments: [call_headroom, high_vix]
+  OversoldBounceCall_HighPrecision_GlobalNoDisagree:
+    style: bounce
+    base_score: 73
+    adjustments: [call_headroom, high_vix]
+  OversoldBounceCall_MoreTrades:
+    style: bounce
+    base_score: 66
+    adjustments: [call_headroom, high_vix]
+  OversoldBounceCall_MoreTrades_GlobalAnyAgree:
+    style: bounce
+    base_score: 70
+    adjustments: [call_headroom, high_vix]
+  OversoldBounceCall_ContextRoom:
+    style: bounce
+    base_score: 72
+    adjustments: [call_headroom, high_vix]
+
+  MomentumDirectional:
+    style: trend_momentum
+    base_score: 74
+    adjustments: [call_headroom, put_room, expansion]
+  MomentumDirectional_GlobalAnyAgree:
+    style: trend_momentum
+    base_score: 78
+    adjustments: [call_headroom, put_room, expansion]
+  MomentumDirectional_ContextVotes_CallExpansionGuard:
+    style: trend_momentum
+    base_score: 80
+    adjustments: [call_headroom, expansion]
+  MomentumDirectional_ContextVotes_CallExpansionGuard_GlobalNoDisagree:
+    style: trend_momentum
+    base_score: 83
+    adjustments: [call_headroom, expansion]
+  MomentumDirectional_ContextVotes_ExpansionGuard:
+    style: trend_momentum
+    base_score: 82
+    adjustments: [call_headroom, put_room, expansion]
+  MomentumDirectional_ContextVotes_StrongExpansionGuard_GlobalAgree:
+    style: trend_momentum
+    base_score: 86
+    adjustments: [call_headroom, put_room, expansion, high_vix]
+
+  DownMomentumPut_MoreTrades:
+    style: trend_momentum
+    base_score: 73
+    adjustments: [put_room, put_momentum_confirmation, high_vix]
+  DownMomentumPut_HighPrecision_GlobalAnyAgree:
+    style: trend_momentum
+    base_score: 82
+    adjustments: [put_room, put_momentum_confirmation, high_vix]
+  DownMomentumPut_MoreTrades_GlobalAnyAgree:
+    style: trend_momentum
+    base_score: 79
+    adjustments: [put_room, put_momentum_confirmation, high_vix]
+
+  MAAlignmentRoom_PutGuarded_GlobalAnyAgree:
+    style: trend_momentum
+    base_score: 75
+    adjustments: [put_room, put_momentum_confirmation]
+  MAAlignmentRoom_ReboundCall:
+    style: bounce
+    base_score: 72
+    adjustments: [call_headroom, call_rebound_confirmation]
+  MAAlignmentRoom_ReboundCall_GlobalAnyAgree:
+    style: bounce
+    base_score: 76
+    adjustments: [call_headroom, call_rebound_confirmation]
+  MaTrend_001:
+    style: trend_momentum
+    base_score: 70
+    adjustments: [call_headroom, put_room]
+  MaTrend_001_GlobalAnyAgree:
+    style: trend_momentum
+    base_score: 74
+    adjustments: [call_headroom, put_room]
+
+  RangeBreakout_GlobalWeightedTilt:
+    style: trend_momentum
+    base_score: 82
+    adjustments: [call_headroom, put_room, expansion]
+  RangeBreakout_ATRBuffer_GlobalWeightedTilt:
+    style: trend_momentum
+    base_score: 78
+    adjustments: [call_headroom, put_room, expansion]
+
+  CalmTrendCall_Headroom:
+    style: trend_momentum
+    base_score: 70
+    adjustments: [call_headroom, calm_low_vol]
+  CalmTrendCall_ContextHeadroom:
+    style: trend_momentum
+    base_score: 72
+    adjustments: [call_headroom, calm_low_vol]
+  CalmFadePut_Overbought:
+    style: bounce
+    base_score: 66
+    adjustments: [put_room, overbought_exhaustion, calm_low_vol]
+  CalmFadePut_ContextOverbought:
+    style: bounce
+    base_score: 68
+    adjustments: [put_room, overbought_exhaustion, calm_low_vol]
+  CalmFadePut_Overbought_GlobalNoDisagree:
+    style: bounce
+    base_score: 71
+    adjustments: [put_room, overbought_exhaustion, calm_low_vol]
+  CalmMomentumPut_Continuation:
+    style: trend_momentum
+    base_score: 70
+    adjustments: [put_room, put_momentum_confirmation, calm_low_vol]
+  CalmMomentumPut_Continuation_GlobalWeightedTilt:
+    style: trend_momentum
+    base_score: 74
+    adjustments: [put_room, put_momentum_confirmation, calm_low_vol]

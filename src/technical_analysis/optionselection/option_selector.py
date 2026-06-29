@@ -7,7 +7,6 @@ from .schema import OptionBias, OptionSelectionResult, OptionStrategyCandidate
 from .scoring import score_option_candidate
 from .strategy_builder import build_strategy_candidates
 from .strategy_rules import choose_option_strategy_type
-from .underlying_view_strength import derive_option_bias
 from src.technical_analysis.prediction.schema import UnderlyingView
 
 MIN_UNDERLYING_SCORE = 65
@@ -21,19 +20,13 @@ def select_option_strategy(
     as_of_time: str | None = None,
     atm_iv_history_90d: list[float] | None = None,
 ) -> OptionSelectionResult:
-    if underlying_view.raw_signal == "NO_POSITION":
+    prediction_side = _prediction_side(underlying_view)
+    if prediction_side == "NO_POSITION":
         return no_trade_result(underlying_view.symbol, underlying_view.trade_date, "Underlying signal is NO_POSITION")
     if underlying_view.strength_score < MIN_UNDERLYING_SCORE:
         return no_trade_result(underlying_view.symbol, underlying_view.trade_date, "Underlying signal score below threshold")
 
-    option_bias = derive_option_bias(underlying_view)
-    if option_bias == "NEUTRAL":
-        return no_trade_result(
-            underlying_view.symbol,
-            underlying_view.trade_date,
-            "Option bias neutral after downgrades",
-            option_bias=option_bias,
-        )
+    option_bias = _option_bias_from_prediction(prediction_side, underlying_view.strength_score)
 
     contracts = load_option_chain_with_calcs(db_client, underlying_view.symbol, as_of_time=as_of_time)
     if not contracts:
@@ -126,3 +119,25 @@ def _atm_metric(features: dict[str, object], spot_price: float, metric: str) -> 
     atm = min(option_features, key=lambda feature: abs(feature.strike - spot_price))  # type: ignore[attr-defined]
     value = getattr(atm, metric, None)
     return float(value) if value is not None else None
+
+
+def _prediction_side(underlying_view: UnderlyingView) -> str:
+    direction = str(underlying_view.direction)
+    if direction in {"CALL", "PUT", "NO_POSITION"}:
+        return direction
+    raw_signal = str(underlying_view.raw_signal)
+    if raw_signal in {"CALL", "PUT"}:
+        return raw_signal
+    if direction == "BULLISH":
+        return "CALL"
+    if direction == "BEARISH":
+        return "PUT"
+    return "NO_POSITION"
+
+
+def _option_bias_from_prediction(prediction_side: str, strength_score: float) -> OptionBias:
+    if prediction_side == "CALL":
+        return "BULLISH_STRONG" if strength_score >= 80 else "BULLISH_MODERATE"
+    if prediction_side == "PUT":
+        return "BEARISH_STRONG" if strength_score >= 80 else "BEARISH_MODERATE"
+    return "NEUTRAL"

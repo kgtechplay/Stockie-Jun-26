@@ -12,13 +12,22 @@ def compute_option_features_for_chain(
     trade_date: str,
     atm_iv_history_90d: list[float] | None = None,
 ) -> dict[str, OptionFeatures]:
-    atm_iv = _current_atm_iv(contracts, spot_price)
     by_expiry_type: dict[tuple[str, str], list[OptionContract]] = {}
+    by_expiry: dict[str, list[OptionContract]] = {}
     for contract in contracts:
         by_expiry_type.setdefault((contract.expiry, contract.option_type), []).append(contract)
+        by_expiry.setdefault(contract.expiry, []).append(contract)
+
+    atm_iv_by_expiry = {
+        expiry: _current_atm_iv(expiry_contracts, spot_price)
+        for expiry, expiry_contracts in by_expiry.items()
+    }
 
     output: dict[str, OptionFeatures] = {}
     for contract in contracts:
+        atm_iv = atm_iv_by_expiry.get(contract.expiry)
+        if atm_iv is None:
+            atm_iv = _current_atm_iv(_similar_dte_contracts(contract, contracts, trade_date), spot_price)
         output[contract.tradingsymbol] = _compute_features(
             contract,
             spot_price,
@@ -171,6 +180,20 @@ def _current_atm_iv(contracts: list[OptionContract], spot_price: float) -> float
         return None
     atm = min(valid, key=lambda c: abs(c.strike - spot_price))
     return atm.iv
+
+
+def _similar_dte_contracts(
+    target_contract: OptionContract,
+    contracts: list[OptionContract],
+    trade_date: str,
+    tolerance_days: int = 7,
+) -> list[OptionContract]:
+    target_dte = max(0, (_parse_date(target_contract.expiry) - _parse_date(trade_date)).days)
+    return [
+        contract
+        for contract in contracts
+        if abs(max(0, (_parse_date(contract.expiry) - _parse_date(trade_date)).days) - target_dte) <= tolerance_days
+    ]
 
 
 def _iv_rank(current_iv: float | None, history: list[float] | None) -> float | None:
