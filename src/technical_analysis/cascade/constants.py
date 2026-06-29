@@ -1,12 +1,12 @@
-"""Shared constants for the NIFTY regime-aware precision cascade.
+﻿"""Shared constants for the NIFTY regime-aware precision cascade.
 
 This package is the single source of truth for the cascade ENGINE and the
 PROMOTED strategy roster. Two pipelines consume it:
 
-  * backtest/research/build_experiment.py  — research harness; registers the FULL
+  * backtest/vectorbt_research/build_experiment.py  â€” research harness; registers the FULL
     strategy roster (promoted + still-experimental) and writes the experiment
     artifacts (per-strategy CSVs, comparison.txt, base.txt).
-  * src/technical_analysis/cascade/pipeline.py / scripts/daily_NIFTY — production;
+  * src/technical_analysis/cascade/pipeline.py / scripts/daily_NIFTY â€” production;
     registers ONLY the promoted roster and emits the single final prediction.
 
 The engine math (regime routing, labelling, precision-floor voting, scoring) is
@@ -32,7 +32,7 @@ CALL, PUT, FLAT = "CALL", "PUT", "NO_POSITION"
 
 THRESHOLD = 0.005  # 0.5% next-day intraday move (touch) from next_open
 
-# ── volatility regime router ──────────────────────────────────────────────
+# â”€â”€ volatility regime router â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # A same-day (point-in-time) split into a calm low-volatility tape and a
 # stressed higher-volatility tape. Calm days rarely print a 0.5% intraday move,
 # so they are graded against a smaller threshold; stressed days keep 0.5%.
@@ -51,7 +51,7 @@ _VIX_COLS = ["vix_close", "vix_chg_1d", "vix_chg_pct"]
 # coerced with pd.to_numeric when freshly pulled from the DB).
 _BASE_STR_COLS = {"trade_date", "next_trade_date", "final_prediction", "final_position"}
 
-# ── precision-cascade voting ──────────────────────────────────────────────
+# â”€â”€ precision-cascade voting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PRECISION_FLOOR = 0.70   # default floor (stress regime); see REGIME_PRECISION_FLOOR
 # A side (CALL/PUT) may only vote if its precision clears its regime's floor. The
 # calm tape's edge is thinner (lower base rate at the 0.3% threshold), so calm

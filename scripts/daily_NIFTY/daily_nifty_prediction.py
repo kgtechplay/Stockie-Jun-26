@@ -1,4 +1,4 @@
-"""
+﻿"""
 Daily NIFTY final-prediction job (regime-aware precision cascade).
 
 This is the PRODUCTION daily entrypoint that predicts the next trading day (n+1)
@@ -12,8 +12,8 @@ What it does
   1. Runs the shared regime-aware cascade via
      src.technical_analysis.cascade.pipeline.generate_prediction_csv, which drives
      the shared cascade engine (src/technical_analysis/cascade) with the PROMOTED
-     strategy roster — the same engine the research harness
-     (backtest/research/build_experiment.py) drives with the full roster, so the
+     strategy roster â€” the same engine the research harness
+     (backtest/vectorbt_research/build_experiment.py) drives with the full roster, so the
      engine never drifts between research and production. This writes:
        - output/backtest/NIFTY/production/NIFTY_prediction.csv
        - output/backtest/NIFTY/production/NIFTY_prediction_summary.txt
@@ -82,7 +82,7 @@ def run_daily_nifty_prediction(
 ) -> dict:
     os.environ.setdefault("NIFTY_PREDICTION_FEATURE_SOURCE", "db")
 
-    # 1) cascade → CSV + summary (also returns the prediction frame).
+    # 1) cascade â†’ CSV + summary (also returns the prediction frame).
     result = generate_prediction_csv(underlying=underlying.upper(), output_path=output_path)
     df = result.get("frame")
     if df is None or df.empty:

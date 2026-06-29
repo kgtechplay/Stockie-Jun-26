@@ -8,12 +8,10 @@ from typing import Any
 
 import requests
 
-from src.news_sentiment.config import ZERO_SHOT_LABEL_TO_SECTOR, ZERO_SHOT_SECTOR_LABELS
+from src.news_sentiment.config import NIFTY50_SECTOR_DEFINITIONS
 from src.news_sentiment.schemas import SectorTag
 
-ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-SUPPORTED_SECTOR_KEYS = tuple(ZERO_SHOT_LABEL_TO_SECTOR.values()) + ("broad_market",)
+SUPPORTED_SECTOR_KEYS = tuple(definition.key for definition in NIFTY50_SECTOR_DEFINITIONS) + ("broad_market",)
 
 SECTOR_KEYWORDS: dict[str, tuple[str, ...]] = {
     "financial_services": (
@@ -65,57 +63,6 @@ def classify_sectors(text: str, max_tags: int = 3) -> list[SectorTag]:
     return KeywordSectorClassifier().classify(text, max_tags=max_tags)
 
 
-@dataclass
-class ZeroShotSectorClassifier:
-    model_name: str = ZERO_SHOT_MODEL
-    use_transformers: bool = True
-    multi_label: bool = True
-
-    def __post_init__(self) -> None:
-        self._pipeline = None
-        if not self.use_transformers:
-            return
-        try:
-            from transformers import pipeline  # type: ignore[import-not-found]
-
-            self._pipeline = pipeline("zero-shot-classification", model=self.model_name)
-        except Exception as exc:  # noqa: BLE001 - fallback keeps the scaffold runnable.
-            print(f"[WARN] zero-shot sector model unavailable; using keyword fallback: {exc}")
-            self._pipeline = None
-
-    def classify(self, text: str, max_tags: int = 3) -> list[SectorTag]:
-        clean = " ".join((text or "").split())
-        if not clean:
-            return [SectorTag("broad_market", 0.35, [])]
-        if self._pipeline is None:
-            return KeywordSectorClassifier().classify(clean, max_tags=max_tags)
-
-        raw_result = self._pipeline(
-            clean,
-            candidate_labels=list(ZERO_SHOT_SECTOR_LABELS),
-            multi_label=self.multi_label,
-        )
-        return self._from_zero_shot_result(raw_result, max_tags=max_tags)
-
-    def classify_many(self, texts: list[str], max_tags: int = 3) -> list[list[SectorTag]]:
-        return [self.classify(text, max_tags=max_tags) for text in texts]
-
-    def _from_zero_shot_result(self, result: dict[str, Any], max_tags: int = 3) -> list[SectorTag]:
-        labels = [str(label) for label in result.get("labels") or []]
-        scores = [float(score) for score in result.get("scores") or []]
-        pairs = [
-            (ZERO_SHOT_LABEL_TO_SECTOR[label], score, label)
-            for label, score in zip(labels, scores)
-            if label in ZERO_SHOT_LABEL_TO_SECTOR and score > 0
-        ]
-        if not pairs:
-            return [SectorTag("broad_market", 0.35, [])]
-
-        top = pairs[:max_tags]
-        total = sum(score for _, score, _ in top) or 1.0
-        return [SectorTag(sector, score / total, [label]) for sector, score, label in top]
-
-
 class KeywordSectorClassifier:
     def classify(self, text: str, max_tags: int = 3) -> list[SectorTag]:
         return _classify_sectors_keyword(text, max_tags=max_tags)
@@ -126,30 +73,22 @@ class KeywordSectorClassifier:
 
 @dataclass
 class LlmSectorClassifier:
-    provider: str = "auto"
+    provider: str = "azure"
     timeout_seconds: int = 90
     max_batch_size: int = 10
     temperature: float = 0.0
 
     def __post_init__(self) -> None:
-        self.provider = self.provider.lower().strip()
+        self.provider = (os.getenv("NEWS_SECTOR_LLM_PROVIDER") or self.provider).lower().strip()
         self.azure_endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_AI_ENDPOINT") or "").rstrip("/")
         self.azure_api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_AI_API_KEY") or ""
         self.azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_AI_DEPLOYMENT") or ""
         self.azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("AZURE_AI_API_VERSION") or "2024-02-15-preview"
-        self.openai_api_key = os.getenv("OPENAI_API_KEY") or ""
-        self.openai_model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 
     @property
     def resolved_provider(self) -> str | None:
         if self.provider == "azure":
             return "azure" if self._azure_configured else None
-        if self.provider == "openai":
-            return "openai" if self.openai_api_key else None
-        if self._azure_configured:
-            return "azure"
-        if self.openai_api_key:
-            return "openai"
         return None
 
     @property
@@ -162,7 +101,11 @@ class LlmSectorClassifier:
     def classify_many(self, texts: list[str], max_tags: int = 3) -> list[list[SectorTag]]:
         provider = self.resolved_provider
         if provider is None:
-            print("[WARN] LLM sector classifier is not configured; using keyword fallback.")
+            print(
+                "[WARN] Azure OpenAI sector classifier is not configured; "
+                "using keyword fallback. Required: AZURE_OPENAI_ENDPOINT, "
+                "AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT."
+            )
             return KeywordSectorClassifier().classify_many(texts, max_tags=max_tags)
 
         results: list[list[SectorTag]] = []
@@ -191,9 +134,6 @@ class LlmSectorClassifier:
             "temperature": self.temperature,
             "response_format": {"type": "json_object"},
         }
-        if provider == "openai":
-            request_body["model"] = self.openai_model
-
         response = requests.post(
             self._chat_url(provider),
             headers=self._headers(provider),
@@ -212,12 +152,12 @@ class LlmSectorClassifier:
     def _chat_url(self, provider: str) -> str:
         if provider == "azure":
             return f"{self.azure_endpoint}/openai/deployments/{self.azure_deployment}/chat/completions"
-        return OPENAI_CHAT_URL
+        raise ValueError(f"Unsupported sector LLM provider: {provider}")
 
     def _headers(self, provider: str) -> dict[str, str]:
         if provider == "azure":
             return {"api-key": self.azure_api_key, "Content-Type": "application/json"}
-        return {"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"}
+        raise ValueError(f"Unsupported sector LLM provider: {provider}")
 
     def _params(self, provider: str) -> dict[str, str]:
         if provider == "azure":
@@ -250,8 +190,8 @@ def _contains_term(text: str, term: str) -> bool:
 
 def _sector_prompt_options() -> list[dict[str, str]]:
     return [
-        {"sector": ZERO_SHOT_LABEL_TO_SECTOR[label], "label": label}
-        for label in ZERO_SHOT_SECTOR_LABELS
+        {"sector": definition.key, "label": definition.label}
+        for definition in NIFTY50_SECTOR_DEFINITIONS
     ] + [{"sector": "broad_market", "label": "Broad market, macro, index, rates, currency, global cues"}]
 
 

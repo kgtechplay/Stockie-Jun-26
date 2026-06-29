@@ -69,9 +69,9 @@ NEWSAPI_QUERY = (
     "OR global markets OR US yields"
 )
 
-# NIFTY50 sector definitions are the single source of truth for both Layer 3
-# zero-shot candidate labels and Layer 4 fallback sector weighting. Official
-# weights should be refreshed from NSE into NIFTY50_SECTOR_WEIGHTS_STORE.
+# NIFTY50 sector definitions are the single source of truth for both Azure LLM
+# prompt labels and Layer 4 fallback sector weighting. Official weights should
+# be refreshed from NSE into NIFTY50_SECTOR_WEIGHTS_STORE.
 NIFTY50_SECTOR_DEFINITIONS: tuple[SectorDefinition, ...] = (
     SectorDefinition("financial_services", "Banking & Finance", 0.33),
     SectorDefinition("information_technology", "IT & Technology", 0.13),
@@ -87,14 +87,6 @@ NIFTY50_SECTOR_DEFINITIONS: tuple[SectorDefinition, ...] = (
     SectorDefinition("services", "Services & Logistics", 0.01),
     SectorDefinition("realty", "Realty", 0.01),
 )
-
-ZERO_SHOT_SECTOR_LABELS: tuple[str, ...] = tuple(
-    definition.label for definition in NIFTY50_SECTOR_DEFINITIONS
-)
-
-ZERO_SHOT_LABEL_TO_SECTOR: dict[str, str] = {
-    definition.label: definition.key for definition in NIFTY50_SECTOR_DEFINITIONS
-}
 
 NIFTY50_SECTOR_WEIGHTS: dict[str, float] = {
     definition.key: definition.nifty50_weight for definition in NIFTY50_SECTOR_DEFINITIONS

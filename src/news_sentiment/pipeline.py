@@ -17,8 +17,8 @@ from src.news_sentiment.article_store import append_articles, append_composite_s
 from src.news_sentiment.config import article_sentiment_store_path, article_store_path, composite_signal_store_path
 from src.news_sentiment.db_store import persist_news_sentiment_run
 from src.news_sentiment.schemas import CompositeSignal, EnrichedArticle
-from src.news_sentiment.sector_classifier import KeywordSectorClassifier, LlmSectorClassifier, ZeroShotSectorClassifier
-from src.news_sentiment.sentiment import FinBertSentimentScorer
+from src.news_sentiment.sector_classifier import KeywordSectorClassifier, LlmSectorClassifier
+from src.news_sentiment.sentiment import FinBertSentimentScorer, build_sentiment_scorer
 from src.news_sentiment.sector_weights import load_nifty50_sector_weights
 from src.news_sentiment.sources import fetch_all_articles
 from src.news_sentiment.weighting import build_composite_signal, enrich_article
@@ -38,12 +38,11 @@ def run_news_sentiment_pipeline(
     target_date: date | None = None,
     include_newsapi: bool = True,
     use_transformers: bool = True,
-    use_zero_shot_sectors: bool = True,
-    sector_classifier_mode: str = "bart",
+    sector_classifier_mode: str = "keyword",
 ) -> dict[str, object]:
     target = target_date or datetime.now(IST).date()
-    scorer = FinBertSentimentScorer(use_transformers=use_transformers)
-    sector_classifier = _build_sector_classifier(sector_classifier_mode, use_transformers, use_zero_shot_sectors)
+    scorer = build_sentiment_scorer(use_transformers=use_transformers)
+    sector_classifier = _build_sector_classifier(sector_classifier_mode)
     signal = run_news_sentiment_for_target(
         target,
         scorer=scorer,
@@ -73,7 +72,7 @@ def run_news_sentiment_pipeline(
 def run_news_sentiment_for_target(
     target: date,
     scorer: FinBertSentimentScorer,
-    sector_classifier: KeywordSectorClassifier | LlmSectorClassifier | ZeroShotSectorClassifier,
+    sector_classifier: KeywordSectorClassifier | LlmSectorClassifier,
     include_newsapi: bool = True,
 ) -> CompositeSignal | None:
     window_start, window_end = sentiment_window(target)
@@ -144,17 +143,14 @@ def _safe_persist_to_db(
 
 def _build_sector_classifier(
     mode: str,
-    use_transformers: bool,
-    use_zero_shot_sectors: bool,
-) -> KeywordSectorClassifier | LlmSectorClassifier | ZeroShotSectorClassifier:
+) -> KeywordSectorClassifier | LlmSectorClassifier:
     selected = mode.lower().strip()
-    if not use_zero_shot_sectors:
-        selected = "keyword"
     if selected == "keyword":
         return KeywordSectorClassifier()
     if selected == "llm":
         return LlmSectorClassifier()
-    return ZeroShotSectorClassifier(use_transformers=use_transformers)
+    print(f"[WARN] Unknown sector classifier '{mode}'; using keyword fallback.")
+    return KeywordSectorClassifier()
 
 
 def _print_signal(signal: CompositeSignal) -> None:
@@ -176,12 +172,11 @@ def main() -> None:
     parser.add_argument("--target-date", default=None, help="Target market date YYYY-MM-DD. Default: today IST.")
     parser.add_argument("--no-newsapi", action="store_true", help="Skip NewsAPI and use RSS only.")
     parser.add_argument("--no-transformers", action="store_true", help="Skip FinBERT and use lexical fallback.")
-    parser.add_argument("--no-zero-shot-sectors", action="store_true", help="Skip BART zero-shot sector tagging and use keyword fallback.")
     parser.add_argument(
         "--sector-classifier",
-        choices=("bart", "keyword", "llm"),
-        default="bart",
-        help="Sector classifier backend. Default: bart. Use llm for Azure/OpenAI chat classification.",
+        choices=("keyword", "llm"),
+        default="keyword",
+        help="Sector classifier backend. Default: keyword. Use llm for Azure OpenAI chat classification.",
     )
     args = parser.parse_args()
 
@@ -190,7 +185,6 @@ def main() -> None:
         target_date=target,
         include_newsapi=not args.no_newsapi,
         use_transformers=not args.no_transformers,
-        use_zero_shot_sectors=not args.no_zero_shot_sectors,
         sector_classifier_mode=args.sector_classifier,
     )
     print(result)

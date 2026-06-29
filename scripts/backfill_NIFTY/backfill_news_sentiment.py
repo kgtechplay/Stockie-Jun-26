@@ -22,7 +22,7 @@ load_dotenv(project_root / ".env")
 
 from src.news_sentiment.config import composite_signal_store_path
 from src.news_sentiment.pipeline import _build_sector_classifier, run_news_sentiment_for_target
-from src.news_sentiment.sentiment import FinBertSentimentScorer
+from src.news_sentiment.sentiment import build_sentiment_scorer
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -52,18 +52,13 @@ def backfill_news_sentiment(
     batch_index: int | None,
     include_newsapi: bool,
     use_transformers: bool,
-    use_zero_shot_sectors: bool,
     sector_classifier_mode: str,
     skip_existing: bool,
     continue_on_error: bool,
 ) -> list[dict[str, object]]:
     dates = select_batch(iter_dates(start_date, end_date), batch_size, batch_index)
-    scorer = FinBertSentimentScorer(use_transformers=use_transformers)
-    sector_classifier = _build_sector_classifier(
-        sector_classifier_mode,
-        use_transformers,
-        use_zero_shot_sectors,
-    )
+    scorer = build_sentiment_scorer(use_transformers=use_transformers)
+    sector_classifier = _build_sector_classifier(sector_classifier_mode)
 
     results: list[dict[str, object]] = []
     for target in dates:
@@ -113,12 +108,11 @@ def main() -> None:
     parser.add_argument("--batch-index", type=int, default=None, help="Zero-based batch index. Omit to process the full range.")
     parser.add_argument("--no-newsapi", action="store_true", help="Skip NewsAPI. Historical backfills usually need NewsAPI.")
     parser.add_argument("--no-transformers", action="store_true", help="Skip FinBERT and use lexical fallback.")
-    parser.add_argument("--no-zero-shot-sectors", action="store_true", help="Force keyword sector tagging.")
     parser.add_argument(
         "--sector-classifier",
-        choices=("bart", "keyword", "llm"),
+        choices=("keyword", "llm"),
         default="keyword",
-        help="Sector classifier backend. Default: keyword for fast backfills.",
+        help="Sector classifier backend. Default: keyword for fast backfills. Use llm for Azure OpenAI from env.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Recompute dates even if their composite file exists.")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop at the first failed target date.")
@@ -131,7 +125,6 @@ def main() -> None:
         batch_index=args.batch_index,
         include_newsapi=not args.no_newsapi,
         use_transformers=not args.no_transformers,
-        use_zero_shot_sectors=not args.no_zero_shot_sectors,
         sector_classifier_mode=args.sector_classifier,
         skip_existing=not args.overwrite,
         continue_on_error=not args.stop_on_error,

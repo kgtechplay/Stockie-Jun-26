@@ -152,6 +152,90 @@ def add_global_index_features(base: pd.DataFrame) -> pd.DataFrame:
     return _ensure_global_columns(out)
 
 
+_RISK_OFF_RETURN = -0.002   # mean cumulative return threshold
+_RISK_OFF_BREADTH = -0.20   # breadth threshold (fraction: (pos-neg)/n)
+_RISK_ON_RETURN = 0.002
+_RISK_ON_BREADTH = 0.20
+
+
+def build_gap_gate_signal(rows: pd.DataFrame) -> dict:
+    """Compute a cumulative gate signal from GlobalIndexOhlc rows spanning a date range.
+
+    For each RISK_INDEX present in `rows`, cumulative return = (last - first) / first
+    across all dates in the range. Returns both the 12-index compound risk_off/risk_on
+    gate AND the 3-regional GlobalNoDisagree gate (put_agree / call_agree), so callers
+    can apply either or both.
+
+    Intended for holiday-gap scenarios where multiple sessions of global data must be
+    evaluated cumulatively before an Indian market open.
+
+    Keys returned:
+        us_mean, europe_mean, asia_mean  — regional cumulative means
+        all_mean                         — 12-index mean cumulative return
+        breadth                          — (pos - neg) / n
+        risk_off                         — all_mean <= -0.2% AND breadth <= -0.20
+        risk_on                          — all_mean >= +0.2% AND breadth >= +0.20
+        put_agree                        — 2 of 3 regions negative (GlobalNoDisagree for CALL)
+        call_agree                       — 2 of 3 regions positive (GlobalNoDisagree for PUT)
+        indices                          — per-index cumulative return
+        dates_covered                    — distinct trade_dates in rows
+    """
+    _empty: dict = {
+        "us_mean": 0.0, "europe_mean": 0.0, "asia_mean": 0.0,
+        "all_mean": 0.0, "breadth": 0.0,
+        "risk_off": False, "risk_on": False,
+        "put_agree": False, "call_agree": False,
+        "indices": {}, "dates_covered": 0,
+    }
+    if rows is None or rows.empty:
+        return _empty
+
+    rows = rows.copy()
+    rows["close_price"] = pd.to_numeric(rows["close_price"], errors="coerce")
+    rows["trade_date"] = pd.to_datetime(rows["trade_date"])
+
+    index_returns: dict[str, float] = {}
+    for idx_code in RISK_INDEXES:
+        grp = rows[rows["index_code"] == idx_code].sort_values("trade_date").dropna(subset=["close_price"])
+        if len(grp) >= 2:
+            start = float(grp["close_price"].iloc[0])
+            end = float(grp["close_price"].iloc[-1])
+            if start > 0:
+                index_returns[idx_code] = (end - start) / start
+
+    if not index_returns:
+        return {**_empty, "dates_covered": int(rows["trade_date"].nunique())}
+
+    n = len(index_returns)
+    pos = sum(1 for r in index_returns.values() if r > 0)
+    neg = sum(1 for r in index_returns.values() if r < 0)
+    breadth = (pos - neg) / n if n else 0.0
+
+    def _rmean(codes: list[str]) -> float:
+        vals = [index_returns[c] for c in codes if c in index_returns]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    us_mean = _rmean(US_INDEXES)
+    europe_mean = _rmean(EUROPE_INDEXES)
+    asia_mean = _rmean(ASIA_INDEXES)
+    all_mean = sum(index_returns.values()) / n
+    regional = [us_mean, europe_mean, asia_mean]
+
+    return {
+        "us_mean": round(us_mean, 6),
+        "europe_mean": round(europe_mean, 6),
+        "asia_mean": round(asia_mean, 6),
+        "all_mean": round(all_mean, 6),
+        "breadth": round(breadth, 4),
+        "risk_off": bool(all_mean <= _RISK_OFF_RETURN and breadth <= _RISK_OFF_BREADTH),
+        "risk_on": bool(all_mean >= _RISK_ON_RETURN and breadth >= _RISK_ON_BREADTH),
+        "put_agree": bool(sum(1 for v in regional if v < 0) >= 2),
+        "call_agree": bool(sum(1 for v in regional if v > 0) >= 2),
+        "indices": {k: round(v, 6) for k, v in sorted(index_returns.items())},
+        "dates_covered": int(rows["trade_date"].nunique()),
+    }
+
+
 def _mean_existing(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
     present = [c for c in columns if c in frame.columns]
     if not present:

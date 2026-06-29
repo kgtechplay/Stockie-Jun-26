@@ -8,8 +8,8 @@ Usage:
     python scripts/daily_NIFTY/daily_news_sentiment.py --target-date 2026-06-26
     python scripts/daily_NIFTY/daily_news_sentiment.py --target-date 2026-06-26 --skip-existing
     python scripts/daily_NIFTY/daily_news_sentiment.py --no-newsapi --no-transformers
-    python scripts/daily_NIFTY/daily_news_sentiment.py --no-newsapi --no-zero-shot-sectors
     python scripts/daily_NIFTY/daily_news_sentiment.py --sector-classifier llm
+    NEWS_SENTIMENT_SCORER=hf_finbert HF_TOKEN=... python scripts/daily_NIFTY/daily_news_sentiment.py --sector-classifier llm --no-transformers
 """
 
 from __future__ import annotations
@@ -37,8 +37,7 @@ def run_daily_news_sentiment(
     target_date: date | None = None,
     include_newsapi: bool = True,
     use_transformers: bool = True,
-    use_zero_shot_sectors: bool = True,
-    sector_classifier_mode: str = "bart",
+    sector_classifier_mode: str = "keyword",
     skip_existing: bool = False,
 ) -> dict[str, object]:
     target = target_date or datetime.now(IST).date()
@@ -60,7 +59,6 @@ def run_daily_news_sentiment(
         target_date=target,
         include_newsapi=include_newsapi,
         use_transformers=use_transformers,
-        use_zero_shot_sectors=use_zero_shot_sectors,
         sector_classifier_mode=sector_classifier_mode,
     )
     status = "ok" if result.get("article_count", 0) else "no_articles"
@@ -79,12 +77,11 @@ def main() -> None:
     parser.add_argument("--skip-existing", action="store_true", help="Skip when the target date market sentiment file already exists.")
     parser.add_argument("--no-newsapi", action="store_true", help="Skip NewsAPI and use RSS only.")
     parser.add_argument("--no-transformers", action="store_true", help="Skip FinBERT and use lexical fallback.")
-    parser.add_argument("--no-zero-shot-sectors", action="store_true", help="Skip BART zero-shot sector tagging and use keyword fallback.")
     parser.add_argument(
         "--sector-classifier",
-        choices=("bart", "keyword", "llm"),
-        default="bart",
-        help="Sector classifier backend. Default: bart. Use llm for Azure/OpenAI chat classification.",
+        choices=("keyword", "llm"),
+        default="keyword",
+        help="Sector classifier backend. Default: keyword. Use llm for Azure OpenAI chat classification from env.",
     )
     args = parser.parse_args()
     target = date.fromisoformat(args.target_date) if args.target_date else None
@@ -92,7 +89,6 @@ def main() -> None:
         target_date=target,
         include_newsapi=not args.no_newsapi,
         use_transformers=not args.no_transformers,
-        use_zero_shot_sectors=not args.no_zero_shot_sectors,
         sector_classifier_mode=args.sector_classifier,
         skip_existing=args.skip_existing,
     )

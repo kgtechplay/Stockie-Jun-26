@@ -1,8 +1,8 @@
-"""
-NIFTY production prediction pipeline — regime-aware precision cascade.
+﻿"""
+NIFTY production prediction pipeline â€” regime-aware precision cascade.
 
 This is the PRODUCTION counterpart to the research harness in
-backtest/research/build_experiment.py. The cascade engine (dataset assembly,
+backtest/vectorbt_research/build_experiment.py. The cascade engine (dataset assembly,
 labelling, precision-floor voting, scoring, walk-forward) is shared; production
 registers ONLY the promoted strategy roster and captures the single final
 prediction per day.
@@ -12,13 +12,13 @@ Pipeline:
      NIFTY_base.csv), appends any newly-resolved day from the DB, and labels every
      resolved day (actual_trade_label).
   2. Any current day whose next-day outcome does not exist yet is also loaded so
-     the cascade can still PREDICT it (it just cannot be graded — handy for the
+     the cascade can still PREDICT it (it just cannot be graded â€” handy for the
      daily pre-market run).
   3. The regime-aware precision cascade (eligibility fit on resolved history only)
      produces one final_prediction per day.
   4. output/backtest/NIFTY/production/NIFTY_prediction.csv keeps the historical
      prices, volume, India VIX, regime, the final_prediction and the
-     actual_trade_label (the technical feature columns are dropped — they live in
+     actual_trade_label (the technical feature columns are dropped â€” they live in
      the shared feature store).
   5. NIFTY_prediction_summary.txt captures precision / recall / accuracy of the
      final prediction (in-sample headline + an honest walk-forward number).
@@ -46,9 +46,9 @@ if str(_repo_root) not in sys.path:
 
 load_dotenv(_repo_root / ".env")
 
-# ── shared cascade engine (single source of truth, shared with the experiment) ─
+# â”€â”€ shared cascade engine (single source of truth, shared with the experiment) â”€
 # Production registers ONLY the promoted strategy roster; the research harness
-# (backtest/research/build_experiment.py) registers the full roster on the same
+# (backtest/vectorbt_research/build_experiment.py) registers the full roster on the same
 # engine, so the two pipelines share the engine yet diverge on strategies.
 from src.technical_analysis.cascade.constants import (
     _VIX_COLS, _BASE_STR_COLS, WF_WINDOW,
@@ -60,10 +60,14 @@ from src.technical_analysis.cascade.engine import (
     _fmt, score_final, _confusion_lines,
     gather_regime_signals, build_regime_cascade, walk_forward_regime,
 )
+from src.technical_analysis.cascade.global_index_features import (
+    build_gap_gate_signal,
+    load_global_index_rows,
+)
 from src.technical_analysis.cascade.option_signal_mapper import enrich_option_signal_columns
 from src.technical_analysis.cascade.strategies import PROMOTED_REGIME_FAMILIES
 
-# ── pipeline-only imports ─────────────────────────────────────────────────────
+# â”€â”€ pipeline-only imports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from src.common.config import get_settings
 from src.data_manager.db.client_factory import get_database_client
 
@@ -73,7 +77,7 @@ DEFAULT_OUTPUT = Path("output") / "backtest" / "NIFTY" / "production" / "NIFTY_p
 # Columns kept in the production CSV: the raw market data (prices, volume, India
 # VIX), the volatility regime, the cascade's final_prediction and the realised
 # actual_trade_label. Every technical feature column from the feature store is
-# dropped — those belong to research, not to the production prediction record.
+# dropped â€” those belong to research, not to the production prediction record.
 _PRODUCTION_COLS = [
     "trade_date", "next_trade_date",
     "open_915", "high_day", "low_day", "close_1515",
@@ -88,12 +92,109 @@ _PRODUCTION_COLS = [
     "strength_score", "strength_label", "confidence_level",
     "expected_move_pct", "is_option_eligible", "option_bias", "conflict_flag",
     "actual_trade_label",
+    "global_gate_reason",
 ]
 
 
+def _apply_global_gate(full: pd.DataFrame) -> pd.DataFrame:
+    """Apply global index gate to cascade final_prediction.
+
+    Two layers, applied in order (later layers can further block already-open signals):
+
+    1. Same-day gate — uses global_risk_off / global_risk_on columns (already computed
+       by add_global_index_features from prior-session 1d returns) plus a
+       GlobalNoDisagree check on the 3 regional means.  Fires on every trading day
+       where the precomputed global backdrop disagrees with the prediction direction.
+
+    2. Holiday gap gate — when trade_date is more than 1 calendar day after the
+       previous row's trade_date (multi-day Indian holiday), cumulative GlobalIndexOhlc
+       returns over the gap are computed and the combined risk_off/put_agree gate is
+       applied.  Catches scenarios where the same-day 1d signal is weak but the
+       accumulated gap effect is severe.
+
+    Gate logic (same in both layers):
+       CALL blocked if risk_off  OR put_agree  (2+ of 3 regions negative)
+       PUT  blocked if risk_on   OR call_agree (2+ of 3 regions positive)
+
+    Overrides final_prediction -> NO_POSITION where blocked.
+    Sets global_gate_reason to the trigger name; empty string if not blocked.
+    The cascade direction column is preserved to show what the raw signal was.
+    """
+    out = full.copy()
+    out["global_gate_reason"] = ""
+
+    # --- Layer 1: same-day gate using precomputed feature columns ---
+    regional = out[
+        ["global_us_return_mean", "global_europe_return_mean", "global_asia_return_mean"]
+    ].apply(pd.to_numeric, errors="coerce")
+    put_agree_s = (regional < 0).sum(axis=1) >= 2
+    call_agree_s = (regional > 0).sum(axis=1) >= 2
+    risk_off_s = out["global_risk_off"].fillna(0).astype(bool)
+    risk_on_s = out["global_risk_on"].fillna(0).astype(bool)
+
+    call_rows = out["final_prediction"] == "CALL"
+    put_rows = out["final_prediction"] == "PUT"
+
+    mask = call_rows & risk_off_s
+    out.loc[mask, "final_prediction"] = "NO_POSITION"
+    out.loc[mask, "global_gate_reason"] = "RISK_OFF"
+
+    mask = call_rows & ~risk_off_s & put_agree_s
+    out.loc[mask, "final_prediction"] = "NO_POSITION"
+    out.loc[mask, "global_gate_reason"] = "PUT_AGREE"
+
+    mask = put_rows & risk_on_s
+    out.loc[mask, "final_prediction"] = "NO_POSITION"
+    out.loc[mask, "global_gate_reason"] = "RISK_ON"
+
+    mask = put_rows & ~risk_on_s & call_agree_s
+    out.loc[mask, "final_prediction"] = "NO_POSITION"
+    out.loc[mask, "global_gate_reason"] = "CALL_AGREE"
+
+    # --- Layer 2: holiday gap gate using cumulative returns over the gap ---
+    out["_trade_dt"] = pd.to_datetime(out["trade_date"])
+    prev_dt = out["_trade_dt"].shift(1)
+    gap_calendar_days = (out["_trade_dt"] - prev_dt).dt.days
+    gap_row_idx = out.index[gap_calendar_days > 1]
+
+    if len(gap_row_idx) > 0:
+        min_load = (out.loc[gap_row_idx, "_trade_dt"].min() - pd.Timedelta(days=14)).date()
+        max_load = out.loc[gap_row_idx, "_trade_dt"].max().date()
+        try:
+            global_rows = load_global_index_rows(min_load, max_load)
+            global_rows["trade_date"] = pd.to_datetime(global_rows["trade_date"])
+        except Exception as exc:
+            print(f"[WARN] Global gap gate: GlobalIndexOhlc load failed: {exc}")
+            global_rows = pd.DataFrame(columns=["index_code", "trade_date", "close_price"])
+
+        for idx in gap_row_idx:
+            direction = out.loc[idx, "final_prediction"]
+            if direction not in ("CALL", "PUT"):
+                continue  # already gated or flat
+            trade_dt = out.loc[idx, "_trade_dt"]
+            prior_dt = prev_dt.loc[idx]
+            gap_data = global_rows[
+                (global_rows["trade_date"] >= prior_dt) &
+                (global_rows["trade_date"] < trade_dt)
+            ]
+            gate = build_gap_gate_signal(gap_data)
+            call_blocked = direction == "CALL" and (gate["risk_off"] or gate["put_agree"])
+            put_blocked = direction == "PUT" and (gate["risk_on"] or gate["call_agree"])
+            if call_blocked:
+                trigger = "GAP_RISK_OFF" if gate["risk_off"] else "GAP_PUT_AGREE"
+            elif put_blocked:
+                trigger = "GAP_RISK_ON" if gate["risk_on"] else "GAP_CALL_AGREE"
+            else:
+                continue
+            out.loc[idx, "final_prediction"] = "NO_POSITION"
+            out.loc[idx, "global_gate_reason"] = trigger
+
+    return out.drop(columns=["_trade_dt"])
+
+
 def _load_unresolved_rows(resolved: pd.DataFrame) -> pd.DataFrame:
-    """Pull SignalFeatureDaily NIFTY rows NEWER than the last resolved date — the
-    current day(s) whose next-day outcome does not exist yet — shaped into the base
+    """Pull SignalFeatureDaily NIFTY rows NEWER than the last resolved date â€” the
+    current day(s) whose next-day outcome does not exist yet â€” shaped into the base
     schema so the cascade can still PREDICT them. next_* and actual_trade_label stay
     blank (pending). Returns an empty frame on no-new-rows or DB failure."""
     max_date = str(resolved["trade_date"].max())
@@ -177,7 +278,7 @@ def _write_prediction_summary(
     m_in = score_final(df_res, pred_res)
     lines = [
         "=" * 64,
-        "NIFTY final prediction — summary (regime-aware precision cascade)",
+        "NIFTY final prediction â€” summary (regime-aware precision cascade)",
         "=" * 64,
         f"graded rows: {m_in['n']}   "
         f"date range: {df_res['trade_date'].min()} .. {df_res['trade_date'].max()}",
@@ -191,7 +292,7 @@ def _write_prediction_summary(
     ]
 
     if not pending.empty:
-        lines.append("Pending prediction(s) — predicted but not yet gradeable "
+        lines.append("Pending prediction(s) â€” predicted but not yet gradeable "
                      "(no next-day outcome):")
         for _, r in pending.iterrows():
             lines.append(f"    {r['trade_date']}  regime={r['regime']:<6}  "
@@ -204,14 +305,14 @@ def _write_prediction_summary(
     lines += _confusion_lines(df_res, pred_res)
     lines.append("")
 
-    # Walk-forward (honest out-of-sample) — eligibility fit only on trailing days.
+    # Walk-forward (honest out-of-sample) â€” eligibility fit only on trailing days.
     rs_res = gather_regime_signals(df_res, PROMOTED_REGIME_FAMILIES)
     wf_pred = walk_forward_regime(df_res, rs_res)
     wf_eval = df_res.iloc[WF_WINDOW:]
     if len(wf_eval):
         wf = score_final(wf_eval, wf_pred.loc[wf_eval.index])
         lines += _final_block(
-            f"Walk-forward (rolling {WF_WINDOW}-day eligibility, out-of-sample — "
+            f"Walk-forward (rolling {WF_WINDOW}-day eligibility, out-of-sample â€” "
             "the honest number)",
             wf,
         )
@@ -241,7 +342,7 @@ def generate_prediction_csv(
     current unresolved day) and write the production prediction CSV + summary.
 
     The final prediction uses the shared cascade engine
-    (src/technical_analysis/cascade) with the PROMOTED strategy roster — the same
+    (src/technical_analysis/cascade) with the PROMOTED strategy roster â€” the same
     engine the research harness drives with the full roster. Extra legacy keyword
     arguments are accepted and ignored for backward compatibility with older
     callers."""
@@ -257,7 +358,7 @@ def generate_prediction_csv(
     # 1) resolved history: prices/volume/VIX/base features + regime + label.
     resolved = build_base().reset_index(drop=True)
 
-    # 2) current unresolved day(s) — predicted but not yet gradeable.
+    # 2) current unresolved day(s) â€” predicted but not yet gradeable.
     unresolved = _load_unresolved_rows(resolved)
     if not unresolved.empty:
         print(f"  loaded {len(unresolved)} unresolved day(s) to predict "
@@ -276,7 +377,12 @@ def generate_prediction_csv(
     full["final_prediction"] = final_pos
     full = enrich_option_signal_columns(full, final_pos, regime_signals, elig)
 
-    # 4) production CSV — market data + regime + final prediction + actual label.
+    # 3b) global gate: same-day risk_off/GlobalNoDisagree + holiday gap cumulative gate.
+    #     Overrides final_prediction -> NO_POSITION where global indices block the signal.
+    #     direction column is preserved to show the raw cascade recommendation.
+    full = _apply_global_gate(full)
+
+    # 4) production CSV â€” market data + regime + final prediction + actual label.
     out_df = full.reindex(columns=_PRODUCTION_COLS).copy()
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,7 +391,7 @@ def generate_prediction_csv(
     except Exception as exc:  # noqa: BLE001 - Render DB persistence must not depend on local files.
         print(f"[WARN] Prediction CSV write skipped: {type(exc).__name__}: {exc}")
 
-    # 5) summary — precision / recall graded on the resolved history.
+    # 5) summary â€” precision / recall graded on the resolved history.
     pending = out_df.iloc[n_res:]
     try:
         _write_prediction_summary(resolved_full, final_pos.iloc[:n_res], pending, summary_path)

@@ -1,4 +1,4 @@
-# Run Locally
+﻿# Run Locally
 
 This repo is DB-first for the NIFTY production flow. Local files under `output/`
 are developer artifacts only and are ignored by git.
@@ -123,8 +123,8 @@ Open `http://127.0.0.1:5000`.
 ## Validation
 
 ```powershell
-python -m pytest backtest/test_optionselection_e2e.py backtest/test_cascade_option_signal_mapper.py backtest/test_underlying_prediction.py
-python -m pytest backtest/test_news_sentiment.py
+python -m pytest tests/test_optionselection_e2e.py tests/test_cascade_option_signal_mapper.py tests/test_underlying_prediction.py
+python -m pytest tests/test_news_sentiment.py
 ```
 
 ## Troubleshooting

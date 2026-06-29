@@ -158,7 +158,9 @@ def down_momentum_put(df: pd.DataFrame) -> dict[str, pd.Series]:
             _sig((s5 <= -0.002) & (ret3 <= -0.005) & (vol >= vfloor_fast), PUT),
     }
     return _with_selected_global_variants(df, signals, {
+        "DownMomentumPut_HighPrecision",
         "DownMomentumPut_MoreTrades",
+        "DownMomentumPut_Fast",
         "DownMomentumPut_HighPrecision_GlobalAnyAgree",
         "DownMomentumPut_MoreTrades_GlobalAnyAgree",
     })
@@ -237,6 +239,7 @@ def momentum_directional(df: pd.DataFrame) -> dict[str, pd.Series]:
         "MomentumDirectional_ContextVotes_ExpansionGuard",
         "MomentumDirectional_GlobalAnyAgree",
         "MomentumDirectional_ContextVotes_CallExpansionGuard_GlobalNoDisagree",
+        "MomentumDirectional_ContextVotes_StrongExpansionGuard",
         "MomentumDirectional_ContextVotes_StrongExpansionGuard_GlobalAgree",
     })
 
@@ -292,6 +295,7 @@ def ma_alignment_room(df: pd.DataFrame) -> dict[str, pd.Series]:
     }
     return _with_selected_global_variants(df, signals, {
         "MAAlignmentRoom_ReboundCall",
+        "MAAlignmentRoom_PutGuarded",
         "MaTrend_001",
         "MAAlignmentRoom_PutGuarded_GlobalAnyAgree",
         "MAAlignmentRoom_ReboundCall_GlobalAnyAgree",
@@ -315,6 +319,8 @@ def range_breakout(df: pd.DataFrame) -> dict[str, pd.Series]:
         ),
     }
     return _with_selected_global_variants(df, signals, {
+        "RangeBreakout",
+        "RangeBreakout_ATRBuffer",
         "RangeBreakout_GlobalWeightedTilt",
         "RangeBreakout_ATRBuffer_GlobalWeightedTilt",
     })
@@ -356,6 +362,7 @@ def calm_trend_call(df: pd.DataFrame) -> dict[str, pd.Series]:
     )
     return {col: sig for col, sig in signals.items() if col.replace("strategy_", "").replace("_signal", "") in {
         "CalmTrendCall_Headroom",
+        "CalmTrendCall_Pullback",
         "CalmTrendCall_ContextHeadroom",
     }}
 
